@@ -90,6 +90,11 @@ fn find_sde_root(sde_dir: &Path) -> Result<PathBuf> {
     anyhow::bail!("_sde.jsonl not found under {}", sde_dir.display())
 }
 
+#[cfg(test)]
+pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
+    scan_index(path, pb)
+}
+
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     pb.set_message(
         path.file_name()

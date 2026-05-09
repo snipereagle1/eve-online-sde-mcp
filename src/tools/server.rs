@@ -1,0 +1,587 @@
+use std::{collections::HashMap, sync::Arc};
+
+use rmcp::{
+    ServerHandler,
+    handler::server::wrapper::Parameters,
+    model::{Implementation, ServerCapabilities, ServerInfo},
+    schemars::{self, JsonSchema},
+    tool, tool_handler, tool_router,
+    ErrorData,
+};
+use serde::Deserialize;
+
+use crate::store::SdeStore;
+use super::query;
+
+// ── Parameter structs ────────────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TypeIdParam {
+    /// EVE type ID
+    pub type_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchTypesParam {
+    /// Name substring to search for (case-insensitive)
+    pub query: String,
+    /// Maximum results to return (default: 10)
+    pub limit: Option<u64>,
+    /// Only return published types
+    pub published_only: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GroupIdParam {
+    pub group_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CategoryIdParam {
+    pub category_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct BlueprintTypeIdParam {
+    pub blueprint_type_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ProductTypeIdParam {
+    pub product_type_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SolarSystemParam {
+    /// Solar system ID (provide this or name)
+    pub system_id: Option<u64>,
+    /// Solar system name (provide this or system_id)
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchParam {
+    pub query: String,
+    pub limit: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RegionParam {
+    pub region_id: Option<u64>,
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ConstellationIdParam {
+    pub constellation_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct StationIdParam {
+    pub station_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RouteParam {
+    pub from_system_id: u64,
+    pub to_system_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MarketGroupIdParam {
+    pub market_group_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AttributeIdParam {
+    pub attribute_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct EffectIdParam {
+    pub effect_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FactionIdParam {
+    pub faction_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CorporationIdParam {
+    pub corporation_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkinIdParam {
+    pub skin_id: u64,
+}
+
+// ── Server ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct SdeMcpServer {
+    pub store: Arc<SdeStore>,
+    pub language: Option<String>,
+}
+
+impl SdeMcpServer {
+    pub fn new(store: Arc<SdeStore>, language: Option<String>) -> Self {
+        Self { store, language }
+    }
+
+    fn filter(&self, value: &mut serde_json::Value) {
+        if let Some(ref lang) = self.language {
+            query::apply_language_filter(value, lang);
+        }
+    }
+
+    fn fetch_filtered(
+        &self,
+        index: &crate::store::SdeIndex,
+        id: u64,
+        label: &str,
+    ) -> Result<String, ErrorData> {
+        let mut val = query::fetch_by_id(index, id)
+            .map_err(|_| ErrorData::invalid_params(format!("ID {id} not found in {label}"), None))?;
+        self.filter(&mut val);
+        Ok(serde_json::to_string(&val).unwrap())
+    }
+
+    fn search_filtered(
+        &self,
+        index: &crate::store::SdeIndex,
+        q: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, ErrorData> {
+        let mut results = query::search_by_name(index, q, limit)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        for v in &mut results {
+            self.filter(v);
+        }
+        Ok(results)
+    }
+}
+
+// ── Tool implementations ─────────────────────────────────────────────────────
+
+#[tool_router]
+impl SdeMcpServer {
+    #[tool(description = "Get SDE metadata: build number, release date, data directory, files scanned")]
+    async fn sde_status(&self) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "build": self.store.build,
+            "release_date": self.store.release_date,
+            "data_dir": self.store.data_dir.display().to_string(),
+            "files_scanned": self.store.files_scanned,
+            "last_updated": self.store.last_updated,
+        }))
+        .unwrap()
+    }
+
+    #[tool(description = "Get a type (item) by its type ID")]
+    async fn sde_get_type(
+        &self,
+        Parameters(p): Parameters<TypeIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.types, p.type_id, "types")
+    }
+
+    #[tool(description = "Search types by name substring; optionally filter to published only")]
+    async fn sde_search_types(
+        &self,
+        Parameters(p): Parameters<SearchTypesParam>,
+    ) -> Result<String, ErrorData> {
+        let limit = p.limit.unwrap_or(10) as usize;
+        let published_only = p.published_only.unwrap_or(false);
+        let mut results = self.search_filtered(&self.store.types, &p.query, limit)?;
+        if published_only {
+            results.retain(|v| v.get("published").and_then(|b| b.as_bool()).unwrap_or(false));
+        }
+        Ok(serde_json::to_string(&results).unwrap())
+    }
+
+    #[tool(description = "Get a type group by its group ID")]
+    async fn sde_get_group(
+        &self,
+        Parameters(p): Parameters<GroupIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.groups, p.group_id, "groups")
+    }
+
+    #[tool(description = "Get a type category by its category ID")]
+    async fn sde_get_category(
+        &self,
+        Parameters(p): Parameters<CategoryIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.categories, p.category_id, "categories")
+    }
+
+    #[tool(description = "Get the materials required to reprocess a type")]
+    async fn sde_get_type_materials(
+        &self,
+        Parameters(p): Parameters<TypeIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.type_materials, p.type_id, "typeMaterials")
+    }
+
+    #[tool(description = "Get a blueprint by its blueprint type ID")]
+    async fn sde_get_blueprint(
+        &self,
+        Parameters(p): Parameters<BlueprintTypeIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.blueprints, p.blueprint_type_id, "blueprints")
+    }
+
+    #[tool(description = "Get the blueprint that manufactures a given product type")]
+    async fn sde_get_blueprint_for_product(
+        &self,
+        Parameters(p): Parameters<ProductTypeIdParam>,
+    ) -> Result<String, ErrorData> {
+        let bp_id = self
+            .store
+            .product_to_blueprint
+            .get(&p.product_type_id)
+            .copied()
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("No blueprint found for product type {}", p.product_type_id),
+                    None,
+                )
+            })?;
+        self.fetch_filtered(&self.store.blueprints, bp_id, "blueprints")
+    }
+
+    #[tool(description = "Get a solar system by ID or name")]
+    async fn sde_get_solar_system(
+        &self,
+        Parameters(p): Parameters<SolarSystemParam>,
+    ) -> Result<String, ErrorData> {
+        match (p.system_id, p.name) {
+            (Some(id), _) => self.fetch_filtered(&self.store.map_solar_systems, id, "mapSolarSystems"),
+            (None, Some(name)) => {
+                let results = self.search_filtered(&self.store.map_solar_systems, &name, 1)?;
+                results
+                    .into_iter()
+                    .next()
+                    .map(|v| serde_json::to_string(&v).unwrap())
+                    .ok_or_else(|| ErrorData::invalid_params(format!("Solar system '{name}' not found"), None))
+            }
+            (None, None) => Err(ErrorData::invalid_params("Provide system_id or name", None)),
+        }
+    }
+
+    #[tool(description = "Search solar systems by name substring")]
+    async fn sde_search_solar_systems(
+        &self,
+        Parameters(p): Parameters<SearchParam>,
+    ) -> Result<String, ErrorData> {
+        let limit = p.limit.unwrap_or(10) as usize;
+        let results = self.search_filtered(&self.store.map_solar_systems, &p.query, limit)?;
+        Ok(serde_json::to_string(&results).unwrap())
+    }
+
+    #[tool(description = "Get a region by ID or name")]
+    async fn sde_get_region(
+        &self,
+        Parameters(p): Parameters<RegionParam>,
+    ) -> Result<String, ErrorData> {
+        match (p.region_id, p.name) {
+            (Some(id), _) => self.fetch_filtered(&self.store.map_regions, id, "mapRegions"),
+            (None, Some(name)) => {
+                let results = self.search_filtered(&self.store.map_regions, &name, 1)?;
+                results
+                    .into_iter()
+                    .next()
+                    .map(|v| serde_json::to_string(&v).unwrap())
+                    .ok_or_else(|| ErrorData::invalid_params(format!("Region '{name}' not found"), None))
+            }
+            (None, None) => Err(ErrorData::invalid_params("Provide region_id or name", None)),
+        }
+    }
+
+    #[tool(description = "Get a constellation by its constellation ID")]
+    async fn sde_get_constellation(
+        &self,
+        Parameters(p): Parameters<ConstellationIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.map_constellations, p.constellation_id, "mapConstellations")
+    }
+
+    #[tool(description = "Get an NPC station by its station ID")]
+    async fn sde_get_npc_station(
+        &self,
+        Parameters(p): Parameters<StationIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.npc_stations, p.station_id, "npcStations")
+    }
+
+    #[tool(description = "Find the shortest route between two solar systems; returns jump count and system ID path")]
+    async fn sde_find_route(
+        &self,
+        Parameters(p): Parameters<RouteParam>,
+    ) -> Result<String, ErrorData> {
+        let graph = self.store.stargate_graph.clone();
+        let from = p.from_system_id;
+        let to = p.to_system_id;
+        let path = tokio::task::spawn_blocking(move || bfs_route(&graph, from, to))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        match path {
+            Some(p) => Ok(serde_json::to_string(&serde_json::json!({
+                "jumps": p.len().saturating_sub(1),
+                "path": p,
+            }))
+            .unwrap()),
+            None => Err(ErrorData::invalid_params("No route found", None)),
+        }
+    }
+
+    #[tool(description = "Get a market group by its market group ID")]
+    async fn sde_get_market_group(
+        &self,
+        Parameters(p): Parameters<MarketGroupIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.market_groups, p.market_group_id, "marketGroups")
+    }
+
+    #[tool(description = "Get the full ancestor chain for a market group, from root to the given group")]
+    async fn sde_get_market_group_tree(
+        &self,
+        Parameters(p): Parameters<MarketGroupIdParam>,
+    ) -> Result<String, ErrorData> {
+        const MAX_HOPS: usize = 20;
+        let mut chain = Vec::new();
+        let mut id = p.market_group_id;
+        loop {
+            if chain.len() >= MAX_HOPS {
+                return Err(ErrorData::internal_error(
+                    "Market group chain exceeds 20 hops",
+                    None,
+                ));
+            }
+            let mut val = query::fetch_by_id(&self.store.market_groups, id).map_err(|_| {
+                ErrorData::invalid_params(format!("ID {id} not found in marketGroups"), None)
+            })?;
+            self.filter(&mut val);
+            let parent = val.get("parentGroupID").and_then(|v| v.as_u64());
+            chain.push(val);
+            match parent {
+                Some(pid) => id = pid,
+                None => break,
+            }
+        }
+        chain.reverse();
+        Ok(serde_json::to_string(&chain).unwrap())
+    }
+
+    #[tool(description = "Get a dogma attribute by its attribute ID")]
+    async fn sde_get_dogma_attribute(
+        &self,
+        Parameters(p): Parameters<AttributeIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.dogma_attributes, p.attribute_id, "dogmaAttributes")
+    }
+
+    #[tool(description = "Get a dogma effect by its effect ID")]
+    async fn sde_get_dogma_effect(
+        &self,
+        Parameters(p): Parameters<EffectIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.dogma_effects, p.effect_id, "dogmaEffects")
+    }
+
+    #[tool(description = "Get a faction by its faction ID")]
+    async fn sde_get_faction(
+        &self,
+        Parameters(p): Parameters<FactionIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.factions, p.faction_id, "factions")
+    }
+
+    #[tool(description = "Get an NPC corporation by its corporation ID")]
+    async fn sde_get_npc_corporation(
+        &self,
+        Parameters(p): Parameters<CorporationIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.npc_corporations, p.corporation_id, "npcCorporations")
+    }
+
+    #[tool(description = "Get a SKIN (ship SKINs) by its skin ID")]
+    async fn sde_get_skin(
+        &self,
+        Parameters(p): Parameters<SkinIdParam>,
+    ) -> Result<String, ErrorData> {
+        self.fetch_filtered(&self.store.skins, p.skin_id, "skins")
+    }
+}
+
+#[tool_handler(name = "eve-sde-mcp", version = "0.1.0", instructions = "EVE Online Static Data Export MCP server")]
+impl ServerHandler for SdeMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "eve-sde-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+    }
+}
+
+// ── BFS route ────────────────────────────────────────────────────────────────
+
+fn bfs_route(graph: &HashMap<u64, Vec<u64>>, from: u64, to: u64) -> Option<Vec<u64>> {
+    if from == to {
+        return Some(vec![from]);
+    }
+    let mut queue = std::collections::VecDeque::new();
+    let mut prev: HashMap<u64, u64> = HashMap::new();
+    queue.push_back(from);
+    prev.insert(from, from);
+    while let Some(curr) = queue.pop_front() {
+        if let Some(neighbors) = graph.get(&curr) {
+            for &next in neighbors {
+                if let std::collections::hash_map::Entry::Vacant(e) = prev.entry(next) {
+                    e.insert(curr);
+                    if next == to {
+                        let mut path = vec![to];
+                        let mut node = to;
+                        while node != from {
+                            node = prev[&node];
+                            path.push(node);
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server() -> SdeMcpServer {
+        SdeMcpServer::new(
+            Arc::new(SdeStore {
+                data_dir: std::path::PathBuf::from("/tmp"),
+                build: 42,
+                release_date: "2024-01-01".to_string(),
+                files_scanned: 16,
+                last_updated: "2024-01-01".to_string(),
+                types: empty_index(),
+                groups: empty_index(),
+                categories: empty_index(),
+                blueprints: empty_index(),
+                type_materials: empty_index(),
+                map_solar_systems: empty_index(),
+                map_constellations: empty_index(),
+                map_regions: empty_index(),
+                map_stargates: empty_index(),
+                npc_stations: empty_index(),
+                market_groups: empty_index(),
+                dogma_attributes: empty_index(),
+                dogma_effects: empty_index(),
+                factions: empty_index(),
+                npc_corporations: empty_index(),
+                skins: empty_index(),
+                product_to_blueprint: HashMap::new(),
+                stargate_graph: HashMap::new(),
+            }),
+            None,
+        )
+    }
+
+    fn empty_index() -> crate::store::SdeIndex {
+        crate::store::SdeIndex {
+            path: std::path::PathBuf::from("/dev/null"),
+            id_index: HashMap::new(),
+            name_index: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sde_status_returns_build_metadata() {
+        let server = make_server();
+        let result = server.sde_status().await;
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["build"], 42);
+        assert_eq!(v["release_date"], "2024-01-01");
+        assert_eq!(v["files_scanned"], 16);
+    }
+
+    #[tokio::test]
+    async fn sde_get_type_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_type(Parameters(TypeIdParam { type_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn bfs_route_finds_direct_connection() {
+        let mut graph = HashMap::new();
+        graph.insert(1, vec![2]);
+        graph.insert(2, vec![1]);
+        let path = bfs_route(&graph, 1, 2).unwrap();
+        assert_eq!(path, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn bfs_route_returns_none_for_unreachable() {
+        let graph = HashMap::new();
+        assert!(bfs_route(&graph, 1, 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn bfs_route_same_system() {
+        let graph = HashMap::new();
+        let path = bfs_route(&graph, 42, 42).unwrap();
+        assert_eq!(path, vec![42]);
+    }
+
+    #[tokio::test]
+    async fn mcp_handshake_initialize_and_list_tools() -> anyhow::Result<()> {
+        use rmcp::{ClientHandler, ServiceExt as _, model::ClientInfo};
+
+        #[derive(Clone, Default)]
+        struct DummyClient;
+        impl ClientHandler for DummyClient {
+            fn get_info(&self) -> ClientInfo {
+                ClientInfo::default()
+            }
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(65536);
+        let store = make_server().store;
+        let server_handle = tokio::spawn(async move {
+            SdeMcpServer::new(store, None)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = DummyClient.serve(client_transport).await?;
+        let tools = client.list_all_tools().await?;
+        assert!(
+            tools.len() >= 21,
+            "expected ≥21 tools, got {}",
+            tools.len()
+        );
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(names.contains(&"sde_status"));
+        assert!(names.contains(&"sde_find_route"));
+        assert!(names.contains(&"sde_get_market_group_tree"));
+        client.cancel().await?;
+        let _ = server_handle.await;
+        Ok(())
+    }
+}
