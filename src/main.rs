@@ -31,4 +31,16 @@ fn main() {
     } else {
         eprintln!("SDE build {} is current", result.build);
     }
+
+    let start = std::time::Instant::now();
+    let _store = scan::scan_sde(
+        &cfg.sde_dir(result.build),
+        result.build,
+        &result.release_date,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    });
+    tracing::debug!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
 }
