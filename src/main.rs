@@ -17,4 +17,18 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log_level)),
         )
         .init();
+
+    let result = download::check_and_update(&cfg).unwrap_or_else(|e| {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    });
+
+    if result.was_downloaded {
+        eprintln!(
+            "SDE build {} ({}) ready",
+            result.build, result.release_date
+        );
+    } else {
+        eprintln!("SDE build {} is current", result.build);
+    }
 }
