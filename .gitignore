@@ -1,0 +1,4 @@
+target/
+*.mcpb
+sde/
+sde-data/
