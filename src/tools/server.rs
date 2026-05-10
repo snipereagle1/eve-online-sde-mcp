@@ -956,4 +956,181 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["result"], serde_json::Value::Null);
     }
+
+    #[tokio::test]
+    async fn sde_get_market_group_returns_record_for_known_id() {
+        let (_f, market_groups) = make_index(
+            "{\"_key\":4,\"name\":{\"en\":\"Ships\"},\"parentGroupID\":null}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { market_groups, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_market_group(Parameters(MarketGroupIdParam { market_group_id: 4 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 4);
+    }
+
+    #[tokio::test]
+    async fn sde_get_market_group_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_market_group(Parameters(MarketGroupIdParam { market_group_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_market_group_tree_walks_multi_level_chain() {
+        // root (id=1) → child (id=2) → grandchild (id=3)
+        let fixture = concat!(
+            "{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n",
+            "{\"_key\":2,\"name\":{\"en\":\"Child\"},\"parentGroupID\":1}\n",
+            "{\"_key\":3,\"name\":{\"en\":\"Grandchild\"},\"parentGroupID\":2}\n",
+        );
+        let (_f, market_groups) = make_index(fixture);
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { market_groups, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_market_group_tree(Parameters(MarketGroupIdParam { market_group_id: 3 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["_key"], 1); // root first
+        assert_eq!(arr[1]["_key"], 2);
+        assert_eq!(arr[2]["_key"], 3); // requested group last
+    }
+
+    #[tokio::test]
+    async fn sde_get_market_group_tree_single_node_has_no_parent() {
+        let (_f, market_groups) =
+            make_index("{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n");
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { market_groups, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_market_group_tree(Parameters(MarketGroupIdParam { market_group_id: 1 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["_key"], 1);
+    }
+
+    #[tokio::test]
+    async fn sde_get_dogma_attribute_returns_record_for_known_id() {
+        let (_f, dogma_attributes) = make_index(
+            "{\"_key\":37,\"name\":{\"en\":\"CPU\"},\"unitID\":5}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { dogma_attributes, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_dogma_attribute(Parameters(AttributeIdParam { attribute_id: 37 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 37);
+        assert_eq!(v["unitID"], 5);
+    }
+
+    #[tokio::test]
+    async fn sde_get_dogma_attribute_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_dogma_attribute(Parameters(AttributeIdParam { attribute_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_dogma_effect_returns_record_for_known_id() {
+        let (_f, dogma_effects) = make_index(
+            "{\"_key\":11,\"name\":{\"en\":\"loPower\"},\"effectCategory\":0}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { dogma_effects, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_dogma_effect(Parameters(EffectIdParam { effect_id: 11 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 11);
+    }
+
+    #[tokio::test]
+    async fn sde_get_faction_returns_record_for_known_id() {
+        let (_f, factions) = make_index(
+            "{\"_key\":500001,\"name\":{\"en\":\"Caldari State\"},\"corporationID\":1000035}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { factions, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_faction(Parameters(FactionIdParam { faction_id: 500001 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 500001);
+    }
+
+    #[tokio::test]
+    async fn sde_get_npc_corporation_returns_record_for_known_id() {
+        let (_f, npc_corporations) = make_index(
+            "{\"_key\":1000035,\"name\":{\"en\":\"Caldari Navy\"},\"factionID\":500001}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { npc_corporations, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_npc_corporation(Parameters(CorporationIdParam { corporation_id: 1000035 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 1000035);
+        assert_eq!(v["factionID"], 500001);
+    }
+
+    #[tokio::test]
+    async fn sde_get_skin_returns_record_for_known_id() {
+        let (_f, skins) = make_index(
+            "{\"_key\":1001,\"name\":{\"en\":\"Caldari Navy SKIN\"},\"typeID\":638}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { skins, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_skin(Parameters(SkinIdParam { skin_id: 1001 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 1001);
+        assert_eq!(v["typeID"], 638);
+    }
+
+    #[tokio::test]
+    async fn sde_get_skin_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_skin(Parameters(SkinIdParam { skin_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
 }
