@@ -1,0 +1,12 @@
+{"_key": 34, "groupID": 18, "name": {"en": "Tritanium"}, "published": true, "marketGroupID": 1857, "basePrice": 2.0, "volume": 0.01, "portionSize": 1}
+{"_key": 35, "groupID": 18, "name": {"en": "Pyerite"}, "published": true, "marketGroupID": 1857, "basePrice": 8.0, "volume": 0.01, "portionSize": 1}
+{"_key": 36, "groupID": 18, "name": {"en": "Mexallon"}, "published": true, "marketGroupID": 1857, "basePrice": 32.0, "volume": 0.01, "portionSize": 1}
+{"_key": 37, "groupID": 18, "name": {"en": "Isogen"}, "published": true, "marketGroupID": 1857, "basePrice": 128.0, "volume": 0.01, "portionSize": 1}
+{"_key": 38, "groupID": 18, "name": {"en": "Nocxium"}, "published": true, "marketGroupID": 1857, "basePrice": 512.0, "volume": 0.01, "portionSize": 1}
+{"_key": 39, "groupID": 18, "name": {"en": "Zydrine"}, "published": true, "marketGroupID": 1857, "basePrice": 2048.0, "volume": 0.01, "portionSize": 1}
+{"_key": 40, "groupID": 18, "name": {"en": "Megacyte"}, "published": true, "marketGroupID": 1857, "basePrice": 8192.0, "volume": 0.01, "portionSize": 1}
+{"_key": 638, "groupID": 27, "name": {"en": "Raven"}, "published": true, "marketGroupID": 80, "basePrice": 153900000.0, "mass": 99300000.0, "volume": 470000.0, "portionSize": 1}
+{"_key": 1230, "groupID": 462, "name": {"en": "Veldspar"}, "published": true, "marketGroupID": 518, "basePrice": 2000.0, "mass": 4000.0, "volume": 0.1, "portionSize": 100}
+{"_key": 11399, "groupID": 18, "name": {"en": "Morphite"}, "published": true, "marketGroupID": 1857, "basePrice": 32768.0, "volume": 0.01, "portionSize": 1}
+{"_key": 16227, "groupID": 419, "name": {"en": "Ferox"}, "published": true, "marketGroupID": 471, "basePrice": 0.0, "mass": 14250000.0, "volume": 252000.0, "portionSize": 1}
+{"_key": 16228, "groupID": 489, "name": {"en": "Ferox Blueprint"}, "published": true, "portionSize": 1}

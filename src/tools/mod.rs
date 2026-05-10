@@ -1,3 +1,3 @@
-mod query;
+pub(crate) mod query;
 mod server;
 pub use server::SdeMcpServer;

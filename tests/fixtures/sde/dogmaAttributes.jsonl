@@ -1,0 +1,8 @@
+{"_key": 30, "name": {"en": "power"}, "unitID": 107}
+{"_key": 37, "name": {"en": "maxVelocity"}, "unitID": 11}
+{"_key": 50, "name": {"en": "cpu"}, "unitID": 106}
+{"_key": 263, "name": {"en": "shieldCapacity"}, "unitID": 113}
+{"_key": 265, "name": {"en": "armorHP"}, "unitID": 113}
+{"_key": 9, "name": {"en": "structureHP"}, "unitID": 113}
+{"_key": 11, "name": {"en": "powerOutput"}, "unitID": 107}
+{"_key": 64, "name": {"en": "cpuOutput"}, "unitID": 106}

@@ -1,0 +1,6 @@
+{"_key": 475, "name": {"en": "Manufacture & Research"}, "parentGroupID": null}
+{"_key": 533, "name": {"en": "Materials"}, "parentGroupID": 475}
+{"_key": 1857, "name": {"en": "Minerals"}, "parentGroupID": 533}
+{"_key": 80, "name": {"en": "Battleships"}, "parentGroupID": null}
+{"_key": 471, "name": {"en": "Battlecruisers"}, "parentGroupID": null}
+{"_key": 518, "name": {"en": "Standard Ores"}, "parentGroupID": null}

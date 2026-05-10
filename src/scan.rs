@@ -354,6 +354,67 @@ mod tests {
     use indicatif::ProgressBar;
     use std::io::Write;
 
+    #[test]
+    fn scan_sde_fixture_dir_indexes_all_16_files() {
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        let store =
+            scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
+
+        assert_eq!(store.build, crate::sde_version::PINNED_BUILD);
+        assert_eq!(store.files_scanned, 16);
+
+        assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
+        assert!(store.types.name_index.contains_key("tritanium"), "Tritanium name index missing");
+        assert!(store.types.id_index.contains_key(&16227), "Ferox missing");
+
+        assert!(store.map_solar_systems.id_index.contains_key(&30000142), "Jita missing");
+        assert!(store.map_solar_systems.id_index.contains_key(&30000144), "Perimeter missing");
+        assert!(store.map_solar_systems.name_index.contains_key("jita"), "Jita name index missing");
+
+        assert!(store.blueprints.id_index.contains_key(&16228), "Ferox Blueprint missing");
+        assert_eq!(
+            store.product_to_blueprint.get(&16227),
+            Some(&16228),
+            "Ferox product->blueprint map missing"
+        );
+
+        assert!(store.market_groups.id_index.contains_key(&1857), "Minerals market group missing");
+        assert!(store.factions.id_index.contains_key(&500001), "Caldari State faction missing");
+        assert!(store.npc_corporations.id_index.contains_key(&1000035), "Caldari Navy corp missing");
+        assert!(store.skins.id_index.contains_key(&50), "Ferox skin missing");
+        assert!(store.dogma_attributes.id_index.contains_key(&263), "shieldCapacity attr missing");
+
+        let jita_neighbors = store.stargate_graph.get(&30000142).expect("Jita has no stargate neighbors");
+        assert!(jita_neighbors.contains(&30000144), "Jita->Perimeter stargate missing");
+    }
+
+    #[test]
+    fn fixture_fetch_by_id_and_search_by_name() {
+        use crate::tools::query;
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        let store =
+            scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
+
+        let tritanium = query::fetch_by_id(&store.types, 34).unwrap();
+        assert_eq!(tritanium["_key"], 34);
+        assert_eq!(tritanium["groupID"], 18);
+
+        let results = query::search_by_name(&store.types, "ferox", 10).unwrap();
+        let keys: Vec<_> = results.iter().filter_map(|v| v["_key"].as_u64()).collect();
+        assert!(keys.contains(&16227), "search 'ferox' should find Ferox type");
+
+        let jita = query::fetch_by_id(&store.map_solar_systems, 30000142).unwrap();
+        assert_eq!(jita["_key"], 30000142);
+        assert_eq!(jita["securityStatus"].as_f64().unwrap(), 0.945913);
+
+        let ferox_bp = query::fetch_by_id(&store.blueprints, 16228).unwrap();
+        assert_eq!(ferox_bp["_key"], 16228);
+        let products = ferox_bp["activities"]["manufacturing"]["products"].as_array().unwrap();
+        assert_eq!(products[0]["typeID"], 16227);
+    }
+
     fn hidden_pb() -> ProgressBar {
         ProgressBar::hidden()
     }

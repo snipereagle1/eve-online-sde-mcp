@@ -289,15 +289,15 @@ mod tests {
     #[test]
     #[ignore]
     fn integration_head_check_returns_pinned_build_or_newer() {
-        const PINNED_BUILD: u64 = 3333874;
+        let pinned = crate::sde_version::PINNED_BUILD;
         let client = Client::builder()
             .user_agent("eve-sde-mcp/0.1")
             .build()
             .unwrap();
         let (build, _etag, _url) = head_check(&client).unwrap();
         assert!(
-            build >= PINNED_BUILD,
-            "expected build >= {PINNED_BUILD}, got {build}"
+            build >= pinned,
+            "expected build >= {pinned}, got {build}"
         );
     }
 }

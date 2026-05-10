@@ -1,6 +1,7 @@
 mod config;
 mod download;
 mod scan;
+mod sde_version;
 mod store;
 mod tools;
 

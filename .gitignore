@@ -1,4 +1,5 @@
 target/
 *.mcpb
 sde/
+!tests/fixtures/sde/
 sde-data/
