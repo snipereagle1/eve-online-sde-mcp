@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "eve-sde": {
+            "command": "/home/mckernanin/projects/eve/eve-online-sde-mcp/target/debug/eve-sde-mcp",
+            "args": []
+        }
+    }
+}
