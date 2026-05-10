@@ -14,15 +14,13 @@ use crate::config::{Config, Meta};
 const SDE_URL: &str =
     "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip";
 
-#[allow(dead_code)]
-pub struct DownloadResult {
-    pub build: u64,
-    pub release_date: String,
-    pub etag: String,
-    pub was_downloaded: bool,
+pub(crate) struct DownloadResult {
+    pub(crate) build: u64,
+    pub(crate) release_date: String,
+    pub(crate) was_downloaded: bool,
 }
 
-pub fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
+pub(crate) fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
     let client = Client::builder()
         .user_agent("eve-sde-mcp/0.1")
         .build()
@@ -40,7 +38,6 @@ pub fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
         return Ok(DownloadResult {
             build,
             release_date: meta.release_date.clone(),
-            etag: meta.etag.clone(),
             was_downloaded: false,
         });
     }
@@ -72,7 +69,6 @@ pub fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
     Ok(DownloadResult {
         build,
         release_date,
-        etag,
         was_downloaded: true,
     })
 }
@@ -293,7 +289,7 @@ mod tests {
     #[test]
     #[ignore]
     fn integration_head_check_returns_pinned_build_or_newer() {
-        use crate::sde_version::PINNED_BUILD;
+        const PINNED_BUILD: u64 = 3333874;
         let client = Client::builder()
             .user_agent("eve-sde-mcp/0.1")
             .build()

@@ -313,10 +313,10 @@ impl SdeMcpServer {
         &self,
         Parameters(p): Parameters<RouteParam>,
     ) -> Result<String, ErrorData> {
-        let graph = self.store.stargate_graph.clone();
+        let store = Arc::clone(&self.store);
         let from = p.from_system_id;
         let to = p.to_system_id;
-        let path = tokio::task::spawn_blocking(move || bfs_route(&graph, from, to))
+        let path = tokio::task::spawn_blocking(move || bfs_route(&store.stargate_graph, from, to))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         match path {
@@ -477,34 +477,7 @@ mod tests {
     }
 
     fn make_server() -> SdeMcpServer {
-        SdeMcpServer::new(
-            Arc::new(SdeStore {
-                data_dir: std::path::PathBuf::from("/tmp"),
-                build: 42,
-                release_date: "2024-01-01".to_string(),
-                files_scanned: 16,
-                last_updated: "2024-01-01".to_string(),
-                types: empty_index(),
-                groups: empty_index(),
-                categories: empty_index(),
-                blueprints: empty_index(),
-                type_materials: empty_index(),
-                map_solar_systems: empty_index(),
-                map_constellations: empty_index(),
-                map_regions: empty_index(),
-                map_stargates: empty_index(),
-                npc_stations: empty_index(),
-                market_groups: empty_index(),
-                dogma_attributes: empty_index(),
-                dogma_effects: empty_index(),
-                factions: empty_index(),
-                npc_corporations: empty_index(),
-                skins: empty_index(),
-                product_to_blueprint: HashMap::new(),
-                stargate_graph: HashMap::new(),
-            }),
-            None,
-        )
+        SdeMcpServer::new(Arc::new(default_store()), None)
     }
 
     fn empty_index() -> crate::store::SdeIndex {
@@ -530,7 +503,6 @@ mod tests {
             map_solar_systems: empty_index(),
             map_constellations: empty_index(),
             map_regions: empty_index(),
-            map_stargates: empty_index(),
             npc_stations: empty_index(),
             market_groups: empty_index(),
             dogma_attributes: empty_index(),

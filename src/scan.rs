@@ -11,10 +11,12 @@ use std::{
 
 use crate::store::{SdeIndex, SdeStore};
 
+const SDE_FILE_COUNT: u64 = 16;
+
 pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<SdeStore>> {
     let root = find_sde_root(sde_dir)?;
 
-    let pb = ProgressBar::with_draw_target(Some(16), ProgressDrawTarget::stderr());
+    let pb = ProgressBar::with_draw_target(Some(SDE_FILE_COUNT), ProgressDrawTarget::stderr());
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
@@ -32,8 +34,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
     let map_constellations = scan_index(&root.join("mapConstellations.jsonl"), &pb)?;
     let map_regions = scan_index(&root.join("mapRegions.jsonl"), &pb)?;
-    let (map_stargates, stargate_graph) =
-        scan_stargates(&root.join("mapStargates.jsonl"), &pb)?;
+    let stargate_graph = scan_stargates(&root.join("mapStargates.jsonl"), &pb)?;
     let npc_stations = scan_index(&root.join("npcStations.jsonl"), &pb)?;
     let market_groups = scan_index(&root.join("marketGroups.jsonl"), &pb)?;
     let dogma_attributes = scan_index(&root.join("dogmaAttributes.jsonl"), &pb)?;
@@ -46,7 +47,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
 
     tracing::debug!(
         "SDE scan complete: {} files, build {}",
-        16,
+        SDE_FILE_COUNT,
         build
     );
 
@@ -54,7 +55,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         data_dir: sde_dir.to_path_buf(),
         build,
         release_date: release_date.to_owned(),
-        files_scanned: 16,
+        files_scanned: SDE_FILE_COUNT as usize,
         last_updated: release_date.to_owned(),
         types,
         groups,
@@ -64,7 +65,6 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         map_solar_systems,
         map_constellations,
         map_regions,
-        map_stargates,
         npc_stations,
         market_groups,
         dogma_attributes,
@@ -96,7 +96,6 @@ pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn scan_blueprints_pub(
     path: &Path,
     pb: &ProgressBar,
@@ -229,10 +228,7 @@ fn scan_blueprints(
     ))
 }
 
-fn scan_stargates(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
+fn scan_stargates(path: &Path, pb: &ProgressBar) -> Result<HashMap<u64, Vec<u64>>> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -242,34 +238,23 @@ fn scan_stargates(
 
     #[derive(serde::Deserialize)]
     struct Line {
-        #[serde(rename = "_key")]
-        key: u64,
         #[serde(rename = "systemID")]
         system_id: u64,
         destination: Destination,
-        name: Option<LocalizedName>,
     }
     #[derive(serde::Deserialize)]
     struct Destination {
         #[serde(rename = "systemID")]
         system_id: u64,
     }
-    #[derive(serde::Deserialize)]
-    struct LocalizedName {
-        en: Option<String>,
-    }
 
     let file =
         fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
-    let mut id_index = HashMap::new();
-    let mut name_index = HashMap::new();
     let mut stargate_graph: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut buf = String::new();
-    let mut offset = 0u64;
 
     loop {
-        let line_start = offset;
         buf.clear();
         let n = reader
             .read_line(&mut buf)
@@ -277,33 +262,20 @@ fn scan_stargates(
         if n == 0 {
             break;
         }
-        offset += n as u64;
 
         let trimmed = buf.trim();
         if trimmed.is_empty() {
             continue;
         }
         if let Ok(parsed) = serde_json::from_str::<Line>(trimmed) {
-            id_index.insert(parsed.key, line_start);
-            if let Some(name) = parsed.name.and_then(|n| n.en) {
-                name_index.insert(name.to_lowercase(), line_start);
-            }
             let src = parsed.system_id;
             let dst = parsed.destination.system_id;
             stargate_graph.entry(src).or_default().push(dst);
-            stargate_graph.entry(dst).or_default().push(src);
         }
     }
 
     pb.inc(1);
-    Ok((
-        SdeIndex {
-            path: path.to_path_buf(),
-            id_index,
-            name_index,
-        },
-        stargate_graph,
-    ))
+    Ok(stargate_graph)
 }
 
 fn extract_key(line: &[u8]) -> Option<u64> {
@@ -484,19 +456,18 @@ mod tests {
 
     #[test]
     fn scan_stargates_builds_bidirectional_graph() {
-        let fixture = r#"{"_key":50000056,"systemID":30000001,"destination":{"stargateID":50000055,"systemID":30000002},"name":{"en":"Stargate (Akpivem)"}}
-{"_key":50000055,"systemID":30000002,"destination":{"stargateID":50000056,"systemID":30000001},"name":{"en":"Stargate (Tanoo)"}}
+        let fixture = r#"{"_key":50000056,"systemID":30000001,"destination":{"stargateID":50000055,"systemID":30000002}}
+{"_key":50000055,"systemID":30000002,"destination":{"stargateID":50000056,"systemID":30000001}}
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
-        let (idx, graph) = scan_stargates(&path, &pb).unwrap();
-
-        assert!(idx.id_index.contains_key(&50000056));
-        assert!(idx.name_index.contains_key("stargate (akpivem)"));
+        let graph = scan_stargates(&path, &pb).unwrap();
 
         let neighbors_1 = graph.get(&30000001).unwrap();
         let neighbors_2 = graph.get(&30000002).unwrap();
         assert!(neighbors_1.contains(&30000002));
+        assert_eq!(neighbors_1.len(), 1, "no duplicate edges");
         assert!(neighbors_2.contains(&30000001));
+        assert_eq!(neighbors_2.len(), 1, "no duplicate edges");
     }
 }
