@@ -465,6 +465,24 @@ fn bfs_route(graph: &HashMap<u64, Vec<u64>>, from: u64, to: u64) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    fn write_fixture(content: &str) -> (tempfile::NamedTempFile, std::path::PathBuf) {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        let path = f.path().to_path_buf();
+        (f, path)
+    }
+
+    fn make_index(content: &str) -> (tempfile::NamedTempFile, crate::store::SdeIndex) {
+        let (_f, path) = write_fixture(content);
+        let pb = indicatif::ProgressBar::hidden();
+        let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
+        (_f, idx)
+    }
 
     fn make_server() -> SdeMcpServer {
         SdeMcpServer::new(
@@ -502,6 +520,34 @@ mod tests {
             path: std::path::PathBuf::from("/dev/null"),
             id_index: HashMap::new(),
             name_index: HashMap::new(),
+        }
+    }
+
+    fn default_store() -> SdeStore {
+        SdeStore {
+            data_dir: std::path::PathBuf::from("/tmp"),
+            build: 42,
+            release_date: "2024-01-01".to_string(),
+            files_scanned: 16,
+            last_updated: "2024-01-01".to_string(),
+            types: empty_index(),
+            groups: empty_index(),
+            categories: empty_index(),
+            blueprints: empty_index(),
+            type_materials: empty_index(),
+            map_solar_systems: empty_index(),
+            map_constellations: empty_index(),
+            map_regions: empty_index(),
+            map_stargates: empty_index(),
+            npc_stations: empty_index(),
+            market_groups: empty_index(),
+            dogma_attributes: empty_index(),
+            dogma_effects: empty_index(),
+            factions: empty_index(),
+            npc_corporations: empty_index(),
+            skins: empty_index(),
+            product_to_blueprint: HashMap::new(),
+            stargate_graph: HashMap::new(),
         }
     }
 
@@ -545,6 +591,168 @@ mod tests {
         let graph = HashMap::new();
         let path = bfs_route(&graph, 42, 42).unwrap();
         assert_eq!(path, vec![42]);
+    }
+
+    #[tokio::test]
+    async fn sde_get_type_returns_record_for_known_id() {
+        let (_f, types) = make_index(
+            "{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                types,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_type(Parameters(TypeIdParam { type_id: 34 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 34);
+    }
+
+    #[tokio::test]
+    async fn sde_search_types_returns_matches() {
+        let (_f, types) = make_index(
+            "{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n\
+             {\"_key\":35,\"name\":{\"en\":\"Pyerite\"},\"published\":false}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                types,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_search_types(Parameters(SearchTypesParam {
+                query: "trit".to_string(),
+                limit: None,
+                published_only: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["_key"], 34);
+    }
+
+    #[tokio::test]
+    async fn sde_search_types_published_only_filters_unpublished() {
+        let (_f, types) = make_index(
+            "{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n\
+             {\"_key\":35,\"name\":{\"en\":\"Tritan Scrap\"},\"published\":false}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                types,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_search_types(Parameters(SearchTypesParam {
+                query: "tritan".to_string(),
+                limit: None,
+                published_only: Some(true),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["_key"], 34);
+    }
+
+    #[tokio::test]
+    async fn sde_get_group_returns_record_for_known_id() {
+        let (_f, groups) =
+            make_index("{\"_key\":18,\"name\":{\"en\":\"Mineral\"},\"categoryID\":4}\n");
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                groups,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_group(Parameters(GroupIdParam { group_id: 18 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 18);
+        assert_eq!(v["categoryID"], 4);
+    }
+
+    #[tokio::test]
+    async fn sde_get_group_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_group(Parameters(GroupIdParam { group_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_category_returns_record_for_known_id() {
+        let (_f, categories) =
+            make_index("{\"_key\":4,\"name\":{\"en\":\"Material\"},\"published\":true}\n");
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                categories,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_category(Parameters(CategoryIdParam { category_id: 4 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 4);
+    }
+
+    #[tokio::test]
+    async fn sde_get_category_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_category(Parameters(CategoryIdParam { category_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_type_materials_returns_record_for_known_id() {
+        let (_f, type_materials) = make_index(
+            "{\"_key\":34,\"materials\":[{\"typeID\":35,\"quantity\":10}]}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                type_materials,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_type_materials(Parameters(TypeIdParam { type_id: 34 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 34);
+        assert_eq!(v["materials"][0]["typeID"], 35);
+    }
+
+    #[tokio::test]
+    async fn sde_get_type_materials_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_type_materials(Parameters(TypeIdParam { type_id: 99 }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
     }
 
     #[tokio::test]
