@@ -18,8 +18,8 @@ pub(crate) struct Config {
     #[arg(long, default_value_t = false)]
     pub(crate) redownload: bool,
 
-    /// Language for localized names (e.g. "en", "de")
-    #[arg(long, env = "SDE_LANGUAGE")]
+    /// Language for localized names (e.g. "en", "de"). Defaults to "en" to reduce token usage.
+    #[arg(long, env = "SDE_LANGUAGE", default_value = "en")]
     pub(crate) language: Option<String>,
 }
 
