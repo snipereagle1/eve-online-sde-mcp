@@ -785,6 +785,104 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn sde_get_solar_system_by_id_returns_record() {
+        let (_f, map_solar_systems) = make_index(
+            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                map_solar_systems,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_solar_system(Parameters(SolarSystemParam {
+                system_id: Some(30000142),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 30000142);
+    }
+
+    #[tokio::test]
+    async fn sde_get_solar_system_by_name_returns_record() {
+        let (_f, map_solar_systems) = make_index(
+            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                map_solar_systems,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_solar_system(Parameters(SolarSystemParam {
+                system_id: None,
+                name: Some("Jita".to_string()),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 30000142);
+    }
+
+    #[tokio::test]
+    async fn sde_find_route_returns_path_with_correct_jump_count() {
+        // A → B → C → D: 3 jumps, 4 systems
+        let mut graph = HashMap::new();
+        graph.insert(1u64, vec![2u64]);
+        graph.insert(2u64, vec![1u64, 3u64]);
+        graph.insert(3u64, vec![2u64, 4u64]);
+        graph.insert(4u64, vec![3u64]);
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                stargate_graph: graph,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_find_route(Parameters(RouteParam {
+                from_system_id: 1,
+                to_system_id: 4,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["jumps"], 3);
+        assert_eq!(v["path"].as_array().unwrap().len(), 4);
+        assert_eq!(v["path"][0], 1);
+        assert_eq!(v["path"][3], 4);
+    }
+
+    #[tokio::test]
+    async fn sde_find_route_returns_error_for_unreachable_system() {
+        let mut graph = HashMap::new();
+        graph.insert(1u64, vec![2u64]);
+        graph.insert(2u64, vec![1u64]);
+        // system 99 is isolated
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                stargate_graph: graph,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_find_route(Parameters(RouteParam {
+                from_system_id: 1,
+                to_system_id: 99,
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("No route found"));
+    }
+
     fn make_blueprint_index(
         content: &str,
     ) -> (tempfile::NamedTempFile, crate::store::SdeIndex, HashMap<u64, u64>) {
