@@ -2,8 +2,8 @@
 name: eve-sde-mcp
 status: backlog
 created: 2026-05-09T22:30:11Z
-updated: 2026-05-09T22:39:22Z
-progress: 0%
+updated: 2026-05-10T19:46:54Z
+progress: 62%
 prd: .claude/prds/eve-sde-mcp.md
 github: https://github.com/snipereagle1/eve-online-sde-mcp/issues/1
 ---
