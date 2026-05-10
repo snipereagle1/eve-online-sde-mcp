@@ -238,13 +238,13 @@ fn scan_stargates(path: &Path, pb: &ProgressBar) -> Result<HashMap<u64, Vec<u64>
 
     #[derive(serde::Deserialize)]
     struct Line {
-        #[serde(rename = "systemID")]
+        #[serde(rename = "solarSystemID")]
         system_id: u64,
         destination: Destination,
     }
     #[derive(serde::Deserialize)]
     struct Destination {
-        #[serde(rename = "systemID")]
+        #[serde(rename = "solarSystemID")]
         system_id: u64,
     }
 
@@ -456,8 +456,8 @@ mod tests {
 
     #[test]
     fn scan_stargates_builds_bidirectional_graph() {
-        let fixture = r#"{"_key":50000056,"systemID":30000001,"destination":{"stargateID":50000055,"systemID":30000002}}
-{"_key":50000055,"systemID":30000002,"destination":{"stargateID":50000056,"systemID":30000001}}
+        let fixture = r#"{"_key":50000056,"solarSystemID":30000001,"destination":{"stargateID":50000055,"solarSystemID":30000002}}
+{"_key":50000055,"solarSystemID":30000002,"destination":{"stargateID":50000056,"solarSystemID":30000001}}
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
