@@ -1105,4 +1105,303 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("99"));
     }
+
+    #[tokio::test]
+    async fn sde_search_solar_systems_returns_matches() {
+        let (_f, map_solar_systems) = make_index(
+            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n\
+             {\"_key\":30000144,\"name\":{\"en\":\"Perimeter\"},\"securityStatus\":0.9531}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { map_solar_systems, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_search_solar_systems(Parameters(SearchParam {
+                query: "jit".to_string(),
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["_key"], 30000142);
+    }
+
+    #[tokio::test]
+    async fn sde_get_region_returns_record_by_id() {
+        let (_f, map_regions) =
+            make_index("{\"_key\":10000002,\"name\":{\"en\":\"The Forge\"}}\n");
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { map_regions, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_region(Parameters(RegionParam {
+                region_id: Some(10000002),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 10000002);
+    }
+
+    #[tokio::test]
+    async fn sde_get_constellation_returns_record_for_known_id() {
+        let (_f, map_constellations) = make_index(
+            "{\"_key\":20000020,\"name\":{\"en\":\"Kimotoro\"},\"regionID\":10000002}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { map_constellations, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_constellation(Parameters(ConstellationIdParam {
+                constellation_id: 20000020,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 20000020);
+    }
+
+    #[tokio::test]
+    async fn sde_get_npc_station_returns_record_for_known_id() {
+        let (_f, npc_stations) = make_index(
+            "{\"_key\":60003760,\"solarSystemID\":30000142,\"ownerID\":1000035}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore { npc_stations, ..default_store() }),
+            None,
+        );
+        let result = server
+            .sde_get_npc_station(Parameters(StationIdParam { station_id: 60003760 }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 60003760);
+    }
+
+    #[tokio::test]
+    async fn mcp_all_21_tools_via_fixture_data() -> anyhow::Result<()> {
+        use rmcp::{ClientHandler, ServiceExt as _, model::{ClientInfo, CallToolRequestParams}};
+
+        #[derive(Clone, Default)]
+        struct DummyClient;
+        impl ClientHandler for DummyClient {
+            fn get_info(&self) -> ClientInfo {
+                ClientInfo::default()
+            }
+        }
+
+        fn text_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.raw.as_text())
+                .map(|t| t.text.as_str())
+                .expect("expected text content");
+            serde_json::from_str(text).expect("invalid JSON in tool response")
+        }
+
+        fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+            v.as_object().unwrap().clone()
+        }
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sde");
+        let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
+
+        let (server_transport, client_transport) = tokio::io::duplex(65536);
+        let server_handle = tokio::spawn(async move {
+            SdeMcpServer::new(store, Some("en".to_string()))
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = DummyClient.serve(client_transport).await?;
+
+        // sde_status
+        let r = text_json(&client.call_tool(CallToolRequestParams::new("sde_status")).await?);
+        assert_eq!(r["build"], 3333874);
+        assert_eq!(r["release_date"], "2024-01-15");
+        assert!(r["files_scanned"].as_u64().unwrap() > 0);
+
+        // sde_get_type
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_type").with_arguments(obj(serde_json::json!({"type_id": 34}))),
+        ).await?);
+        assert_eq!(r["_key"], 34);
+        assert_eq!(r["name"], "Tritanium");
+
+        // sde_search_types
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_search_types")
+                .with_arguments(obj(serde_json::json!({"query": "trit"}))),
+        ).await?);
+        assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 34));
+
+        // sde_get_group
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_group").with_arguments(obj(serde_json::json!({"group_id": 18}))),
+        ).await?);
+        assert_eq!(r["_key"], 18);
+        assert_eq!(r["name"], "Mineral");
+
+        // sde_get_category
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_category")
+                .with_arguments(obj(serde_json::json!({"category_id": 4}))),
+        ).await?);
+        assert_eq!(r["_key"], 4);
+        assert_eq!(r["name"], "Material");
+
+        // sde_get_type_materials
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_type_materials")
+                .with_arguments(obj(serde_json::json!({"type_id": 1230}))),
+        ).await?);
+        assert_eq!(r["_key"], 1230);
+        assert!(r["materials"].as_array().is_some());
+
+        // sde_get_blueprint
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_blueprint")
+                .with_arguments(obj(serde_json::json!({"blueprint_type_id": 16228}))),
+        ).await?);
+        assert_eq!(r["_key"], 16228);
+        assert!(r["activities"]["manufacturing"].is_object());
+
+        // sde_get_blueprint_for_product (Ferox blueprint makes Ferox)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_blueprint_for_product")
+                .with_arguments(obj(serde_json::json!({"product_type_id": 16227}))),
+        ).await?);
+        assert_eq!(r["_key"], 16228);
+
+        // sde_get_solar_system (by ID)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_solar_system")
+                .with_arguments(obj(serde_json::json!({"system_id": 30000142}))),
+        ).await?);
+        assert_eq!(r["_key"], 30000142);
+        assert_eq!(r["name"], "Jita");
+
+        // sde_search_solar_systems
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_search_solar_systems")
+                .with_arguments(obj(serde_json::json!({"query": "jita"}))),
+        ).await?);
+        assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
+
+        // sde_get_region (by ID)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_region")
+                .with_arguments(obj(serde_json::json!({"region_id": 10000002}))),
+        ).await?);
+        assert_eq!(r["_key"], 10000002);
+        assert_eq!(r["name"], "The Forge");
+
+        // sde_get_constellation
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_constellation")
+                .with_arguments(obj(serde_json::json!({"constellation_id": 20000020}))),
+        ).await?);
+        assert_eq!(r["_key"], 20000020);
+        assert_eq!(r["name"], "Kimotoro");
+
+        // sde_get_npc_station
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_npc_station")
+                .with_arguments(obj(serde_json::json!({"station_id": 60003760}))),
+        ).await?);
+        assert_eq!(r["_key"], 60003760);
+        assert_eq!(r["solarSystemID"], 30000142);
+
+        // sde_find_route: Jita → Perimeter (1 jump)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_find_route").with_arguments(obj(serde_json::json!({
+                "from_system_id": 30000142,
+                "to_system_id": 30000144,
+            }))),
+        ).await?);
+        assert_eq!(r["jumps"], 1);
+        assert_eq!(r["path"].as_array().unwrap().len(), 2);
+        assert_eq!(r["path"][0], 30000142);
+        assert_eq!(r["path"][1], 30000144);
+
+        // sde_find_route: unreachable system → error response (Ikuchi has no stargates)
+        let err = client.call_tool(
+            CallToolRequestParams::new("sde_find_route").with_arguments(obj(serde_json::json!({
+                "from_system_id": 30000142,
+                "to_system_id": 30000138,
+            }))),
+        ).await;
+        assert!(err.is_err(), "expected error for unreachable system");
+
+        // sde_get_market_group
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_market_group")
+                .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
+        ).await?);
+        assert_eq!(r["_key"], 1857);
+        assert_eq!(r["name"], "Minerals");
+
+        // sde_get_market_group_tree (Minerals → Materials → Manufacture & Research)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_market_group_tree")
+                .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
+        ).await?);
+        let arr = r.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["_key"], 475); // root: Manufacture & Research
+        assert_eq!(arr[2]["_key"], 1857); // leaf: Minerals
+
+        // sde_get_dogma_attribute
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_dogma_attribute")
+                .with_arguments(obj(serde_json::json!({"attribute_id": 30}))),
+        ).await?);
+        assert_eq!(r["_key"], 30);
+        assert_eq!(r["name"], "power");
+
+        // sde_get_dogma_effect
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_dogma_effect")
+                .with_arguments(obj(serde_json::json!({"effect_id": 11}))),
+        ).await?);
+        assert_eq!(r["_key"], 11);
+        assert_eq!(r["name"], "loPower");
+
+        // sde_get_faction
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_faction")
+                .with_arguments(obj(serde_json::json!({"faction_id": 500001}))),
+        ).await?);
+        assert_eq!(r["_key"], 500001);
+        assert_eq!(r["name"], "Caldari State");
+
+        // sde_get_npc_corporation
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_npc_corporation")
+                .with_arguments(obj(serde_json::json!({"corporation_id": 1000035}))),
+        ).await?);
+        assert_eq!(r["_key"], 1000035);
+        assert_eq!(r["name"], "Caldari Navy");
+
+        // sde_get_skin
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_skin")
+                .with_arguments(obj(serde_json::json!({"skin_id": 50}))),
+        ).await?);
+        assert_eq!(r["_key"], 50);
+        assert_eq!(r["internalName"], "Ferox Caldari Union Day YC124");
+
+        client.cancel().await?;
+        let _ = server_handle.await;
+        Ok(())
+    }
 }
