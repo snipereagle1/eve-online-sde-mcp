@@ -238,17 +238,9 @@ impl SdeMcpServer {
         &self,
         Parameters(p): Parameters<ProductTypeIdParam>,
     ) -> Result<String, ErrorData> {
-        let bp_id = self
-            .store
-            .product_to_blueprint
-            .get(&p.product_type_id)
-            .copied()
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("No blueprint found for product type {}", p.product_type_id),
-                    None,
-                )
-            })?;
+        let Some(&bp_id) = self.store.product_to_blueprint.get(&p.product_type_id) else {
+            return Ok(serde_json::json!({"result": null}).to_string());
+        };
         self.fetch_filtered(&self.store.blueprints, bp_id, "blueprints")
     }
 
@@ -791,5 +783,79 @@ mod tests {
         client.cancel().await?;
         let _ = server_handle.await;
         Ok(())
+    }
+
+    fn make_blueprint_index(
+        content: &str,
+    ) -> (tempfile::NamedTempFile, crate::store::SdeIndex, HashMap<u64, u64>) {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        use std::io::Write as _;
+        f.write_all(content.as_bytes()).unwrap();
+        let path = f.path().to_path_buf();
+        let pb = indicatif::ProgressBar::hidden();
+        let (idx, p2b) = crate::scan::scan_blueprints_pub(&path, &pb).unwrap();
+        (f, idx, p2b)
+    }
+
+    #[tokio::test]
+    async fn sde_get_blueprint_returns_record_for_known_id() {
+        let fixture = r#"{"_key":683,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}],"time":6000}}}
+"#;
+        let (_f, blueprints, product_to_blueprint) = make_blueprint_index(fixture);
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                blueprints,
+                product_to_blueprint,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_blueprint(Parameters(BlueprintTypeIdParam {
+                blueprint_type_id: 683,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 683);
+    }
+
+    #[tokio::test]
+    async fn sde_get_blueprint_for_product_returns_blueprint_for_known_product() {
+        let fixture = r#"{"_key":683,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}],"time":6000}}}
+"#;
+        let (_f, blueprints, product_to_blueprint) = make_blueprint_index(fixture);
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                blueprints,
+                product_to_blueprint,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_blueprint_for_product(Parameters(ProductTypeIdParam {
+                product_type_id: 582,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 683);
+    }
+
+    #[tokio::test]
+    async fn sde_get_blueprint_for_product_returns_null_for_unknown_product() {
+        let server = make_server();
+        let result = server
+            .sde_get_blueprint_for_product(Parameters(ProductTypeIdParam {
+                product_type_id: 99999,
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["result"], serde_json::Value::Null);
     }
 }

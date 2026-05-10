@@ -95,6 +95,15 @@ pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     scan_index(path, pb)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn scan_blueprints_pub(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, u64>)> {
+    scan_blueprints(path, pb)
+}
+
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     pb.set_message(
         path.file_name()
