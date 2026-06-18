@@ -117,6 +117,64 @@ pub struct SkinIdParam {
     pub skin_id: u64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct TypeDogmaParam {
+    /// EVE type ID
+    pub type_id: u64,
+    /// Join attributeID→name and decode skill-prerequisite attrs (182/183/184 + levels)
+    /// into a `requiredSkill` object. Default false keeps the raw record.
+    pub resolve_names: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkillPlanTarget {
+    /// Type ID to train prerequisites for (ship, module, or a skill itself)
+    pub type_id: u64,
+    /// When the target is a skill, train it to this level (default 5). Ignored for
+    /// non-skill targets (their prerequisites keep the levels the item demands).
+    pub level_override: Option<u8>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkillPlanParam {
+    /// Targets are treated as separate items (not a merged fit); no variant expansion
+    pub targets: Vec<SkillPlanTarget>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ModifierQueryParam {
+    /// Direction-a: a skill/ship/type ID → the attributes it modifies + magnitudes
+    pub type_id: Option<u64>,
+    /// Direction-b: a target attribute ID (e.g. 77 miningAmount) → the modifiers that hit it
+    pub attribute_id: Option<u64>,
+    /// Direction-c: a dogma effect ID → the raw modifierInfo entries it defines
+    pub effect_id: Option<u64>,
+    /// Join attribute IDs to human names from dogmaAttributes (default true)
+    pub resolve_names: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TypeIdsParam {
+    /// EVE type IDs to fetch in one call
+    pub type_ids: Vec<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ResolveTypesParam {
+    /// Type IDs to resolve to names
+    pub type_ids: Option<Vec<u64>>,
+    /// Exact type names to resolve to IDs (case-insensitive)
+    pub names: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkillSpParam {
+    /// Skill rank directly (skillTimeConstant, attribute 275)
+    pub rank: Option<u64>,
+    /// Or a skill's type ID — its rank is looked up from dogma
+    pub type_id: Option<u64>,
+}
+
 // ── Server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -160,6 +218,224 @@ impl SdeMcpServer {
             self.filter(v);
         }
         Ok(results)
+    }
+
+    /// English (or configured-language) name of a type, or None if unknown.
+    fn type_name(&self, id: u64) -> Option<String> {
+        let v = query::fetch_by_id(&self.store.types, id).ok()?;
+        pick_name(v.get("name"), self.language.as_deref())
+    }
+
+    /// Name of a dogma attribute by id, or None.
+    fn attribute_name(&self, id: u64) -> Option<String> {
+        let v = query::fetch_by_id(&self.store.dogma_attributes, id).ok()?;
+        pick_name(v.get("name"), self.language.as_deref())
+    }
+
+    /// In-place: annotate each dogmaAttribute with `attributeName`, and decode
+    /// skill-prerequisite slots (182/183/184 + 277/278/279) into a `requiredSkill` object.
+    fn annotate_dogma_names(&self, val: &mut serde_json::Value) {
+        let Some(attrs) = val.get_mut("dogmaAttributes").and_then(|a| a.as_array_mut()) else {
+            return;
+        };
+        // First pass: collect prereq slot levels so we can pair skill id with its level.
+        let mut levels: HashMap<u64, u64> = HashMap::new();
+        for a in attrs.iter() {
+            if let (Some(aid @ 277..=279), Some(v)) = (
+                a.get("attributeID").and_then(|x| x.as_u64()),
+                a.get("value").and_then(|x| x.as_f64()),
+            ) {
+                levels.insert(aid, v as u64);
+            }
+        }
+        for a in attrs.iter_mut() {
+            let Some(aid) = a.get("attributeID").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            if let Some(name) = self.attribute_name(aid) {
+                a["attributeName"] = serde_json::Value::String(name);
+            }
+            // 182→277, 183→278, 184→279 are requiredSkillN / requiredSkillNLevel pairs.
+            let level_attr = match aid {
+                182 => Some(277),
+                183 => Some(278),
+                184 => Some(279),
+                _ => None,
+            };
+            if let (Some(level_attr), Some(skill_id)) =
+                (level_attr, a.get("value").and_then(|x| x.as_f64()))
+            {
+                let skill_id = skill_id as u64;
+                a["requiredSkill"] = serde_json::json!({
+                    "skill_id": skill_id,
+                    "skill_name": self.type_name(skill_id),
+                    "level": levels.get(&level_attr).copied().unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    /// Direction-a: a type's outgoing modifiers — for each effect it carries, the
+    /// attributes that effect modifies and the magnitude on this type.
+    fn modifiers_for_type(
+        &self,
+        type_id: u64,
+        resolve_names: bool,
+    ) -> Result<serde_json::Value, ErrorData> {
+        let dogma = query::fetch_by_id(&self.store.type_dogma, type_id).map_err(|_| {
+            ErrorData::invalid_params(format!("ID {type_id} not found in typeDogma"), None)
+        })?;
+        // Magnitude lookup: this type's own attribute values, keyed by attributeID.
+        let mut magnitudes: HashMap<u64, f64> = HashMap::new();
+        if let Some(attrs) = dogma.get("dogmaAttributes").and_then(|a| a.as_array()) {
+            for a in attrs {
+                if let (Some(aid), Some(v)) = (
+                    a.get("attributeID").and_then(|x| x.as_u64()),
+                    a.get("value").and_then(|x| x.as_f64()),
+                ) {
+                    magnitudes.insert(aid, v);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        if let Some(effects) = dogma.get("dogmaEffects").and_then(|e| e.as_array()) {
+            for e in effects {
+                let Some(eid) = e.get("effectID").and_then(|x| x.as_u64()) else {
+                    tracing::warn!("type {type_id}: dogmaEffects entry has non-integer effectID; skipping");
+                    continue;
+                };
+                let effect = match query::fetch_by_id(&self.store.dogma_effects, eid) {
+                    Ok(effect) => effect,
+                    // Effect not indexed at all: nothing to resolve, expected skip.
+                    Err(_) if !self.store.dogma_effects.id_index.contains_key(&eid) => continue,
+                    // Indexed but unreadable (IO/parse): a real failure — don't let it
+                    // masquerade as "this type modifies nothing".
+                    Err(err) => {
+                        tracing::warn!(
+                            "type {type_id}: failed to read dogma effect {eid}: {err}; \
+                             modifier list may be incomplete"
+                        );
+                        continue;
+                    }
+                };
+                let Some(mods) = effect.get("modifierInfo").and_then(|m| m.as_array()) else {
+                    continue;
+                };
+                for m in mods {
+                    let modified = m.get("modifiedAttributeID").and_then(|x| x.as_u64());
+                    let modifying = m.get("modifyingAttributeID").and_then(|x| x.as_u64());
+                    let (Some(modified), Some(modifying)) = (modified, modifying) else {
+                        continue;
+                    };
+                    let mut row = serde_json::json!({
+                        "effect_id": eid,
+                        "modified_attribute_id": modified,
+                        "modifying_attribute_id": modifying,
+                        "operation": m.get("operation").and_then(|x| x.as_i64()),
+                        "magnitude": magnitudes.get(&modifying),
+                    });
+                    if resolve_names {
+                        row["modified_attribute_name"] =
+                            serde_json::to_value(self.attribute_name(modified)).unwrap();
+                        row["modifying_attribute_name"] =
+                            serde_json::to_value(self.attribute_name(modifying)).unwrap();
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(serde_json::json!({"type_id": type_id, "modifies": rows}))
+    }
+
+    /// Direction-c: the raw modifierInfo entries a single dogma effect defines.
+    fn modifiers_for_effect(
+        &self,
+        effect_id: u64,
+        resolve_names: bool,
+    ) -> Result<serde_json::Value, ErrorData> {
+        let effect = query::fetch_by_id(&self.store.dogma_effects, effect_id).map_err(|_| {
+            ErrorData::invalid_params(format!("ID {effect_id} not found in dogmaEffects"), None)
+        })?;
+        let mut rows = Vec::new();
+        if let Some(mods) = effect.get("modifierInfo").and_then(|m| m.as_array()) {
+            for m in mods {
+                let modified = m.get("modifiedAttributeID").and_then(|x| x.as_u64());
+                let modifying = m.get("modifyingAttributeID").and_then(|x| x.as_u64());
+                let mut row = serde_json::json!({
+                    "modified_attribute_id": modified,
+                    "modifying_attribute_id": modifying,
+                    "operation": m.get("operation").and_then(|x| x.as_i64()),
+                    "func": m.get("func"),
+                    "domain": m.get("domain"),
+                    "skill_type_id": m.get("skillTypeID").and_then(|x| x.as_u64()),
+                });
+                if resolve_names {
+                    if let Some(a) = modified {
+                        row["modified_attribute_name"] =
+                            serde_json::to_value(self.attribute_name(a)).unwrap();
+                    }
+                    if let Some(a) = modifying {
+                        row["modifying_attribute_name"] =
+                            serde_json::to_value(self.attribute_name(a)).unwrap();
+                    }
+                }
+                rows.push(row);
+            }
+        }
+        Ok(serde_json::json!({"effect_id": effect_id, "modifiers": rows}))
+    }
+
+    /// Direction-b: which modifiers target a given attribute (reverse index lookup).
+    fn modifiers_for_attribute(
+        &self,
+        attribute_id: u64,
+        resolve_names: bool,
+    ) -> Result<serde_json::Value, ErrorData> {
+        // Distinguish "valid attribute nobody modifies" (empty list) from "no such
+        // attribute" (error) — otherwise a typo'd id returns a confident empty answer.
+        if !self.store.dogma_attributes.id_index.contains_key(&attribute_id) {
+            return Err(ErrorData::invalid_params(
+                format!("ID {attribute_id} not found in dogmaAttributes"),
+                None,
+            ));
+        }
+        let mut rows = Vec::new();
+        if let Some(mods) = self.store.attribute_modifiers.get(&attribute_id) {
+            for m in mods {
+                // Magnitude is only knowable when the source type is identified (skillTypeID).
+                let magnitude = m.skill_type_id.and_then(|sid| {
+                    query::fetch_by_id(&self.store.type_dogma, sid).ok().and_then(|d| {
+                        d.get("dogmaAttributes")
+                            .and_then(|a| a.as_array())
+                            .and_then(|attrs| {
+                                attrs.iter().find_map(|a| {
+                                    let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
+                                    (aid == m.modifying_attribute_id)
+                                        .then(|| a.get("value").and_then(|x| x.as_f64()))
+                                        .flatten()
+                                })
+                            })
+                    })
+                });
+                let mut row = serde_json::json!({
+                    "effect_id": m.effect_id,
+                    "modifying_attribute_id": m.modifying_attribute_id,
+                    "operation": m.operation,
+                    "func": m.func,
+                    "skill_type_id": m.skill_type_id,
+                    "magnitude": magnitude,
+                });
+                if resolve_names {
+                    row["modifying_attribute_name"] =
+                        serde_json::to_value(self.attribute_name(m.modifying_attribute_id)).unwrap();
+                    if let Some(sid) = m.skill_type_id {
+                        row["skill_name"] = serde_json::to_value(self.type_name(sid)).unwrap();
+                    }
+                }
+                rows.push(row);
+            }
+        }
+        Ok(serde_json::json!({"attribute_id": attribute_id, "modified_by": rows}))
     }
 }
 
@@ -223,6 +499,154 @@ impl SdeMcpServer {
         Parameters(p): Parameters<TypeIdParam>,
     ) -> Result<String, ErrorData> {
         self.fetch_filtered(&self.store.type_materials, p.type_id, "typeMaterials")
+    }
+
+    #[tool(description = "Get the dogma attributes and effects of a type by its type ID (e.g. skill rank/skillTimeConstant attribute 275, module stats). Set resolve_names to annotate each attribute with its name and decode skill-prerequisite attributes into readable requiredSkill objects.")]
+    async fn sde_get_type_dogma(
+        &self,
+        Parameters(p): Parameters<TypeDogmaParam>,
+    ) -> Result<String, ErrorData> {
+        let mut val = query::fetch_by_id(&self.store.type_dogma, p.type_id).map_err(|_| {
+            ErrorData::invalid_params(format!("ID {} not found in typeDogma", p.type_id), None)
+        })?;
+        if p.resolve_names.unwrap_or(false) {
+            self.annotate_dogma_names(&mut val);
+        }
+        self.filter(&mut val);
+        Ok(serde_json::to_string(&val).unwrap())
+    }
+
+    #[tool(description = "Build a recursive skill-prerequisite training plan for one or more target type IDs (ships, modules, or skills). Returns each target's full prerequisite tree plus one merged, deduped (to the highest level demanded), topologically-sorted plan with per-skill rank, SP cost, running cumulative SP, the per-level SP curve (sp_by_level), and which targets require it.")]
+    async fn sde_get_skill_plan(
+        &self,
+        Parameters(p): Parameters<SkillPlanParam>,
+    ) -> Result<String, ErrorData> {
+        let store = Arc::clone(&self.store);
+        let lang = self.language.clone();
+        let targets = p.targets;
+        let plan = tokio::task::spawn_blocking(move || {
+            build_skill_plan(&store, &targets, lang.as_deref())
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(serde_json::to_string(&plan).unwrap())
+    }
+
+    #[tool(description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes.")]
+    async fn sde_get_modifiers(
+        &self,
+        Parameters(p): Parameters<ModifierQueryParam>,
+    ) -> Result<String, ErrorData> {
+        let resolve_names = p.resolve_names.unwrap_or(true);
+        match (p.type_id, p.attribute_id, p.effect_id) {
+            (Some(id), None, None) => Ok(serde_json::to_string(&self.modifiers_for_type(id, resolve_names)?).unwrap()),
+            (None, Some(attr), None) => Ok(serde_json::to_string(&self.modifiers_for_attribute(attr, resolve_names)?).unwrap()),
+            (None, None, Some(eid)) => Ok(serde_json::to_string(&self.modifiers_for_effect(eid, resolve_names)?).unwrap()),
+            _ => Err(ErrorData::invalid_params(
+                "Provide exactly one of type_id, attribute_id, or effect_id",
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Batch-get multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false rather than failing the call.")]
+    async fn sde_get_types(
+        &self,
+        Parameters(p): Parameters<TypeIdsParam>,
+    ) -> Result<String, ErrorData> {
+        let out: Vec<_> = p
+            .type_ids
+            .iter()
+            .map(|&id| match query::fetch_by_id(&self.store.types, id) {
+                Ok(mut v) => {
+                    self.filter(&mut v);
+                    serde_json::json!({"type_id": id, "found": true, "type": v})
+                }
+                Err(_) => serde_json::json!({"type_id": id, "found": false}),
+            })
+            .collect();
+        Ok(serde_json::to_string(&out).unwrap())
+    }
+
+    #[tool(description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false.")]
+    async fn sde_get_types_dogma(
+        &self,
+        Parameters(p): Parameters<TypeIdsParam>,
+    ) -> Result<String, ErrorData> {
+        let out: Vec<_> = p
+            .type_ids
+            .iter()
+            .map(|&id| match query::fetch_by_id(&self.store.type_dogma, id) {
+                Ok(mut v) => {
+                    self.filter(&mut v);
+                    serde_json::json!({"type_id": id, "found": true, "dogma": v})
+                }
+                Err(_) => serde_json::json!({"type_id": id, "found": false}),
+            })
+            .collect();
+        Ok(serde_json::to_string(&out).unwrap())
+    }
+
+    #[tool(description = "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records.")]
+    async fn sde_resolve_types(
+        &self,
+        Parameters(p): Parameters<ResolveTypesParam>,
+    ) -> Result<String, ErrorData> {
+        if p.type_ids.is_none() && p.names.is_none() {
+            return Err(ErrorData::invalid_params("Provide type_ids and/or names", None));
+        }
+        let by_id: Vec<_> = p
+            .type_ids
+            .unwrap_or_default()
+            .iter()
+            .map(|&id| match self.type_name(id) {
+                Some(name) => serde_json::json!({"type_id": id, "name": name, "found": true}),
+                None => serde_json::json!({"type_id": id, "found": false}),
+            })
+            .collect();
+        let by_name: Vec<_> = p
+            .names
+            .unwrap_or_default()
+            .iter()
+            .map(|name| match self.store.types.name_index.get(&name.to_lowercase()) {
+                Some(&offset) => {
+                    let id = query::fetch_at_offset(&self.store.types.path, offset)
+                        .ok()
+                        .and_then(|v| v.get("_key").and_then(|k| k.as_u64()));
+                    match id {
+                        Some(id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
+                        None => serde_json::json!({"name": name, "found": false}),
+                    }
+                }
+                None => serde_json::json!({"name": name, "found": false}),
+            })
+            .collect();
+        Ok(serde_json::to_string(&serde_json::json!({"by_id": by_id, "by_name": by_name})).unwrap())
+    }
+
+    #[tool(description = "Get the SP cost curve (levels 1-5: cumulative sp_to_reach and per-level increment) for a skill. Provide rank directly, or type_id to look its rank up.")]
+    async fn sde_get_skill_sp(
+        &self,
+        Parameters(p): Parameters<SkillSpParam>,
+    ) -> Result<String, ErrorData> {
+        let rank = match (p.rank, p.type_id) {
+            (Some(rank), _) => rank,
+            (None, Some(type_id)) => skill_rank(&self.store, type_id).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("type {type_id} is not a skill (no rank attribute 275)"),
+                    None,
+                )
+            })?,
+            (None, None) => {
+                return Err(ErrorData::invalid_params("Provide rank or type_id", None));
+            }
+        };
+        Ok(serde_json::to_string(&serde_json::json!({
+            "rank": rank,
+            "levels": sp_breakdown(rank),
+        }))
+        .unwrap())
     }
 
     #[tool(description = "Get a blueprint by its blueprint type ID")]
@@ -408,7 +832,21 @@ impl SdeMcpServer {
     }
 }
 
-#[tool_handler(name = "eve-sde-mcp", version = "0.1.0", instructions = "EVE Online Static Data Export MCP server")]
+/// Server-level usage playbook, delivered in the initialize handshake so the model
+/// reads it before choosing tools. Kept short on purpose — long instructions get skimmed.
+const SERVER_INSTRUCTIONS: &str = "\
+EVE Online Static Data Export (SDE) query server. Data is read-only game data indexed by ID.
+
+Pick the most direct tool — most questions are ONE call, not a fan-out:
+- \"What skills / what order to fly SHIP or use MODULE\" → sde_get_skill_plan with ALL target type IDs in one call. Its output already gives the topo-sorted prerequisite order, each skill's rank, per-level SP cost (sp_by_level), running cumulative SP, and which target needs it. Do NOT call sde_get_type_dogma or sde_get_skill_sp per skill to rebuild this.
+- \"Which skills/ships boost ATTRIBUTE X (e.g. mining yield, attr 77)\" → sde_get_modifiers with attribute_id — one call returns every modifier. Use type_id for the inverse, effect_id for a single effect's modifierInfo.
+- Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery.
+- Several types or dogma records at once → sde_get_types / sde_get_types_dogma (batched), not many single calls.
+- Decoding skill prereqs from raw dogma → pass resolve_names:true to sde_get_type_dogma instead of memorizing attribute IDs 182/277 etc.
+
+Not in the SDE: market prices and fitted-yield simulation (stacking penalties). Compute yield/ISK math yourself from the dogma attributes the tools return.";
+
+#[tool_handler(name = "eve-sde-mcp", version = "0.1.0")]
 impl ServerHandler for SdeMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -416,6 +854,7 @@ impl ServerHandler for SdeMcpServer {
                 "eve-sde-mcp",
                 env!("CARGO_PKG_VERSION"),
             ))
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
@@ -450,6 +889,317 @@ fn bfs_route(graph: &HashMap<u64, Vec<u64>>, from: u64, to: u64) -> Option<Vec<u
         }
     }
     None
+}
+
+// ── Skill plan ───────────────────────────────────────────────────────────────
+
+use serde_json::Value;
+
+const ATTR_RANK: u64 = 275; // skillTimeConstant
+const PREREQ_SLOTS: [(u64, u64); 3] = [(182, 277), (183, 278), (184, 279)]; // (skillID, levelID)
+const MAX_SKILL_DEPTH: usize = 12;
+
+/// Pick the English (or requested-language) string from a localized name field,
+/// tolerating both `{"en": "X"}` objects and already-filtered plain strings.
+fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
+    match name {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Object(m)) => lang
+            .and_then(|l| m.get(l))
+            .or_else(|| m.get("en"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// Cumulative skill points to have a skill of the given rank at `level`.
+/// EVE's canonical curve: SP(L) = round(rank · 250 · (√32)^(L-1)); √32 = 2^2.5.
+/// Verified against the rank-1 points 250/1414/8000/45255/256000 — `round` (not ceil)
+/// is what matches: 1414.21→1414, 45254.83→45255, and it absorbs the float noise that
+/// makes the exact integer points (8000, 256000) compute as e.g. 256000.00000005.
+fn skill_sp(rank: u64, level: u8) -> u64 {
+    if level == 0 {
+        return 0;
+    }
+    let sqrt32 = 32f64.sqrt();
+    (rank as f64 * 250.0 * sqrt32.powi(level as i32 - 1)).round() as u64
+}
+
+/// A skill's own rank (attribute 275), or None if the type is not a skill.
+fn skill_rank(store: &SdeStore, type_id: u64) -> Option<u64> {
+    let dogma = query::fetch_by_id(&store.type_dogma, type_id).ok()?;
+    let attrs = dogma.get("dogmaAttributes")?.as_array()?;
+    attrs.iter().find_map(|a| {
+        let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
+        (aid == ATTR_RANK)
+            .then(|| a.get("value").and_then(|x| x.as_f64()))
+            .flatten()
+            .map(|v| v.round() as u64)
+    })
+}
+
+/// A type's direct skill prerequisites as (skill_id, level) pairs.
+fn direct_prereqs(store: &SdeStore, type_id: u64) -> Vec<(u64, u8)> {
+    let Ok(dogma) = query::fetch_by_id(&store.type_dogma, type_id) else {
+        return Vec::new();
+    };
+    let Some(attrs) = dogma.get("dogmaAttributes").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    let value_of = |attr_id: u64| -> Option<f64> {
+        attrs.iter().find_map(|a| {
+            let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
+            (aid == attr_id).then(|| a.get("value").and_then(|x| x.as_f64())).flatten()
+        })
+    };
+    let mut out = Vec::new();
+    for (skill_attr, level_attr) in PREREQ_SLOTS {
+        if let Some(skill_id) = value_of(skill_attr) {
+            let level = value_of(level_attr).unwrap_or(1.0).round().clamp(1.0, 5.0) as u8;
+            out.push((skill_id as u64, level));
+        }
+    }
+    out
+}
+
+/// serde `skip_serializing_if` predicate: omit a `bool` field when it's false.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(serde::Serialize, Debug)]
+struct PrereqNode {
+    skill_id: u64,
+    skill_name: Option<String>,
+    required_level: u8,
+    rank: u64,
+    /// True when `rank` was defaulted to 1 because the skill has no rank attribute
+    /// (275) — its SP cost is therefore a lower-bound estimate, not authoritative.
+    #[serde(skip_serializing_if = "is_false")]
+    rank_assumed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prerequisites: Vec<PrereqNode>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct SpLevel {
+    level: u8,
+    /// Total SP to have the skill at this level (cumulative from 0).
+    sp_to_reach: u64,
+    /// SP to train just this level, i.e. from level-1 to level.
+    increment: u64,
+}
+
+/// Full SP cost curve (levels 1..=5) for a skill of the given rank.
+fn sp_breakdown(rank: u64) -> Vec<SpLevel> {
+    let mut prev = 0u64;
+    (1..=5)
+        .map(|level| {
+            let sp_to_reach = skill_sp(rank, level);
+            let increment = sp_to_reach - prev;
+            prev = sp_to_reach;
+            SpLevel { level, sp_to_reach, increment }
+        })
+        .collect()
+}
+
+#[derive(serde::Serialize, Debug)]
+struct PlanStep {
+    skill_id: u64,
+    skill_name: Option<String>,
+    required_level: u8,
+    rank: u64,
+    /// See `PrereqNode::rank_assumed`.
+    #[serde(skip_serializing_if = "is_false")]
+    rank_assumed: bool,
+    sp_for_level: u64,
+    cumulative_sp: u64,
+    /// Per-level SP cost (levels 1..=5) so callers can rank yield-per-SP without
+    /// rebuilding the SP table by hand.
+    sp_by_level: Vec<SpLevel>,
+    required_by: Vec<u64>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct TargetTree {
+    type_id: u64,
+    name: Option<String>,
+    tree: Vec<PrereqNode>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct SkillPlan {
+    targets: Vec<TargetTree>,
+    plan: Vec<PlanStep>,
+    total_sp: u64,
+}
+
+#[derive(Default)]
+struct Merged {
+    level: u8,
+    rank: u64,
+    rank_assumed: bool,
+    required_by: std::collections::BTreeSet<u64>,
+}
+
+/// Accumulators shared across one skill-plan call.
+struct PlanAcc {
+    merged: HashMap<u64, Merged>,
+    edges: HashMap<u64, std::collections::BTreeSet<u64>>, // prereq_skill -> dependent skills
+}
+
+/// Recursively build the prereq tree for one skill, threading provenance and the
+/// merged/edges accumulators. `path` is the active DFS stack for cycle detection.
+fn build_node(
+    store: &SdeStore,
+    lang: Option<&str>,
+    skill_id: u64,
+    level: u8,
+    target_id: u64,
+    acc: &mut PlanAcc,
+    path: &mut Vec<u64>,
+) -> Result<PrereqNode, String> {
+    if path.contains(&skill_id) {
+        return Err(format!("skill prerequisite cycle detected at skill {skill_id}"));
+    }
+    if path.len() >= MAX_SKILL_DEPTH {
+        return Err(format!("skill prerequisite depth exceeds {MAX_SKILL_DEPTH}"));
+    }
+    let (rank, rank_assumed) = match skill_rank(store, skill_id) {
+        Some(r) => (r, false),
+        None => {
+            tracing::warn!(
+                "skill-plan: skill {skill_id} has no rank attribute (275); \
+                 assuming rank 1 — its SP cost is a lower-bound estimate"
+            );
+            (1, true)
+        }
+    };
+    {
+        let entry = acc.merged.entry(skill_id).or_default();
+        entry.level = entry.level.max(level);
+        entry.rank = rank;
+        entry.rank_assumed = rank_assumed;
+        entry.required_by.insert(target_id);
+    }
+    path.push(skill_id);
+    let mut prerequisites = Vec::new();
+    for (prereq_id, prereq_level) in direct_prereqs(store, skill_id) {
+        acc.edges.entry(prereq_id).or_default().insert(skill_id);
+        prerequisites.push(build_node(store, lang, prereq_id, prereq_level, target_id, acc, path)?);
+    }
+    path.pop();
+    Ok(PrereqNode {
+        skill_id,
+        skill_name: pick_name(
+            query::fetch_by_id(&store.types, skill_id).ok().as_ref().and_then(|v| v.get("name")),
+            lang,
+        ),
+        required_level: level,
+        rank,
+        rank_assumed,
+        prerequisites,
+    })
+}
+
+fn build_skill_plan(
+    store: &SdeStore,
+    targets: &[SkillPlanTarget],
+    lang: Option<&str>,
+) -> Result<SkillPlan, String> {
+    let mut acc = PlanAcc {
+        merged: HashMap::new(),
+        edges: HashMap::new(),
+    };
+    let mut target_trees = Vec::new();
+
+    for target in targets {
+        let mut path = Vec::new();
+        let tree = if let Some(rank) = skill_rank(store, target.type_id) {
+            // Target is itself a skill: train it (to override or 5) plus its prereqs.
+            let _ = rank;
+            let level = target.level_override.unwrap_or(5).clamp(1, 5);
+            vec![build_node(store, lang, target.type_id, level, target.type_id, &mut acc, &mut path)?]
+        } else {
+            // Ship/module: expand its direct skill prerequisites.
+            let mut nodes = Vec::new();
+            for (skill_id, level) in direct_prereqs(store, target.type_id) {
+                nodes.push(build_node(store, lang, skill_id, level, target.type_id, &mut acc, &mut path)?);
+            }
+            nodes
+        };
+        target_trees.push(TargetTree {
+            type_id: target.type_id,
+            name: pick_name(
+                query::fetch_by_id(&store.types, target.type_id).ok().as_ref().and_then(|v| v.get("name")),
+                lang,
+            ),
+            tree,
+        });
+    }
+
+    let order = topo_order(&acc)?;
+
+    let mut plan = Vec::new();
+    let mut cumulative = 0u64;
+    for skill_id in order {
+        let m = &acc.merged[&skill_id];
+        let sp = skill_sp(m.rank, m.level);
+        cumulative += sp;
+        plan.push(PlanStep {
+            skill_id,
+            skill_name: pick_name(
+                query::fetch_by_id(&store.types, skill_id).ok().as_ref().and_then(|v| v.get("name")),
+                lang,
+            ),
+            required_level: m.level,
+            rank: m.rank,
+            rank_assumed: m.rank_assumed,
+            sp_for_level: sp,
+            cumulative_sp: cumulative,
+            sp_by_level: sp_breakdown(m.rank),
+            required_by: m.required_by.iter().copied().collect(),
+        });
+    }
+
+    Ok(SkillPlan { targets: target_trees, plan, total_sp: cumulative })
+}
+
+/// Kahn's algorithm over the merged skill set, popping lowest skill_id first for
+/// stable output. Errors if a cycle leaves nodes unsorted.
+fn topo_order(acc: &PlanAcc) -> Result<Vec<u64>, String> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut indegree: HashMap<u64, usize> = acc.merged.keys().map(|&k| (k, 0)).collect();
+    for deps in acc.edges.values() {
+        for &s in deps {
+            *indegree.entry(s).or_insert(0) += 1;
+        }
+    }
+    let mut heap: BinaryHeap<Reverse<u64>> = indegree
+        .iter()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(&k, _)| Reverse(k))
+        .collect();
+    let mut order = Vec::with_capacity(acc.merged.len());
+    while let Some(Reverse(n)) = heap.pop() {
+        order.push(n);
+        if let Some(deps) = acc.edges.get(&n) {
+            for &s in deps {
+                let d = indegree.get_mut(&s).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    heap.push(Reverse(s));
+                }
+            }
+        }
+    }
+    if order.len() != acc.merged.len() {
+        return Err("skill prerequisite cycle detected".to_string());
+    }
+    Ok(order)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -493,13 +1243,14 @@ mod tests {
             data_dir: std::path::PathBuf::from("/tmp"),
             build: 42,
             release_date: "2024-01-01".to_string(),
-            files_scanned: 16,
+            files_scanned: 17,
             last_updated: "2024-01-01".to_string(),
             types: empty_index(),
             groups: empty_index(),
             categories: empty_index(),
             blueprints: empty_index(),
             type_materials: empty_index(),
+            type_dogma: empty_index(),
             map_solar_systems: empty_index(),
             map_constellations: empty_index(),
             map_regions: empty_index(),
@@ -512,6 +1263,7 @@ mod tests {
             skins: empty_index(),
             product_to_blueprint: HashMap::new(),
             stargate_graph: HashMap::new(),
+            attribute_modifiers: HashMap::new(),
         }
     }
 
@@ -522,7 +1274,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["build"], 42);
         assert_eq!(v["release_date"], "2024-01-01");
-        assert_eq!(v["files_scanned"], 16);
+        assert_eq!(v["files_scanned"], 17);
     }
 
     #[tokio::test]
@@ -720,6 +1472,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sde_get_type_dogma_returns_record_for_known_id() {
+        let (_f, type_dogma) = make_index(
+            "{\"_key\":3386,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                type_dogma,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_type_dogma(Parameters(TypeDogmaParam { type_id: 3386, resolve_names: None }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 3386);
+        assert_eq!(v["dogmaAttributes"][0]["attributeID"], 275);
+        assert_eq!(v["dogmaAttributes"][0]["value"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn sde_get_type_dogma_returns_error_for_missing_id() {
+        let server = make_server();
+        let result = server
+            .sde_get_type_dogma(Parameters(TypeDogmaParam { type_id: 99, resolve_names: None }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("99"));
+    }
+
+    #[tokio::test]
     async fn mcp_handshake_initialize_and_list_tools() -> anyhow::Result<()> {
         use rmcp::{ClientHandler, ServiceExt as _, model::ClientInfo};
 
@@ -744,14 +1528,21 @@ mod tests {
         let client = DummyClient.serve(client_transport).await?;
         let tools = client.list_all_tools().await?;
         assert!(
-            tools.len() >= 21,
-            "expected ≥21 tools, got {}",
+            tools.len() >= 28,
+            "expected ≥28 tools, got {}",
             tools.len()
         );
         let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"sde_status"));
         assert!(names.contains(&"sde_find_route"));
         assert!(names.contains(&"sde_get_market_group_tree"));
+        assert!(names.contains(&"sde_get_type_dogma"));
+        assert!(names.contains(&"sde_get_skill_plan"));
+        assert!(names.contains(&"sde_get_modifiers"));
+        assert!(names.contains(&"sde_get_types"));
+        assert!(names.contains(&"sde_get_types_dogma"));
+        assert!(names.contains(&"sde_resolve_types"));
+        assert!(names.contains(&"sde_get_skill_sp"));
         client.cancel().await?;
         let _ = server_handle.await;
         Ok(())
@@ -1267,6 +2058,14 @@ mod tests {
         assert_eq!(r["_key"], 1230);
         assert!(r["materials"].as_array().is_some());
 
+        // sde_get_type_dogma (Ferox has dogma attributes in fixture)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_type_dogma")
+                .with_arguments(obj(serde_json::json!({"type_id": 16227}))),
+        ).await?);
+        assert_eq!(r["_key"], 16227);
+        assert!(r["dogmaAttributes"].as_array().is_some());
+
         // sde_get_blueprint
         let r = text_json(&client.call_tool(
             CallToolRequestParams::new("sde_get_blueprint")
@@ -1400,8 +2199,261 @@ mod tests {
         assert_eq!(r["_key"], 50);
         assert_eq!(r["internalName"], "Ferox Caldari Union Day YC124");
 
+        // sde_get_skill_plan: Covetor + ORE Deep Core Strip Miner → one merged plan
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_skill_plan").with_arguments(obj(serde_json::json!({
+                "targets": [{"type_id": 17476}, {"type_id": 87562}]
+            }))),
+        ).await?);
+        let plan = r["plan"].as_array().unwrap();
+        // Mining deduped to level 5 (module demands 5), prereqs before dependents.
+        assert_eq!(plan[0]["skill_id"], 3386);
+        assert_eq!(plan[0]["required_level"], 5);
+        assert_eq!(plan[0]["sp_for_level"], 256000);
+        assert_eq!(plan[0]["required_by"].as_array().unwrap().len(), 2);
+        assert_eq!(plan.last().unwrap()["skill_id"], 17940); // Mining Barge last
+        assert_eq!(r["total_sp"], 312000);
+
+        // sde_get_modifiers direction-b: what modifies miningAmount (77)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_modifiers")
+                .with_arguments(obj(serde_json::json!({"attribute_id": 77}))),
+        ).await?);
+        let mods = r["modified_by"].as_array().unwrap();
+        assert!(mods.iter().any(|m| m["skill_type_id"] == 3386 && m["magnitude"] == 5.0));
+
+        // sde_get_modifiers direction-a: Mining skill's outgoing modifiers
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_modifiers")
+                .with_arguments(obj(serde_json::json!({"type_id": 3386}))),
+        ).await?);
+        assert!(r["modifies"].as_array().unwrap().iter().any(|m| m["modified_attribute_id"] == 77));
+
+        // sde_get_modifiers direction-c: a dogma effect's raw modifierInfo
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_modifiers")
+                .with_arguments(obj(serde_json::json!({"effect_id": 391}))),
+        ).await?);
+        let m = &r["modifiers"][0];
+        assert_eq!(m["modified_attribute_id"], 77);
+        assert_eq!(m["modifying_attribute_id"], 434);
+        assert_eq!(m["skill_type_id"], 3386);
+
+        // sde_get_type_dogma resolve_names: decode Mining Barge prereqs
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_type_dogma")
+                .with_arguments(obj(serde_json::json!({"type_id": 17940, "resolve_names": true}))),
+        ).await?);
+        let attrs = r["dogmaAttributes"].as_array().unwrap();
+        assert!(attrs.iter().any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology" && a["requiredSkill"]["level"] == 3));
+
+        // sde_get_types batch with a missing id
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_types")
+                .with_arguments(obj(serde_json::json!({"type_ids": [34, 999999]}))),
+        ).await?);
+        let arr = r.as_array().unwrap();
+        assert_eq!(arr[0]["found"], true);
+        assert_eq!(arr[0]["type"]["name"], "Tritanium");
+        assert_eq!(arr[1]["found"], false);
+
+        // sde_resolve_types both directions
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_resolve_types")
+                .with_arguments(obj(serde_json::json!({"type_ids": [87562], "names": ["Covetor", "Mining"]}))),
+        ).await?);
+        assert_eq!(r["by_id"][0]["name"], "ORE Deep Core Strip Miner");
+        assert_eq!(r["by_name"][0]["type_id"], 17476);
+        assert_eq!(r["by_name"][1]["type_id"], 3386);
+
+        // sde_get_skill_sp by type_id (Astrogeology = rank 3)
+        let r = text_json(&client.call_tool(
+            CallToolRequestParams::new("sde_get_skill_sp")
+                .with_arguments(obj(serde_json::json!({"type_id": 3410}))),
+        ).await?);
+        assert_eq!(r["rank"], 3);
+        let lvls = r["levels"].as_array().unwrap();
+        assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
+        assert_eq!(lvls[4]["sp_to_reach"], 768000); // rank3 L5 = 3 × 256000
+        assert_eq!(lvls[4]["increment"], 768000 - 3 * 45255);
+
         client.cancel().await?;
         let _ = server_handle.await;
         Ok(())
+    }
+
+    #[test]
+    fn skill_sp_matches_canonical_rank1_points() {
+        assert_eq!(skill_sp(1, 1), 250);
+        assert_eq!(skill_sp(1, 2), 1414);
+        assert_eq!(skill_sp(1, 3), 8000);
+        assert_eq!(skill_sp(1, 4), 45255);
+        assert_eq!(skill_sp(1, 5), 256000);
+        assert_eq!(skill_sp(3, 3), 24000); // rank scales linearly
+        assert_eq!(skill_sp(1, 0), 0);
+    }
+
+    fn fixture_store() -> Arc<SdeStore> {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15").unwrap()
+    }
+
+    #[test]
+    fn build_skill_plan_dedupes_to_highest_level_and_topo_sorts() {
+        let store = fixture_store();
+        let targets = vec![
+            SkillPlanTarget { type_id: 17476, level_override: None }, // Covetor (ship)
+            SkillPlanTarget { type_id: 87562, level_override: None }, // ORE module → Mining 5
+        ];
+        let plan = build_skill_plan(&store, &targets, Some("en")).unwrap();
+
+        let ids: Vec<u64> = plan.plan.iter().map(|s| s.skill_id).collect();
+        assert_eq!(ids, vec![3386, 3410, 17940], "Mining → Astrogeology → Mining Barge");
+
+        let mining = &plan.plan[0];
+        assert_eq!(mining.required_level, 5, "deduped to highest demanded level");
+        assert_eq!(mining.required_by, vec![17476, 87562], "provenance unions both targets");
+        assert_eq!(mining.sp_for_level, 256000);
+        assert_eq!(plan.total_sp, 312000);
+        assert_eq!(plan.plan.last().unwrap().cumulative_sp, 312000);
+
+        // Covetor target tree roots at Mining Barge (its only direct prereq).
+        let covetor = plan.targets.iter().find(|t| t.type_id == 17476).unwrap();
+        assert_eq!(covetor.tree[0].skill_id, 17940);
+        assert_eq!(covetor.tree[0].rank, 4);
+    }
+
+    #[test]
+    fn build_skill_plan_errors_on_cycle() {
+        // 100 requires 101, 101 requires 100 — both skills (have rank 275).
+        let (_d, type_dogma) = make_index(
+            "{\"_key\":100,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0},{\"attributeID\":182,\"value\":101.0},{\"attributeID\":277,\"value\":1.0}]}\n\
+             {\"_key\":101,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0},{\"attributeID\":182,\"value\":100.0},{\"attributeID\":277,\"value\":1.0}]}\n",
+        );
+        let (_t, types) = make_index(
+            "{\"_key\":100,\"name\":{\"en\":\"Loop A\"}}\n{\"_key\":101,\"name\":{\"en\":\"Loop B\"}}\n",
+        );
+        let store = Arc::new(SdeStore { type_dogma, types, ..default_store() });
+        let targets = vec![SkillPlanTarget { type_id: 100, level_override: None }];
+        let err = build_skill_plan(&store, &targets, None).unwrap_err();
+        assert!(err.contains("cycle"), "expected cycle error, got: {err}");
+    }
+
+    #[test]
+    fn sp_breakdown_increments_sum_to_cumulative() {
+        let b = sp_breakdown(1);
+        assert_eq!(b[0].sp_to_reach, 250);
+        assert_eq!(b[4].sp_to_reach, 256000);
+        // increments are level-to-level deltas
+        assert_eq!(b[0].increment, 250);
+        assert_eq!(b[1].increment, 1414 - 250);
+        // last increment + prior cumulative == final cumulative
+        assert_eq!(b[3].sp_to_reach + b[4].increment, b[4].sp_to_reach);
+    }
+
+    #[test]
+    fn skill_plan_steps_carry_full_sp_curve() {
+        let store = fixture_store();
+        let plan = build_skill_plan(
+            &store,
+            &[SkillPlanTarget { type_id: 87562, level_override: None }],
+            Some("en"),
+        )
+        .unwrap();
+        // Mining (rank 1) demanded at L5 — its sp_by_level still spans all 5 levels.
+        let mining = plan.plan.iter().find(|s| s.skill_id == 3386).unwrap();
+        assert_eq!(mining.sp_by_level.len(), 5);
+        assert_eq!(mining.sp_by_level[0].sp_to_reach, 250);
+        assert_eq!(mining.sp_by_level[4].sp_to_reach, mining.sp_for_level);
+    }
+
+    #[tokio::test]
+    async fn sde_get_modifiers_requires_exactly_one_arg() {
+        let server = make_server();
+        let err = server
+            .sde_get_modifiers(Parameters(ModifierQueryParam { type_id: None, attribute_id: None, effect_id: None, resolve_names: None }))
+            .await;
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn build_skill_plan_errors_when_depth_exceeded() {
+        // Linear prereq chain 100→101→…→115 (16 deep), no cycle. Must trip the
+        // depth guard (MAX_SKILL_DEPTH = 12), not the cycle guard.
+        let mut dogma = String::new();
+        for id in 100u64..=114 {
+            dogma.push_str(&format!(
+                "{{\"_key\":{id},\"dogmaAttributes\":[{{\"attributeID\":275,\"value\":1.0}},{{\"attributeID\":182,\"value\":{next}.0}},{{\"attributeID\":277,\"value\":1.0}}]}}\n",
+                next = id + 1
+            ));
+        }
+        // Leaf skill at the end of the chain (has rank, no further prereq).
+        dogma.push_str("{\"_key\":115,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n");
+        let (_d, type_dogma) = make_index(&dogma);
+        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
+        let targets = vec![SkillPlanTarget { type_id: 100, level_override: None }];
+        let err = build_skill_plan(&store, &targets, None).unwrap_err();
+        assert!(err.contains("depth"), "expected depth error, got: {err}");
+    }
+
+    #[test]
+    fn build_skill_plan_handles_empty_targets() {
+        let store = fixture_store();
+        let plan = build_skill_plan(&store, &[], Some("en")).unwrap();
+        assert!(plan.plan.is_empty());
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.total_sp, 0);
+    }
+
+    #[test]
+    fn build_skill_plan_flags_assumed_rank_for_rankless_skill() {
+        // 200 is a module needing skill 201; 201 has no rank attribute (275), so
+        // its rank is defaulted to 1 and the step must be flagged rank_assumed.
+        let (_d, type_dogma) = make_index(
+            "{\"_key\":200,\"dogmaAttributes\":[{\"attributeID\":182,\"value\":201.0},{\"attributeID\":277,\"value\":3.0}]}\n\
+             {\"_key\":201,\"dogmaAttributes\":[]}\n",
+        );
+        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
+        let targets = vec![SkillPlanTarget { type_id: 200, level_override: None }];
+        let plan = build_skill_plan(&store, &targets, None).unwrap();
+        let step = plan.plan.iter().find(|s| s.skill_id == 201).unwrap();
+        assert!(step.rank_assumed, "rank-less skill should be flagged");
+        assert_eq!(step.rank, 1, "defaults to rank 1");
+    }
+
+    #[tokio::test]
+    async fn sde_get_modifiers_errors_on_unknown_attribute() {
+        // Unknown attribute_id must error, not return a confident empty answer.
+        let server = make_server();
+        let err = server
+            .sde_get_modifiers(Parameters(ModifierQueryParam {
+                type_id: None,
+                attribute_id: Some(999),
+                effect_id: None,
+                resolve_names: None,
+            }))
+            .await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().message.contains("999"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_modifiers_returns_empty_for_unmodified_attribute() {
+        // Attribute exists but nothing modifies it → empty list, not an error.
+        let (_a, dogma_attributes) = make_index("{\"_key\":77,\"name\":{\"en\":\"miningAmount\"}}\n");
+        let store = Arc::new(SdeStore { dogma_attributes, ..default_store() });
+        let server = SdeMcpServer::new(store, None);
+        let out = server
+            .sde_get_modifiers(Parameters(ModifierQueryParam {
+                type_id: None,
+                attribute_id: Some(77),
+                effect_id: None,
+                resolve_names: Some(false),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["attribute_id"], 77);
+        assert_eq!(v["modified_by"].as_array().unwrap().len(), 0);
     }
 }

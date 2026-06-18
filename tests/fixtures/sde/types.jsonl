@@ -10,3 +10,8 @@
 {"_key": 11399, "groupID": 18, "name": {"en": "Morphite"}, "published": true, "marketGroupID": 1857, "basePrice": 32768.0, "volume": 0.01, "portionSize": 1}
 {"_key": 16227, "groupID": 419, "name": {"en": "Ferox"}, "published": true, "marketGroupID": 471, "basePrice": 0.0, "mass": 14250000.0, "volume": 252000.0, "portionSize": 1}
 {"_key": 16228, "groupID": 489, "name": {"en": "Ferox Blueprint"}, "published": true, "portionSize": 1}
+{"_key": 3386, "groupID": 257, "name": {"en": "Mining"}, "published": true, "portionSize": 1}
+{"_key": 3410, "groupID": 257, "name": {"en": "Astrogeology"}, "published": true, "portionSize": 1}
+{"_key": 17940, "groupID": 268, "name": {"en": "Mining Barge"}, "published": true, "portionSize": 1}
+{"_key": 17476, "groupID": 463, "name": {"en": "Covetor"}, "published": true, "marketGroupID": 477, "portionSize": 1}
+{"_key": 87562, "groupID": 54, "name": {"en": "ORE Deep Core Strip Miner"}, "published": true, "portionSize": 1}

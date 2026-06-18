@@ -6,3 +6,10 @@
 {"_key": 9, "name": {"en": "structureHP"}, "unitID": 113}
 {"_key": 11, "name": {"en": "powerOutput"}, "unitID": 107}
 {"_key": 64, "name": {"en": "cpuOutput"}, "unitID": 106}
+{"_key": 77, "name": {"en": "miningAmount"}, "unitID": 116}
+{"_key": 182, "name": {"en": "requiredSkill1"}, "unitID": null}
+{"_key": 183, "name": {"en": "requiredSkill2"}, "unitID": null}
+{"_key": 275, "name": {"en": "skillTimeConstant"}, "unitID": null}
+{"_key": 277, "name": {"en": "requiredSkill1Level"}, "unitID": null}
+{"_key": 278, "name": {"en": "requiredSkill2Level"}, "unitID": null}
+{"_key": 434, "name": {"en": "miningAmountBonus"}, "unitID": 105}
