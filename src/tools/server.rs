@@ -241,16 +241,11 @@ impl SdeMcpServer {
         // First pass: collect prereq slot levels so we can pair skill id with its level.
         let mut levels: HashMap<u64, u64> = HashMap::new();
         for a in attrs.iter() {
-            if let (Some(aid), Some(v)) = (
+            if let (Some(aid @ 277..=279), Some(v)) = (
                 a.get("attributeID").and_then(|x| x.as_u64()),
                 a.get("value").and_then(|x| x.as_f64()),
             ) {
-                match aid {
-                    277 | 278 | 279 => {
-                        levels.insert(aid, v as u64);
-                    }
-                    _ => {}
-                }
+                levels.insert(aid, v as u64);
             }
         }
         for a in attrs.iter_mut() {
@@ -267,15 +262,15 @@ impl SdeMcpServer {
                 184 => Some(279),
                 _ => None,
             };
-            if let Some(level_attr) = level_attr {
-                if let Some(skill_id) = a.get("value").and_then(|x| x.as_f64()) {
-                    let skill_id = skill_id as u64;
-                    a["requiredSkill"] = serde_json::json!({
-                        "skill_id": skill_id,
-                        "skill_name": self.type_name(skill_id),
-                        "level": levels.get(&level_attr).copied().unwrap_or(0),
-                    });
-                }
+            if let (Some(level_attr), Some(skill_id)) =
+                (level_attr, a.get("value").and_then(|x| x.as_f64()))
+            {
+                let skill_id = skill_id as u64;
+                a["requiredSkill"] = serde_json::json!({
+                    "skill_id": skill_id,
+                    "skill_name": self.type_name(skill_id),
+                    "level": levels.get(&level_attr).copied().unwrap_or(0),
+                });
             }
         }
     }
@@ -306,10 +301,22 @@ impl SdeMcpServer {
         if let Some(effects) = dogma.get("dogmaEffects").and_then(|e| e.as_array()) {
             for e in effects {
                 let Some(eid) = e.get("effectID").and_then(|x| x.as_u64()) else {
+                    tracing::warn!("type {type_id}: dogmaEffects entry has non-integer effectID; skipping");
                     continue;
                 };
-                let Ok(effect) = query::fetch_by_id(&self.store.dogma_effects, eid) else {
-                    continue;
+                let effect = match query::fetch_by_id(&self.store.dogma_effects, eid) {
+                    Ok(effect) => effect,
+                    // Effect not indexed at all: nothing to resolve, expected skip.
+                    Err(_) if !self.store.dogma_effects.id_index.contains_key(&eid) => continue,
+                    // Indexed but unreadable (IO/parse): a real failure — don't let it
+                    // masquerade as "this type modifies nothing".
+                    Err(err) => {
+                        tracing::warn!(
+                            "type {type_id}: failed to read dogma effect {eid}: {err}; \
+                             modifier list may be incomplete"
+                        );
+                        continue;
+                    }
                 };
                 let Some(mods) = effect.get("modifierInfo").and_then(|m| m.as_array()) else {
                     continue;
@@ -379,7 +386,19 @@ impl SdeMcpServer {
     }
 
     /// Direction-b: which modifiers target a given attribute (reverse index lookup).
-    fn modifiers_for_attribute(&self, attribute_id: u64, resolve_names: bool) -> serde_json::Value {
+    fn modifiers_for_attribute(
+        &self,
+        attribute_id: u64,
+        resolve_names: bool,
+    ) -> Result<serde_json::Value, ErrorData> {
+        // Distinguish "valid attribute nobody modifies" (empty list) from "no such
+        // attribute" (error) — otherwise a typo'd id returns a confident empty answer.
+        if !self.store.dogma_attributes.id_index.contains_key(&attribute_id) {
+            return Err(ErrorData::invalid_params(
+                format!("ID {attribute_id} not found in dogmaAttributes"),
+                None,
+            ));
+        }
         let mut rows = Vec::new();
         if let Some(mods) = self.store.attribute_modifiers.get(&attribute_id) {
             for m in mods {
@@ -416,7 +435,7 @@ impl SdeMcpServer {
                 rows.push(row);
             }
         }
-        serde_json::json!({"attribute_id": attribute_id, "modified_by": rows})
+        Ok(serde_json::json!({"attribute_id": attribute_id, "modified_by": rows}))
     }
 }
 
@@ -522,7 +541,7 @@ impl SdeMcpServer {
         let resolve_names = p.resolve_names.unwrap_or(true);
         match (p.type_id, p.attribute_id, p.effect_id) {
             (Some(id), None, None) => Ok(serde_json::to_string(&self.modifiers_for_type(id, resolve_names)?).unwrap()),
-            (None, Some(attr), None) => Ok(serde_json::to_string(&self.modifiers_for_attribute(attr, resolve_names)).unwrap()),
+            (None, Some(attr), None) => Ok(serde_json::to_string(&self.modifiers_for_attribute(attr, resolve_names)?).unwrap()),
             (None, None, Some(eid)) => Ok(serde_json::to_string(&self.modifiers_for_effect(eid, resolve_names)?).unwrap()),
             _ => Err(ErrorData::invalid_params(
                 "Provide exactly one of type_id, attribute_id, or effect_id",
@@ -944,12 +963,21 @@ fn direct_prereqs(store: &SdeStore, type_id: u64) -> Vec<(u64, u8)> {
     out
 }
 
+/// serde `skip_serializing_if` predicate: omit a `bool` field when it's false.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(serde::Serialize, Debug)]
 struct PrereqNode {
     skill_id: u64,
     skill_name: Option<String>,
     required_level: u8,
     rank: u64,
+    /// True when `rank` was defaulted to 1 because the skill has no rank attribute
+    /// (275) — its SP cost is therefore a lower-bound estimate, not authoritative.
+    #[serde(skip_serializing_if = "is_false")]
+    rank_assumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prerequisites: Vec<PrereqNode>,
 }
@@ -982,6 +1010,9 @@ struct PlanStep {
     skill_name: Option<String>,
     required_level: u8,
     rank: u64,
+    /// See `PrereqNode::rank_assumed`.
+    #[serde(skip_serializing_if = "is_false")]
+    rank_assumed: bool,
     sp_for_level: u64,
     cumulative_sp: u64,
     /// Per-level SP cost (levels 1..=5) so callers can rank yield-per-SP without
@@ -1008,6 +1039,7 @@ struct SkillPlan {
 struct Merged {
     level: u8,
     rank: u64,
+    rank_assumed: bool,
     required_by: std::collections::BTreeSet<u64>,
 }
 
@@ -1034,11 +1066,21 @@ fn build_node(
     if path.len() >= MAX_SKILL_DEPTH {
         return Err(format!("skill prerequisite depth exceeds {MAX_SKILL_DEPTH}"));
     }
-    let rank = skill_rank(store, skill_id).unwrap_or(1);
+    let (rank, rank_assumed) = match skill_rank(store, skill_id) {
+        Some(r) => (r, false),
+        None => {
+            tracing::warn!(
+                "skill-plan: skill {skill_id} has no rank attribute (275); \
+                 assuming rank 1 — its SP cost is a lower-bound estimate"
+            );
+            (1, true)
+        }
+    };
     {
         let entry = acc.merged.entry(skill_id).or_default();
         entry.level = entry.level.max(level);
         entry.rank = rank;
+        entry.rank_assumed = rank_assumed;
         entry.required_by.insert(target_id);
     }
     path.push(skill_id);
@@ -1056,6 +1098,7 @@ fn build_node(
         ),
         required_level: level,
         rank,
+        rank_assumed,
         prerequisites,
     })
 }
@@ -1112,6 +1155,7 @@ fn build_skill_plan(
             ),
             required_level: m.level,
             rank: m.rank,
+            rank_assumed: m.rank_assumed,
             sp_for_level: sp,
             cumulative_sp: cumulative,
             sp_by_level: sp_breakdown(m.rank),
@@ -2330,5 +2374,86 @@ mod tests {
             .sde_get_modifiers(Parameters(ModifierQueryParam { type_id: None, attribute_id: None, effect_id: None, resolve_names: None }))
             .await;
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn build_skill_plan_errors_when_depth_exceeded() {
+        // Linear prereq chain 100→101→…→115 (16 deep), no cycle. Must trip the
+        // depth guard (MAX_SKILL_DEPTH = 12), not the cycle guard.
+        let mut dogma = String::new();
+        for id in 100u64..=114 {
+            dogma.push_str(&format!(
+                "{{\"_key\":{id},\"dogmaAttributes\":[{{\"attributeID\":275,\"value\":1.0}},{{\"attributeID\":182,\"value\":{next}.0}},{{\"attributeID\":277,\"value\":1.0}}]}}\n",
+                next = id + 1
+            ));
+        }
+        // Leaf skill at the end of the chain (has rank, no further prereq).
+        dogma.push_str("{\"_key\":115,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n");
+        let (_d, type_dogma) = make_index(&dogma);
+        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
+        let targets = vec![SkillPlanTarget { type_id: 100, level_override: None }];
+        let err = build_skill_plan(&store, &targets, None).unwrap_err();
+        assert!(err.contains("depth"), "expected depth error, got: {err}");
+    }
+
+    #[test]
+    fn build_skill_plan_handles_empty_targets() {
+        let store = fixture_store();
+        let plan = build_skill_plan(&store, &[], Some("en")).unwrap();
+        assert!(plan.plan.is_empty());
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.total_sp, 0);
+    }
+
+    #[test]
+    fn build_skill_plan_flags_assumed_rank_for_rankless_skill() {
+        // 200 is a module needing skill 201; 201 has no rank attribute (275), so
+        // its rank is defaulted to 1 and the step must be flagged rank_assumed.
+        let (_d, type_dogma) = make_index(
+            "{\"_key\":200,\"dogmaAttributes\":[{\"attributeID\":182,\"value\":201.0},{\"attributeID\":277,\"value\":3.0}]}\n\
+             {\"_key\":201,\"dogmaAttributes\":[]}\n",
+        );
+        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
+        let targets = vec![SkillPlanTarget { type_id: 200, level_override: None }];
+        let plan = build_skill_plan(&store, &targets, None).unwrap();
+        let step = plan.plan.iter().find(|s| s.skill_id == 201).unwrap();
+        assert!(step.rank_assumed, "rank-less skill should be flagged");
+        assert_eq!(step.rank, 1, "defaults to rank 1");
+    }
+
+    #[tokio::test]
+    async fn sde_get_modifiers_errors_on_unknown_attribute() {
+        // Unknown attribute_id must error, not return a confident empty answer.
+        let server = make_server();
+        let err = server
+            .sde_get_modifiers(Parameters(ModifierQueryParam {
+                type_id: None,
+                attribute_id: Some(999),
+                effect_id: None,
+                resolve_names: None,
+            }))
+            .await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().message.contains("999"));
+    }
+
+    #[tokio::test]
+    async fn sde_get_modifiers_returns_empty_for_unmodified_attribute() {
+        // Attribute exists but nothing modifies it → empty list, not an error.
+        let (_a, dogma_attributes) = make_index("{\"_key\":77,\"name\":{\"en\":\"miningAmount\"}}\n");
+        let store = Arc::new(SdeStore { dogma_attributes, ..default_store() });
+        let server = SdeMcpServer::new(store, None);
+        let out = server
+            .sde_get_modifiers(Parameters(ModifierQueryParam {
+                type_id: None,
+                attribute_id: Some(77),
+                effect_id: None,
+                resolve_names: Some(false),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["attribute_id"], 77);
+        assert_eq!(v["modified_by"].as_array().unwrap().len(), 0);
     }
 }

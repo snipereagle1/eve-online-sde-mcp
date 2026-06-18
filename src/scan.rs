@@ -107,14 +107,6 @@ pub fn scan_blueprints_pub(
     scan_blueprints(path, pb)
 }
 
-#[cfg(test)]
-pub fn scan_dogma_effects_pub(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, Vec<ModifierRef>>)> {
-    scan_dogma_effects(path, pb)
-}
-
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     pb.set_message(
         path.file_name()
@@ -282,6 +274,7 @@ fn scan_dogma_effects(
     let mut attribute_modifiers: HashMap<u64, Vec<ModifierRef>> = HashMap::new();
     let mut buf = String::new();
     let mut offset = 0u64;
+    let mut parse_failures = 0u64;
 
     loop {
         let line_start = offset;
@@ -298,24 +291,40 @@ fn scan_dogma_effects(
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(parsed) = serde_json::from_str::<Line>(trimmed) {
-            id_index.insert(parsed.key, line_start);
-            for m in parsed.modifier_info.into_iter().flatten() {
-                // A modifier with no target attribute can't be reverse-indexed; skip it.
-                let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
-                    continue;
-                };
-                attribute_modifiers.entry(modified).or_default().push(ModifierRef {
-                    effect_id: parsed.key,
-                    modifying_attribute_id: modifying,
-                    modified_attribute_id: modified,
-                    operation: m.operation.unwrap_or(0),
-                    func: m.func,
-                    domain: m.domain,
-                    skill_type_id: m.skill_type_id,
-                });
+        let parsed = match serde_json::from_str::<Line>(trimmed) {
+            Ok(parsed) => parsed,
+            // Count rather than swallow: a schema drift (e.g. modifierInfo shape
+            // changing) would otherwise empty the reverse map silently, making
+            // `sde_get_modifiers` look like "no modifiers exist". Surface it.
+            Err(_) => {
+                parse_failures += 1;
+                continue;
             }
+        };
+        id_index.insert(parsed.key, line_start);
+        for m in parsed.modifier_info.into_iter().flatten() {
+            // A modifier with no target attribute can't be reverse-indexed; skip it.
+            let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
+                continue;
+            };
+            attribute_modifiers.entry(modified).or_default().push(ModifierRef {
+                effect_id: parsed.key,
+                modifying_attribute_id: modifying,
+                modified_attribute_id: modified,
+                operation: m.operation.unwrap_or(0),
+                func: m.func,
+                domain: m.domain,
+                skill_type_id: m.skill_type_id,
+            });
         }
+    }
+
+    if parse_failures > 0 {
+        tracing::warn!(
+            "{}: {parse_failures} dogmaEffects line(s) failed to parse; \
+             attribute_modifiers reverse map may be incomplete (possible SDE schema change)",
+            path.display()
+        );
     }
 
     pb.inc(1);
