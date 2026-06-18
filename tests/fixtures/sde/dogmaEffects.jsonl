@@ -3,3 +3,4 @@
 {"_key": 13, "name": {"en": "medPower"}, "effectCategory": null}
 {"_key": 16, "name": {"en": "online"}, "effectCategory": 4}
 {"_key": 132, "name": {"en": "rigSlot"}, "effectCategory": null}
+{"_key": 391, "name": {"en": "miningAmountMultiply"}, "effectCategory": null, "modifierInfo": [{"domain": "shipID", "func": "LocationRequiredSkillModifier", "modifiedAttributeID": 77, "modifyingAttributeID": 434, "operation": 6, "skillTypeID": 3386}]}

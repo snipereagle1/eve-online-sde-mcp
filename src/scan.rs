@@ -9,9 +9,9 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::{SdeIndex, SdeStore};
+use crate::store::{ModifierRef, SdeIndex, SdeStore};
 
-const SDE_FILE_COUNT: u64 = 16;
+const SDE_FILE_COUNT: u64 = 17;
 
 pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<SdeStore>> {
     let root = find_sde_root(sde_dir)?;
@@ -31,6 +31,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let (blueprints, product_to_blueprint) =
         scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
+    let type_dogma = scan_index(&root.join("typeDogma.jsonl"), &pb)?;
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
     let map_constellations = scan_index(&root.join("mapConstellations.jsonl"), &pb)?;
     let map_regions = scan_index(&root.join("mapRegions.jsonl"), &pb)?;
@@ -38,7 +39,8 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let npc_stations = scan_index(&root.join("npcStations.jsonl"), &pb)?;
     let market_groups = scan_index(&root.join("marketGroups.jsonl"), &pb)?;
     let dogma_attributes = scan_index(&root.join("dogmaAttributes.jsonl"), &pb)?;
-    let dogma_effects = scan_index(&root.join("dogmaEffects.jsonl"), &pb)?;
+    let (dogma_effects, attribute_modifiers) =
+        scan_dogma_effects(&root.join("dogmaEffects.jsonl"), &pb)?;
     let factions = scan_index(&root.join("factions.jsonl"), &pb)?;
     let npc_corporations = scan_index(&root.join("npcCorporations.jsonl"), &pb)?;
     let skins = scan_index(&root.join("skins.jsonl"), &pb)?;
@@ -62,6 +64,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         categories,
         blueprints,
         type_materials,
+        type_dogma,
         map_solar_systems,
         map_constellations,
         map_regions,
@@ -74,6 +77,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         skins,
         product_to_blueprint,
         stargate_graph,
+        attribute_modifiers,
     }))
 }
 
@@ -101,6 +105,14 @@ pub fn scan_blueprints_pub(
     pb: &ProgressBar,
 ) -> Result<(SdeIndex, HashMap<u64, u64>)> {
     scan_blueprints(path, pb)
+}
+
+#[cfg(test)]
+pub fn scan_dogma_effects_pub(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, Vec<ModifierRef>>)> {
+    scan_dogma_effects(path, pb)
 }
 
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
@@ -225,6 +237,95 @@ fn scan_blueprints(
             name_index: HashMap::new(),
         },
         product_to_blueprint,
+    ))
+}
+
+/// Scan dogmaEffects.jsonl into both the id→offset index (like every other file)
+/// and a reverse modifier map keyed by `modifiedAttributeID`. Mirrors
+/// `scan_blueprints`'s tuple-returning, typed-inner-struct pattern. `modifierInfo`
+/// ships as a real JSON array (verified against build 3396210), so it deserializes
+/// straight into `Vec<RawMod>` with no inner-string parsing.
+fn scan_dogma_effects(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, Vec<ModifierRef>>)> {
+    pb.set_message(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    #[derive(serde::Deserialize)]
+    struct Line {
+        #[serde(rename = "_key")]
+        key: u64,
+        #[serde(rename = "modifierInfo")]
+        modifier_info: Option<Vec<RawMod>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawMod {
+        domain: Option<String>,
+        func: Option<String>,
+        #[serde(rename = "modifiedAttributeID")]
+        modified: Option<u64>,
+        #[serde(rename = "modifyingAttributeID")]
+        modifying: Option<u64>,
+        operation: Option<i64>,
+        #[serde(rename = "skillTypeID")]
+        skill_type_id: Option<u64>,
+    }
+
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(65536, file);
+    let mut id_index = HashMap::new();
+    let mut attribute_modifiers: HashMap<u64, Vec<ModifierRef>> = HashMap::new();
+    let mut buf = String::new();
+    let mut offset = 0u64;
+
+    loop {
+        let line_start = offset;
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<Line>(trimmed) {
+            id_index.insert(parsed.key, line_start);
+            for m in parsed.modifier_info.into_iter().flatten() {
+                // A modifier with no target attribute can't be reverse-indexed; skip it.
+                let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
+                    continue;
+                };
+                attribute_modifiers.entry(modified).or_default().push(ModifierRef {
+                    effect_id: parsed.key,
+                    modifying_attribute_id: modifying,
+                    modified_attribute_id: modified,
+                    operation: m.operation.unwrap_or(0),
+                    func: m.func,
+                    domain: m.domain,
+                    skill_type_id: m.skill_type_id,
+                });
+            }
+        }
+    }
+
+    pb.inc(1);
+    Ok((
+        SdeIndex {
+            path: path.to_path_buf(),
+            id_index,
+            name_index: HashMap::new(),
+        },
+        attribute_modifiers,
     ))
 }
 
@@ -355,14 +456,14 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn scan_sde_fixture_dir_indexes_all_16_files() {
+    fn scan_sde_fixture_dir_indexes_all_17_files() {
         let fixture_dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
         let store =
             scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
 
         assert_eq!(store.build, crate::sde_version::PINNED_BUILD);
-        assert_eq!(store.files_scanned, 16);
+        assert_eq!(store.files_scanned, 17);
 
         assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
         assert!(store.types.name_index.contains_key("tritanium"), "Tritanium name index missing");
@@ -384,6 +485,7 @@ mod tests {
         assert!(store.npc_corporations.id_index.contains_key(&1000035), "Caldari Navy corp missing");
         assert!(store.skins.id_index.contains_key(&50), "Ferox skin missing");
         assert!(store.dogma_attributes.id_index.contains_key(&263), "shieldCapacity attr missing");
+        assert!(store.type_dogma.id_index.contains_key(&16227), "Ferox typeDogma missing");
 
         let jita_neighbors = store.stargate_graph.get(&30000142).expect("Jita has no stargate neighbors");
         assert!(jita_neighbors.contains(&30000144), "Jita->Perimeter stargate missing");
@@ -513,6 +615,31 @@ mod tests {
         assert!(idx.id_index.contains_key(&684));
         assert_eq!(p2b.get(&582), Some(&683));
         assert!(!p2b.contains_key(&684));
+    }
+
+    #[test]
+    fn scan_dogma_effects_builds_reverse_modifier_map() {
+        // Effect 391: Astrogeology (skill 3386) applies miningAmountBonus (434) to
+        // miningAmount (77). A second entry with no modifiedAttributeID must be skipped.
+        let fixture = r#"{"_key":391,"name":{"en":"miningBonus"},"modifierInfo":[{"domain":"shipID","func":"LocationRequiredSkillModifier","modifiedAttributeID":77,"modifyingAttributeID":434,"operation":6,"skillTypeID":3386}]}
+{"_key":11,"name":{"en":"loPower"},"modifierInfo":[{"func":"ItemModifier","modifyingAttributeID":50,"operation":2}]}
+"#;
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (idx, mods) = scan_dogma_effects(&path, &pb).unwrap();
+
+        assert!(idx.id_index.contains_key(&391));
+        assert!(idx.id_index.contains_key(&11), "effect with no usable modifier still indexed by id");
+
+        let to_mining = mods.get(&77).expect("attribute 77 has modifiers");
+        assert_eq!(to_mining.len(), 1);
+        let m = &to_mining[0];
+        assert_eq!(m.effect_id, 391);
+        assert_eq!(m.modifying_attribute_id, 434);
+        assert_eq!(m.skill_type_id, Some(3386));
+        assert_eq!(m.operation, 6);
+        // The modifier missing modifiedAttributeID was skipped, not indexed.
+        assert!(mods.values().flatten().all(|m| m.effect_id != 11));
     }
 
     #[test]

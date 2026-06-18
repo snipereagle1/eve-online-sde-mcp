@@ -25,8 +25,8 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 **Startup flow** (`main.rs`):
 1. `download::check_and_update` — HEAD checks CCP's stable redirect URL, downloads+extracts the ~81 MB zip if build number changed, stores `meta.json` with current build
-2. `scan::scan_sde` — reads all 16 JSONL files, builds in-memory `HashMap<id, byte_offset>` and `HashMap<name_lowercase, byte_offset>` per file; also builds `product_to_blueprint` reverse map and `stargate_graph` adjacency map
-3. `SdeMcpServer::serve` — runs MCP stdio transport with 21 tools
+2. `scan::scan_sde` — reads all 17 JSONL files, builds in-memory `HashMap<id, byte_offset>` and `HashMap<name_lowercase, byte_offset>` per file; also builds `product_to_blueprint` reverse map, `stargate_graph` adjacency map, and `attribute_modifiers` (reverse map from `dogmaEffects.modifierInfo`, keyed by `modifiedAttributeID`)
+3. `SdeMcpServer::serve` — runs MCP stdio transport with 28 tools
 
 **Data access pattern** (`tools/query.rs`):
 - ID lookup: `id_index.get(id)` → seek to byte offset → read one line → deserialize
@@ -35,8 +35,8 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 **Key files**:
 - `src/store.rs` — `SdeStore` (all indexes) and `SdeIndex` (path + id_index + name_index)
-- `src/scan.rs` — JSONL scanning; `scan_blueprints` and `scan_stargates` have custom parsers for their derived structures
-- `src/tools/server.rs` — all 21 MCP tool definitions using `#[tool]` / `#[tool_router]` macros; `fetch_filtered` and `search_filtered` helpers apply language filter
+- `src/scan.rs` — JSONL scanning; `scan_blueprints`, `scan_stargates`, and `scan_dogma_effects` have custom parsers for their derived structures
+- `src/tools/server.rs` — all 28 MCP tool definitions using `#[tool]` / `#[tool_router]` macros; `fetch_filtered` and `search_filtered` helpers apply language filter. `sde_get_skill_plan` (recursive prereq traversal + topo sort + SP math) and `sde_get_modifiers` (dogma modifier resolution) live here as free functions below the impl
 - `src/download.rs` — SDE download; extracts build number from CCP redirect URL
 - `src/config.rs` — CLI args (clap) and `Meta` (persisted build state)
 
