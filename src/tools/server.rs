@@ -149,6 +149,11 @@ pub struct ModifierQueryParam {
     pub attribute_id: Option<u64>,
     /// Direction-c: a dogma effect ID → the raw modifierInfo entries it defines
     pub effect_id: Option<u64>,
+    /// Direction-d (with type_id): true → list EVERY attribute on the type and, per
+    /// attribute, how many things modify it + the distinct modifying sources
+    /// (skills first). Use this to enumerate all of a module's tunable levers before
+    /// judging which matter — don't assume one "obvious" attribute is the whole story.
+    pub levers: Option<bool>,
     /// Join attribute IDs to human names from dogmaAttributes (default true)
     pub resolve_names: Option<bool>,
 }
@@ -230,6 +235,22 @@ impl SdeMcpServer {
     fn attribute_name(&self, id: u64) -> Option<String> {
         let v = query::fetch_by_id(&self.store.dogma_attributes, id).ok()?;
         pick_name(v.get("name"), self.language.as_deref())
+    }
+
+    /// True if a type is a skill (category 16), via type→group→category. Used by the
+    /// levers view to float skills above implants/boosters/ships when listing what
+    /// modifies an attribute — the skill sources are what a training plan cares about.
+    fn is_skill(&self, type_id: u64) -> bool {
+        let Ok(t) = query::fetch_by_id(&self.store.types, type_id) else {
+            return false;
+        };
+        let Some(group_id) = t.get("groupID").and_then(|x| x.as_u64()) else {
+            return false;
+        };
+        query::fetch_by_id(&self.store.groups, group_id)
+            .ok()
+            .and_then(|g| g.get("categoryID").and_then(|x| x.as_u64()))
+            == Some(16)
     }
 
     /// In-place: annotate each dogmaAttribute with `attributeName`, and decode
@@ -327,11 +348,13 @@ impl SdeMcpServer {
                     let (Some(modified), Some(modifying)) = (modified, modifying) else {
                         continue;
                     };
+                    let op = m.get("operation").and_then(|x| x.as_i64());
                     let mut row = serde_json::json!({
                         "effect_id": eid,
                         "modified_attribute_id": modified,
                         "modifying_attribute_id": modifying,
-                        "operation": m.get("operation").and_then(|x| x.as_i64()),
+                        "operation": op,
+                        "operation_name": op.map(operation_label),
                         "magnitude": magnitudes.get(&modifying),
                     });
                     if resolve_names {
@@ -361,10 +384,12 @@ impl SdeMcpServer {
             for m in mods {
                 let modified = m.get("modifiedAttributeID").and_then(|x| x.as_u64());
                 let modifying = m.get("modifyingAttributeID").and_then(|x| x.as_u64());
+                let op = m.get("operation").and_then(|x| x.as_i64());
                 let mut row = serde_json::json!({
                     "modified_attribute_id": modified,
                     "modifying_attribute_id": modifying,
-                    "operation": m.get("operation").and_then(|x| x.as_i64()),
+                    "operation": op,
+                    "operation_name": op.map(operation_label),
                     "func": m.get("func"),
                     "domain": m.get("domain"),
                     "skill_type_id": m.get("skillTypeID").and_then(|x| x.as_u64()),
@@ -399,43 +424,193 @@ impl SdeMcpServer {
                 None,
             ));
         }
+        // Cap owners surfaced per effect: a few generic effects are owned by hundreds
+        // of types and would otherwise swamp the response. owner_count makes any
+        // truncation explicit (no silent cap).
+        const MAX_OWNERS: usize = 25;
         let mut rows = Vec::new();
         if let Some(mods) = self.store.attribute_modifiers.get(&attribute_id) {
             for m in mods {
-                // Magnitude is only knowable when the source type is identified (skillTypeID).
-                let magnitude = m.skill_type_id.and_then(|sid| {
-                    query::fetch_by_id(&self.store.type_dogma, sid).ok().and_then(|d| {
-                        d.get("dogmaAttributes")
-                            .and_then(|a| a.as_array())
-                            .and_then(|attrs| {
-                                attrs.iter().find_map(|a| {
-                                    let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
-                                    (aid == m.modifying_attribute_id)
-                                        .then(|| a.get("value").and_then(|x| x.as_f64()))
-                                        .flatten()
+                // The real bonus source is the type whose dogmaEffects own this effect
+                // — NOT modifierInfo.skillTypeID (that's a required-skill filter on the
+                // boosted modules). One effect can be owned by several types (e.g. 391
+                // is owned by both Mining and Astrogeology), so emit one row per owner.
+                let owners = self.store.effect_to_types.get(&m.effect_id);
+                let owner_count = owners.map_or(0, |o| o.len());
+                // Build the per-owner row. `source` is the owning type (or None for an
+                // orphan effect no type references — still surfaced so it isn't dropped).
+                let push_row = |source: Option<u64>| {
+                    // Magnitude is the modifying attribute's value on the *owning* type.
+                    let magnitude = source.and_then(|sid| {
+                        query::fetch_by_id(&self.store.type_dogma, sid).ok().and_then(|d| {
+                            d.get("dogmaAttributes")
+                                .and_then(|a| a.as_array())
+                                .and_then(|attrs| {
+                                    attrs.iter().find_map(|a| {
+                                        let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
+                                        (aid == m.modifying_attribute_id)
+                                            .then(|| a.get("value").and_then(|x| x.as_f64()))
+                                            .flatten()
+                                    })
                                 })
-                            })
-                    })
-                });
-                let mut row = serde_json::json!({
-                    "effect_id": m.effect_id,
-                    "modifying_attribute_id": m.modifying_attribute_id,
-                    "operation": m.operation,
-                    "func": m.func,
-                    "skill_type_id": m.skill_type_id,
-                    "magnitude": magnitude,
-                });
-                if resolve_names {
-                    row["modifying_attribute_name"] =
-                        serde_json::to_value(self.attribute_name(m.modifying_attribute_id)).unwrap();
-                    if let Some(sid) = m.skill_type_id {
-                        row["skill_name"] = serde_json::to_value(self.type_name(sid)).unwrap();
+                        })
+                    });
+                    let mut row = serde_json::json!({
+                        "effect_id": m.effect_id,
+                        "modified_attribute_id": m.modified_attribute_id,
+                        "modifying_attribute_id": m.modifying_attribute_id,
+                        "operation": m.operation,
+                        "operation_name": operation_label(m.operation),
+                        "func": m.func,
+                        "source_type_id": source,
+                        "required_skill_id": m.skill_type_id,
+                        "magnitude": magnitude,
+                    });
+                    if owner_count > MAX_OWNERS {
+                        row["owner_count"] = serde_json::json!(owner_count);
                     }
+                    if resolve_names {
+                        row["modifying_attribute_name"] =
+                            serde_json::to_value(self.attribute_name(m.modifying_attribute_id)).unwrap();
+                        if let Some(sid) = source {
+                            row["source_type_name"] =
+                                serde_json::to_value(self.type_name(sid)).unwrap();
+                        }
+                        if let Some(sid) = m.skill_type_id {
+                            row["required_skill_name"] =
+                                serde_json::to_value(self.type_name(sid)).unwrap();
+                        }
+                    }
+                    row
+                };
+                match owners {
+                    Some(types) if !types.is_empty() => {
+                        for &sid in types.iter().take(MAX_OWNERS) {
+                            rows.push(push_row(Some(sid)));
+                        }
+                    }
+                    // No owning type references this effect: still surface the modifier.
+                    _ => rows.push(push_row(None)),
                 }
-                rows.push(row);
             }
         }
         Ok(serde_json::json!({"attribute_id": attribute_id, "modified_by": rows}))
+    }
+
+    /// Direction-d: a module-centric "all tunable levers" view. For the type's every
+    /// dogmaAttribute, report how many things modify it and the distinct modifying
+    /// sources (skills first, so a skill lever never gets truncated behind implant /
+    /// booster noise). Built to defeat the under-enumeration failure mode where an
+    /// agent anchors on one obvious attribute (e.g. miningAmount) and misses the
+    /// others that also feed effective output (crit chance, crit yield, duration).
+    /// This is a SUMMARY: drill into any attribute with attribute_id for full rows.
+    fn levers_for_type(
+        &self,
+        type_id: u64,
+        resolve_names: bool,
+    ) -> Result<serde_json::Value, ErrorData> {
+        // Distinct sources listed per attribute before truncation — bounds output
+        // while keeping every skill lever visible (skills are sorted to the front).
+        const MAX_SOURCES: usize = 12;
+        let dogma = query::fetch_by_id(&self.store.type_dogma, type_id).map_err(|_| {
+            ErrorData::invalid_params(format!("ID {type_id} not found in typeDogma"), None)
+        })?;
+        // Required-skill applicability filter. A LocationRequiredSkill / OwnerRequiredSkill
+        // modifier only hits modules that REQUIRE its skillTypeID. The reverse map is
+        // global, so without this an afterburner-duration or turret-range skill would
+        // show up as a "lever" on a mining laser. Keep modifiers whose skill_type_id is
+        // None (unconditional / item-level) or is one of THIS type's required skills.
+        let required_skills: std::collections::HashSet<u64> = dogma
+            .get("dogmaAttributes")
+            .and_then(|a| a.as_array())
+            .map(|attrs| {
+                attrs
+                    .iter()
+                    .filter_map(|a| {
+                        let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
+                        // 182/183/184 carry requiredSkill1..3 as the skill's type id.
+                        matches!(aid, 182..=184)
+                            .then(|| a.get("value").and_then(|x| x.as_f64()))
+                            .flatten()
+                            .map(|v| v as u64)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let applies = |m: &crate::store::ModifierRef| {
+            m.skill_type_id
+                .is_none_or(|sid| required_skills.contains(&sid))
+        };
+        let mut attributes = Vec::new();
+        if let Some(attrs) = dogma.get("dogmaAttributes").and_then(|a| a.as_array()) {
+            for a in attrs {
+                let Some(aid) = a.get("attributeID").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
+                let value = a.get("value").and_then(|x| x.as_f64());
+
+                // Gather distinct owning-type sources across every modifier hitting
+                // this attribute (owner = the type whose dogmaEffects own the effect),
+                // keeping only modifiers that actually apply to this module.
+                let mut source_ids: Vec<u64> = Vec::new();
+                let mut modifier_count = 0usize;
+                if let Some(mods) = self.store.attribute_modifiers.get(&aid) {
+                    for m in mods.iter().filter(|m| applies(m)) {
+                        let owners = self.store.effect_to_types.get(&m.effect_id);
+                        match owners {
+                            Some(types) if !types.is_empty() => {
+                                modifier_count += types.len();
+                                for &sid in types {
+                                    if !source_ids.contains(&sid) {
+                                        source_ids.push(sid);
+                                    }
+                                }
+                            }
+                            _ => modifier_count += 1,
+                        }
+                    }
+                }
+                // Skills first, then by id for determinism, so the training-relevant
+                // levers survive the MAX_SOURCES cap even amid many item sources.
+                let mut sources: Vec<(u64, bool)> =
+                    source_ids.iter().map(|&id| (id, self.is_skill(id))).collect();
+                sources.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+                let source_count = sources.len();
+                let truncated = source_count > MAX_SOURCES;
+                let source_rows: Vec<_> = sources
+                    .iter()
+                    .take(MAX_SOURCES)
+                    .map(|&(id, is_skill)| {
+                        let mut s = serde_json::json!({"type_id": id, "is_skill": is_skill});
+                        if resolve_names {
+                            s["name"] = serde_json::to_value(self.type_name(id)).unwrap();
+                        }
+                        s
+                    })
+                    .collect();
+
+                let mut entry = serde_json::json!({
+                    "attribute_id": aid,
+                    "value": value,
+                    "modifier_count": modifier_count,
+                    "source_count": source_count,
+                    "sources": source_rows,
+                });
+                if truncated {
+                    entry["sources_truncated"] = serde_json::json!(true);
+                }
+                if resolve_names {
+                    entry["attribute_name"] =
+                        serde_json::to_value(self.attribute_name(aid)).unwrap();
+                }
+                attributes.push((modifier_count, entry));
+            }
+        }
+        // Most-modified attributes first: the tunable levers float to the top, fixed
+        // stats (modifier_count 0) sink — but all stay present (no silent omission).
+        attributes.sort_by(|x, y| y.0.cmp(&x.0));
+        let attributes: Vec<_> = attributes.into_iter().map(|(_, e)| e).collect();
+        Ok(serde_json::json!({"type_id": type_id, "attributes": attributes}))
     }
 }
 
@@ -533,12 +708,24 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&plan).unwrap())
     }
 
-    #[tool(description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes.")]
+    #[tool(description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows.")]
     async fn sde_get_modifiers(
         &self,
         Parameters(p): Parameters<ModifierQueryParam>,
     ) -> Result<String, ErrorData> {
         let resolve_names = p.resolve_names.unwrap_or(true);
+        // Direction-d: levers mode is a distinct read over type_id, so branch first.
+        if p.levers == Some(true) {
+            return match (p.type_id, p.attribute_id, p.effect_id) {
+                (Some(id), None, None) => {
+                    Ok(serde_json::to_string(&self.levers_for_type(id, resolve_names)?).unwrap())
+                }
+                _ => Err(ErrorData::invalid_params(
+                    "levers:true requires type_id (and not attribute_id/effect_id)",
+                    None,
+                )),
+            };
+        }
         match (p.type_id, p.attribute_id, p.effect_id) {
             (Some(id), None, None) => Ok(serde_json::to_string(&self.modifiers_for_type(id, resolve_names)?).unwrap()),
             (None, Some(attr), None) => Ok(serde_json::to_string(&self.modifiers_for_attribute(attr, resolve_names)?).unwrap()),
@@ -839,7 +1026,7 @@ EVE Online Static Data Export (SDE) query server. Data is read-only game data in
 
 Pick the most direct tool — most questions are ONE call, not a fan-out:
 - \"What skills / what order to fly SHIP or use MODULE\" → sde_get_skill_plan with ALL target type IDs in one call. Its output already gives the topo-sorted prerequisite order, each skill's rank, per-level SP cost (sp_by_level), running cumulative SP, and which target needs it. Do NOT call sde_get_type_dogma or sde_get_skill_sp per skill to rebuild this.
-- \"Which skills/ships boost ATTRIBUTE X (e.g. mining yield, attr 77)\" → sde_get_modifiers with attribute_id — one call returns every modifier. Use type_id for the inverse, effect_id for a single effect's modifierInfo.
+- \"Which skills/ships boost ATTRIBUTE X (e.g. mining yield, attr 77)\" → sde_get_modifiers with attribute_id — one call returns every modifier, one row per owning type. Read source_type_id/source_type_name as the bonus SOURCE (e.g. Astrogeology); required_skill_id/required_skill_name is only a target-module filter, NOT the source. Use type_id for the inverse, effect_id for a single effect's modifierInfo.
 - Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery.
 - Several types or dogma records at once → sde_get_types / sde_get_types_dogma (batched), not many single calls.
 - Decoding skill prereqs from raw dogma → pass resolve_names:true to sde_get_type_dogma instead of memorizing attribute IDs 182/277 etc.
@@ -910,6 +1097,26 @@ fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         _ => None,
+    }
+}
+
+/// Human-readable name for a dogma modifier `operation` code (EVE's canonical
+/// dogma Operator enum). The magnitude alone is ambiguous — e.g. op 6 with
+/// magnitude 5.0 is "+5% per stacking source", NOT "+5 flat". Surfacing this
+/// stops callers misreading a percent bonus as additive (the exact slip that made
+/// a benchmark agent treat Mining/Astrogeology's +5%/level as +5 m³/level).
+fn operation_label(op: i64) -> &'static str {
+    match op {
+        -1 => "preAssignment (set, applied first)",
+        0 => "preMul (multiply)",
+        1 => "preDiv (divide)",
+        2 => "modAdd (additive, flat)",
+        3 => "modSub (subtractive, flat)",
+        4 => "postMul (multiply)",
+        5 => "postDiv (divide)",
+        6 => "postPercent (+magnitude% per stacking source)",
+        7 => "postAssignment (set, applied last)",
+        _ => "unknown",
     }
 }
 
@@ -1264,6 +1471,7 @@ mod tests {
             product_to_blueprint: HashMap::new(),
             stargate_graph: HashMap::new(),
             attribute_modifiers: HashMap::new(),
+            effect_to_types: HashMap::new(),
         }
     }
 
@@ -2220,7 +2428,24 @@ mod tests {
                 .with_arguments(obj(serde_json::json!({"attribute_id": 77}))),
         ).await?);
         let mods = r["modified_by"].as_array().unwrap();
-        assert!(mods.iter().any(|m| m["skill_type_id"] == 3386 && m["magnitude"] == 5.0));
+        // One row per owning type: effect 391 is owned by BOTH Mining (3386) and
+        // Astrogeology (3410), each granting +5% via its own attr 434. The old code
+        // collapsed this to a single "Mining" row and hid Astrogeology entirely.
+        assert!(mods.iter().any(|m| m["source_type_id"] == 3386
+            && m["source_type_name"] == "Mining"
+            && m["magnitude"] == 5.0));
+        assert!(mods.iter().any(|m| m["source_type_id"] == 3410
+            && m["source_type_name"] == "Astrogeology"
+            && m["magnitude"] == 5.0), "Astrogeology must surface as a yield source");
+        // operation_name decodes op 6 as percent so the +5 isn't read as flat m³.
+        assert!(mods.iter().any(|m| m["source_type_id"] == 3410
+            && m["operation"] == 6
+            && m["operation_name"].as_str().is_some_and(|s| s.starts_with("postPercent"))));
+        // The skillTypeID filter is now a distinct field, not mislabeled as the source.
+        assert!(mods.iter().all(|m| m["skill_type_id"].is_null() && m["skill_name"].is_null()),
+            "old skill_type_id/skill_name keys removed (renamed to required_skill_*)");
+        assert!(mods.iter().any(|m| m["required_skill_id"] == 3386
+            && m["required_skill_name"] == "Mining"));
 
         // sde_get_modifiers direction-a: Mining skill's outgoing modifiers
         let r = text_json(&client.call_tool(
@@ -2371,7 +2596,7 @@ mod tests {
     async fn sde_get_modifiers_requires_exactly_one_arg() {
         let server = make_server();
         let err = server
-            .sde_get_modifiers(Parameters(ModifierQueryParam { type_id: None, attribute_id: None, effect_id: None, resolve_names: None }))
+            .sde_get_modifiers(Parameters(ModifierQueryParam { type_id: None, attribute_id: None, effect_id: None, levers: None, resolve_names: None }))
             .await;
         assert!(err.is_err());
     }
@@ -2421,6 +2646,74 @@ mod tests {
         assert_eq!(step.rank, 1, "defaults to rank 1");
     }
 
+    #[test]
+    fn operation_label_decodes_canonical_dogma_operators() {
+        // op 6 is the one that bit the benchmark: percent, not flat.
+        assert_eq!(operation_label(6), "postPercent (+magnitude% per stacking source)");
+        assert_eq!(operation_label(2), "modAdd (additive, flat)");
+        assert_eq!(operation_label(4), "postMul (multiply)");
+        assert_eq!(operation_label(0), "preMul (multiply)");
+        assert_eq!(operation_label(7), "postAssignment (set, applied last)");
+        assert_eq!(operation_label(123), "unknown");
+    }
+
+    #[test]
+    fn levers_for_type_enumerates_all_attrs_with_skill_sources_first() {
+        use crate::store::ModifierRef;
+        // Module 100 has two attributes: 77 (miningAmount) and 5967 (miningCritChance).
+        // Each is modified by one effect, owned respectively by Mining (a skill) and
+        // Mining Precision (a skill). The levers view must surface BOTH attributes —
+        // the crit attr is exactly what an agent anchoring on 77 would otherwise miss.
+        // Module 100 requires skill 3386 (attr 182) — so modifiers gated on
+        // skillTypeID 3386 apply; ones for other skills would be filtered out.
+        let (_td, type_dogma) = make_index(
+            "{\"_key\":100,\"dogmaAttributes\":[{\"attributeID\":182,\"value\":3386.0},{\"attributeID\":77,\"value\":200.0},{\"attributeID\":5967,\"value\":0.01}]}\n",
+        );
+        let (_ty, types) = make_index(
+            "{\"_key\":3386,\"name\":{\"en\":\"Mining\"},\"groupID\":600}\n\
+             {\"_key\":90727,\"name\":{\"en\":\"Mining Precision\"},\"groupID\":600}\n",
+        );
+        let (_gr, groups) = make_index("{\"_key\":600,\"categoryID\":16}\n");
+        let mk = |effect_id, modified| ModifierRef {
+            effect_id,
+            modifying_attribute_id: 6049,
+            modified_attribute_id: modified,
+            operation: 6,
+            func: None,
+            domain: None,
+            skill_type_id: Some(3386),
+        };
+        let attribute_modifiers = HashMap::from([
+            (77u64, vec![mk(501, 77)]),
+            (5967u64, vec![mk(500, 5967)]),
+        ]);
+        let effect_to_types = HashMap::from([(500u64, vec![90727u64]), (501u64, vec![3386u64])]);
+        let store = Arc::new(SdeStore {
+            type_dogma,
+            types,
+            groups,
+            attribute_modifiers,
+            effect_to_types,
+            ..default_store()
+        });
+        let server = SdeMcpServer::new(store, None);
+        let r = server.levers_for_type(100, false).unwrap();
+        let attrs = r["attributes"].as_array().unwrap();
+        // All three dogmaAttributes appear (incl. the requiredSkill1 meta-attr 182,
+        // which has no modifiers) — completeness, no silent omission.
+        assert_eq!(attrs.len(), 3, "every module attribute must appear");
+
+        let crit = attrs.iter().find(|a| a["attribute_id"] == 5967).expect("crit attr present");
+        assert_eq!(crit["modifier_count"], 1);
+        let src = &crit["sources"][0];
+        assert_eq!(src["type_id"], 90727); // Mining Precision surfaces as the lever
+        assert_eq!(src["is_skill"], true);
+
+        let yield_attr = attrs.iter().find(|a| a["attribute_id"] == 77).unwrap();
+        assert_eq!(yield_attr["sources"][0]["type_id"], 3386);
+        assert_eq!(yield_attr["sources"][0]["is_skill"], true);
+    }
+
     #[tokio::test]
     async fn sde_get_modifiers_errors_on_unknown_attribute() {
         // Unknown attribute_id must error, not return a confident empty answer.
@@ -2430,6 +2723,7 @@ mod tests {
                 type_id: None,
                 attribute_id: Some(999),
                 effect_id: None,
+                levers: None,
                 resolve_names: None,
             }))
             .await;
@@ -2448,6 +2742,7 @@ mod tests {
                 type_id: None,
                 attribute_id: Some(77),
                 effect_id: None,
+                levers: None,
                 resolve_names: Some(false),
             }))
             .await

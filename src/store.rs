@@ -48,4 +48,6 @@ pub(crate) struct SdeStore {
     pub(crate) stargate_graph: HashMap<u64, Vec<u64>>,
     /// modifiedAttributeID -> dogma modifiers that target it (reverse of dogmaEffects.modifierInfo)
     pub(crate) attribute_modifiers: HashMap<u64, Vec<ModifierRef>>,
+    /// effectID -> type IDs whose dogmaEffects own this effect (reverse of typeDogma.dogmaEffects)
+    pub(crate) effect_to_types: HashMap<u64, Vec<u64>>,
 }

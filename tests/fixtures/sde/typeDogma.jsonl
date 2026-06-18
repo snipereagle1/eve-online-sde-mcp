@@ -1,7 +1,7 @@
 {"_key": 16227, "dogmaAttributes": [{"attributeID": 9, "value": 4500.0}, {"attributeID": 11, "value": 4500.0}, {"attributeID": 263, "value": 3500.0}], "dogmaEffects": [{"effectID": 11, "isDefault": false}]}
 {"_key": 34, "dogmaAttributes": [{"attributeID": 4, "value": 0.01}, {"attributeID": 161, "value": 0.01}], "dogmaEffects": []}
 {"_key": 3386, "dogmaAttributes": [{"attributeID": 275, "value": 1.0}, {"attributeID": 434, "value": 5.0}], "dogmaEffects": [{"effectID": 391, "isDefault": false}]}
-{"_key": 3410, "dogmaAttributes": [{"attributeID": 275, "value": 3.0}, {"attributeID": 182, "value": 3386.0}, {"attributeID": 277, "value": 4.0}], "dogmaEffects": []}
+{"_key": 3410, "dogmaAttributes": [{"attributeID": 275, "value": 3.0}, {"attributeID": 182, "value": 3386.0}, {"attributeID": 277, "value": 4.0}, {"attributeID": 434, "value": 5.0}], "dogmaEffects": [{"effectID": 391, "isDefault": false}]}
 {"_key": 17940, "dogmaAttributes": [{"attributeID": 275, "value": 4.0}, {"attributeID": 182, "value": 3410.0}, {"attributeID": 277, "value": 3.0}, {"attributeID": 183, "value": 3386.0}, {"attributeID": 278, "value": 4.0}], "dogmaEffects": []}
 {"_key": 17476, "dogmaAttributes": [{"attributeID": 182, "value": 17940.0}, {"attributeID": 277, "value": 3.0}], "dogmaEffects": []}
 {"_key": 87562, "dogmaAttributes": [{"attributeID": 77, "value": 133.0}, {"attributeID": 182, "value": 3386.0}, {"attributeID": 277, "value": 5.0}], "dogmaEffects": []}
