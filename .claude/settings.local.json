@@ -1,33 +1,31 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(rtk read *)",
-      "Bash(gh issue *)",
-      "Bash(rtk find *)",
-      "Bash(rtk ls *)",
-      "Bash(cargo search *)",
-      "Skill(rust-best-practices)",
-      "Bash(rtk cargo build)",
-      "Bash(rtk cargo test)",
-      "Bash(rtk cargo test *)",
-      "Bash(rtk cargo clippy *)",
-      "Bash(rtk cargo fmt *)",
-      "Bash(rtk git diff *)",
-      "Bash(rtk git status *)",
-      "mcp__plugin_context7_context7__resolve-library-id",
-      "mcp__plugin_context7_context7__query-docs",
-      "Bash(~/.claude/skills/ccpm/references/scripts/*)",
-      "mcp__eve-sde__sde_get_type",
-      "mcp__eve-sde__sde_search_solar_systems",
-      "mcp__eve-sde__sde_find_route",
-      "mcp__eve-sde__sde_get_region",
-      "mcp__eve-sde__sde_get_solar_system",
-      "mcp__eve-sde__sde_search_types",
-      "mcp__codegraph__codegraph_explore"
-    ]
-  },
-  "enableAllProjectMcpServers": true,
-  "enabledMcpjsonServers": [
-    "eve-sde"
-  ]
+    "permissions": {
+        "allow": [
+            "Bash(rtk read *)",
+            "Bash(gh issue *)",
+            "Bash(rtk find *)",
+            "Bash(rtk ls *)",
+            "Bash(cargo search *)",
+            "Skill(rust-best-practices)",
+            "Bash(rtk cargo build)",
+            "Bash(rtk cargo test)",
+            "Bash(rtk cargo test *)",
+            "Bash(rtk cargo clippy *)",
+            "Bash(rtk cargo fmt *)",
+            "Bash(rtk git diff *)",
+            "Bash(rtk git status *)",
+            "mcp__plugin_context7_context7__resolve-library-id",
+            "mcp__plugin_context7_context7__query-docs",
+            "mcp__eve-sde__sde_get_type",
+            "mcp__eve-sde__sde_search_solar_systems",
+            "mcp__eve-sde__sde_find_route",
+            "mcp__eve-sde__sde_get_region",
+            "mcp__eve-sde__sde_get_solar_system",
+            "mcp__eve-sde__sde_search_types",
+            "mcp__codegraph__codegraph_explore",
+            "mcp__codegraph__codegraph_files"
+        ]
+    },
+    "enableAllProjectMcpServers": true,
+    "enabledMcpjsonServers": ["eve-sde"]
 }

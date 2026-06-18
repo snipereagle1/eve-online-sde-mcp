@@ -58,3 +58,17 @@ RUST_LOG=debug cargo run             # run with debug logging
 - **No stdout except MCP JSON-RPC frames** — all progress bars, logs, and status messages go to stderr. Breaking this breaks MCP clients.
 - `scan_index` uses `memchr::memmem` for fast byte-pattern matching to extract `_key` and `name.en` without full JSON parsing — the hot path for startup.
 - Tests use `tempfile` JSONL fixtures; the `scan_index_pub` re-export in `scan.rs` exists solely to expose the private function to tests in `tools/server.rs`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`snipereagle1/eve-online-sde-mcp`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
