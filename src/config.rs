@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 #[derive(Parser, Debug)]
 #[command(about = "EVE Online SDE MCP server")]
 pub(crate) struct Config {
-    /// Data directory for SDE files
+    /// Data directory for SDE files. Optional. Precedence: this flag, then the
+    /// SDE_DATA_DIR env var (an empty value is treated as unset), then a per-OS
+    /// default (Linux: ~/.local/share/eve-sde-mcp, Windows: %APPDATA%\eve-sde-mcp,
+    /// macOS: ~/Library/Application Support/eve-sde-mcp).
     #[arg(long, env = "SDE_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
 
@@ -24,25 +27,34 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    pub(crate) fn resolved_data_dir(&self) -> PathBuf {
-        if let Some(ref d) = self.data_dir
-            && !d.as_os_str().is_empty()
-        {
-            return d.clone();
+    /// Resolve the SDE data directory (per the precedence on [`Config::data_dir`])
+    /// and ensure it exists on disk. Errors if no directory can be determined.
+    pub(crate) fn resolved_data_dir(&self) -> Result<PathBuf> {
+        let dir = self.data_dir_setting()?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create SDE data dir {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// Pure precedence resolution with no filesystem side effects: the `--data-dir`
+    /// flag / `SDE_DATA_DIR` env var (empty treated as unset), else the per-OS default.
+    fn data_dir_setting(&self) -> Result<PathBuf> {
+        if let Some(d) = self.data_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
+            return Ok(d.clone());
         }
         default_data_dir()
     }
 
-    pub(crate) fn sde_dir(&self, build: u64) -> PathBuf {
-        self.resolved_data_dir().join(format!("sde-{build}"))
+    pub(crate) fn sde_dir(&self, build: u64) -> Result<PathBuf> {
+        Ok(self.resolved_data_dir()?.join(format!("sde-{build}")))
     }
 
-    pub(crate) fn meta_path(&self) -> PathBuf {
-        self.resolved_data_dir().join("meta.json")
+    pub(crate) fn meta_path(&self) -> Result<PathBuf> {
+        Ok(self.resolved_data_dir()?.join("meta.json"))
     }
 
     pub(crate) fn stale_sde_dirs(&self, current_build: u64) -> Result<Vec<PathBuf>> {
-        let base = self.resolved_data_dir();
+        let base = self.resolved_data_dir()?;
         if !base.exists() {
             return Ok(vec![]);
         }
@@ -62,18 +74,15 @@ impl Config {
     }
 }
 
-fn default_data_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("eve-sde-mcp");
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("eve-sde-mcp");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/eve-sde-mcp")
+/// Per-OS default data dir via the `directories` crate:
+/// Linux `~/.local/share/eve-sde-mcp`, Windows `%APPDATA%\eve-sde-mcp\data`,
+/// macOS `~/Library/Application Support/eve-sde-mcp`.
+fn default_data_dir() -> Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "eve-sde-mcp").context(
+        "no home directory found for the default SDE data dir; \
+         pass --data-dir or set SDE_DATA_DIR",
+    )?;
+    Ok(dirs.data_dir().to_path_buf())
 }
 
 #[cfg(test)]
@@ -94,19 +103,22 @@ mod tests {
         // MCPB injects SDE_DATA_DIR="" when the optional user_config knob is
         // left unset, so an empty path must defer to the per-OS default.
         let cfg = config_with_data_dir(Some(""));
-        assert_eq!(cfg.resolved_data_dir(), default_data_dir());
+        assert_eq!(cfg.data_dir_setting().unwrap(), default_data_dir().unwrap());
     }
 
     #[test]
     fn unset_data_dir_uses_per_os_default() {
         let cfg = config_with_data_dir(None);
-        assert_eq!(cfg.resolved_data_dir(), default_data_dir());
+        assert_eq!(cfg.data_dir_setting().unwrap(), default_data_dir().unwrap());
     }
 
     #[test]
     fn explicit_data_dir_is_honored() {
         let cfg = config_with_data_dir(Some("/custom/sde"));
-        assert_eq!(cfg.resolved_data_dir(), PathBuf::from("/custom/sde"));
+        assert_eq!(
+            cfg.data_dir_setting().unwrap(),
+            PathBuf::from("/custom/sde")
+        );
     }
 }
 
