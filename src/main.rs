@@ -27,17 +27,17 @@ async fn main() -> anyhow::Result<()> {
         let result = download::check_and_update(&cfg)?;
 
         if result.was_downloaded {
-            eprintln!(
-                "SDE build {} ({}) ready",
-                result.build, result.release_date
-            );
+            eprintln!("SDE build {} ({}) ready", result.build, result.release_date);
         } else {
             eprintln!("SDE build {} is current", result.build);
         }
 
         let start = std::time::Instant::now();
-        let store =
-            scan::scan_sde(&cfg.sde_dir(result.build), result.build, &result.release_date)?;
+        let store = scan::scan_sde(
+            &cfg.sde_dir(result.build),
+            result.build,
+            &result.release_date,
+        )?;
         tracing::debug!("scan complete in {:.2}s", start.elapsed().as_secs_f64());
         Ok(store)
     })
