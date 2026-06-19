@@ -624,7 +624,7 @@ impl SdeMcpServer {
         }
         // Most-modified attributes first: the tunable levers float to the top, fixed
         // stats (modifier_count 0) sink — but all stay present (no silent omission).
-        attributes.sort_by(|x, y| y.0.cmp(&x.0));
+        attributes.sort_by_key(|y| std::cmp::Reverse(y.0));
         let attributes: Vec<_> = attributes.into_iter().map(|(_, e)| e).collect();
         Ok(serde_json::json!({"type_id": type_id, "attributes": attributes}))
     }
