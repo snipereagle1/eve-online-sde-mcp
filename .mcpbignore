@@ -1,0 +1,29 @@
+# The MCPB bundle ships only manifest.json + the prebuilt server/ binaries.
+# Everything below is source, tooling, or CI scratch and must stay out of the
+# bundle. (.mcpbignore is denylist-only — it has no `!` allowlist negation —
+# so each excluded path is listed explicitly.)
+
+# Rust source, manifest, and lockfile
+src/
+tests/
+Cargo.toml
+Cargo.lock
+
+# Docs and project prose
+docs/
+README.md
+CLAUDE.md
+CONTEXT.md
+
+# Repo tooling and agent/CI config
+.github/
+.githooks/
+.claude/
+.codegraph/
+.out-of-scope/
+.mcp.json
+
+# CI scratch dirs produced during the release job
+artifacts/
+dist/
+target/
