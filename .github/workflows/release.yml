@@ -146,11 +146,9 @@ jobs:
         id: tag
         run: |
           set -euo pipefail
-          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           # HEAD is the CI-passing commit (checked out via workflow_run.head_sha);
-          # tag with its short SHA so each release maps to an exact commit.
-          short_sha=$(git rev-parse --short HEAD)
-          echo "tag=v${version}+${short_sha}" >> "$GITHUB_OUTPUT"
+          # the short SHA alone is the version, so each release maps to an exact commit.
+          echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
