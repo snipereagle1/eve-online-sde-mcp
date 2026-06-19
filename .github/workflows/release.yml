@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# A release per commit must not clobber an in-flight one; let each run finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate the release on the full suite, including the #[ignore]d network
+  # integration tests that hit CCP's SDE redirect (skipped in plain `cargo test`).
+  test:
+    name: tests (incl. network)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test (including ignored network tests)
+        run: cargo test -- --include-ignored
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin: eve-sde-mcp
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bin: eve-sde-mcp
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: eve-sde-mcp.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  release:
+    name: package & release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # The manifest's platform_overrides expect each binary at a triple-named
+      # path under server/ (see #16 / #14). Reconstruct that layout for `mcpb pack`.
+      - name: Assemble server/ bundle layout
+        run: |
+          set -euo pipefail
+          mkdir -p server/x86_64-unknown-linux-gnu \
+                   server/aarch64-apple-darwin \
+                   server/x86_64-pc-windows-msvc
+          cp artifacts/binary-x86_64-unknown-linux-gnu/eve-sde-mcp server/x86_64-unknown-linux-gnu/eve-sde-mcp
+          cp artifacts/binary-aarch64-apple-darwin/eve-sde-mcp     server/aarch64-apple-darwin/eve-sde-mcp
+          cp artifacts/binary-x86_64-pc-windows-msvc/eve-sde-mcp.exe server/x86_64-pc-windows-msvc/eve-sde-mcp.exe
+          chmod +x server/x86_64-unknown-linux-gnu/eve-sde-mcp \
+                   server/aarch64-apple-darwin/eve-sde-mcp
+
+      - name: Install mcpb CLI
+        run: |
+          set -euo pipefail
+          if ! command -v mcpb >/dev/null 2>&1; then
+            npm install -g @anthropic-ai/mcpb
+          fi
+          mcpb --version
+
+      - name: Pack MCPB bundle
+        run: mcpb pack . eve-sde-mcp.mcpb
+
+      - name: Stage release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp server/x86_64-unknown-linux-gnu/eve-sde-mcp dist/eve-sde-mcp-x86_64-unknown-linux-gnu
+          cp server/aarch64-apple-darwin/eve-sde-mcp     dist/eve-sde-mcp-aarch64-apple-darwin
+          cp server/x86_64-pc-windows-msvc/eve-sde-mcp.exe dist/eve-sde-mcp-x86_64-pc-windows-msvc.exe
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=v${version}+${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            eve-sde-mcp.mcpb
+            dist/eve-sde-mcp-x86_64-unknown-linux-gnu
+            dist/eve-sde-mcp-aarch64-apple-darwin
+            dist/eve-sde-mcp-x86_64-pc-windows-msvc.exe
