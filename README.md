@@ -128,13 +128,13 @@ The MCP protocol harness in `tests/` exercises all tool handlers; unit tests use
 
 ### Pre-commit hook
 
-A git hook in `.githooks/` enforces the same `cargo fmt` and `cargo clippy -D warnings` gates as CI. Enable it once per clone:
+A git hook in `.githooks/` keeps commits clean against the CI gates. Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-It runs `cargo fmt --all --check` then `cargo clippy --all-targets -- -D warnings` before each commit. Bypass for a single commit with `git commit --no-verify`.
+On each commit it runs `cargo fmt --all` and re-stages the formatted Rust files automatically (formatting never blocks the commit), then runs `cargo clippy --all-targets -- -D warnings` — clippy warnings are the only thing that aborts the commit. Bypass for a single commit with `git commit --no-verify`.
 
 ## Data attribution
 

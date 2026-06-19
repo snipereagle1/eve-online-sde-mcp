@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Pre-commit hook: enforce the same fmt + clippy gates as CI (.github/workflows/ci.yml).
+# Pre-commit hook: auto-format, then enforce clippy.
+# - cargo fmt rewrites code and the result is re-staged into this commit (no push-back).
+# - cargo clippy is the only gate that can block the commit.
 # Enable once per clone with:  git config core.hooksPath .githooks
 # Skip a single commit with:   git commit --no-verify
 set -euo pipefail
 
-echo "pre-commit: cargo fmt --all --check"
-if ! cargo fmt --all --check; then
-    echo "error: formatting check failed. Run 'cargo fmt --all' and re-stage." >&2
-    exit 1
+# Staged Rust files (added/copied/modified/renamed), NUL-delimited for odd names.
+mapfile -d '' -t staged_rs < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
+
+if ((${#staged_rs[@]} > 0)); then
+    echo "pre-commit: cargo fmt --all"
+    cargo fmt --all
+    # Re-stage only the files that were already staged, so fmt of unrelated
+    # working-tree files isn't pulled into this commit.
+    git add -- "${staged_rs[@]}"
 fi
 
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
