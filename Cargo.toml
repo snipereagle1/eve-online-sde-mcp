@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.10"
 indicatif = "0.17"
 memchr = "2"
+directories = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3"

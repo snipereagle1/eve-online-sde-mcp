@@ -28,7 +28,7 @@ pub(crate) fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
 
     let (build, etag, final_url) = head_check(&client)?;
 
-    let meta_path = cfg.meta_path();
+    let meta_path = cfg.meta_path()?;
     let existing = Meta::load(&meta_path)?;
 
     if !cfg.redownload
@@ -42,13 +42,12 @@ pub(crate) fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
         });
     }
 
-    let data_dir = cfg.resolved_data_dir();
-    fs::create_dir_all(&data_dir).context("create data dir")?;
+    let data_dir = cfg.resolved_data_dir()?;
 
     let zip_tmp = data_dir.join(format!("sde-{build}.zip.tmp"));
     download_zip(&client, &final_url, &zip_tmp)?;
 
-    let sde_dir = cfg.sde_dir(build);
+    let sde_dir = cfg.sde_dir(build)?;
     extract_zip(&zip_tmp, &sde_dir)?;
     fs::remove_file(&zip_tmp).context("remove temp zip")?;
 

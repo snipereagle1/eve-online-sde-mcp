@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
         let start = std::time::Instant::now();
         let store = scan::scan_sde(
-            &cfg.sde_dir(result.build),
+            &cfg.sde_dir(result.build)?,
             result.build,
             &result.release_date,
         )?;
