@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce the same fmt + clippy gates as CI (.github/workflows/ci.yml).
+# Enable once per clone with:  git config core.hooksPath .githooks
+# Skip a single commit with:   git commit --no-verify
+set -euo pipefail
+
+echo "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo "error: formatting check failed. Run 'cargo fmt --all' and re-stage." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo "error: clippy reported warnings. Fix them and re-stage." >&2
+    exit 1
+fi

@@ -126,6 +126,16 @@ cargo test -- --ignored      # network integration tests
 
 The MCP protocol harness in `tests/` exercises all tool handlers; unit tests use `tempfile` JSONL fixtures.
 
+### Pre-commit hook
+
+A git hook in `.githooks/` enforces the same `cargo fmt` and `cargo clippy -D warnings` gates as CI. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It runs `cargo fmt --all --check` then `cargo clippy --all-targets -- -D warnings` before each commit. Bypass for a single commit with `git commit --no-verify`.
+
 ## Data attribution
 
 The Static Data Export is published by **CCP Games**. EVE Online and all related material are trademarks of CCP hf. This project is an unofficial tool and is not affiliated with or endorsed by CCP.
