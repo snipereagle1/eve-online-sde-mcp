@@ -5,14 +5,14 @@
     "helpers:pinGitHubActionDigests",
     ":semanticCommits"
   ],
-  "timezone": "America/New_York",
+  "timezone": "UTC",
   "schedule": [
-    "before 6am on monday"
+    "after 10pm and before 11pm on friday"
   ],
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
-      "before 6am on monday"
+      "after 10pm and before 11pm on friday"
     ]
   },
   "packageRules": [
