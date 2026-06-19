@@ -25,7 +25,9 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn resolved_data_dir(&self) -> PathBuf {
-        if let Some(ref d) = self.data_dir {
+        if let Some(ref d) = self.data_dir
+            && !d.as_os_str().is_empty()
+        {
             return d.clone();
         }
         default_data_dir()
@@ -72,6 +74,40 @@ fn default_data_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/eve-sde-mcp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_data_dir(data_dir: Option<&str>) -> Config {
+        Config {
+            data_dir: data_dir.map(PathBuf::from),
+            log_level: "warn".to_string(),
+            redownload: false,
+            language: Some("en".to_string()),
+        }
+    }
+
+    #[test]
+    fn empty_data_dir_falls_back_to_per_os_default() {
+        // MCPB injects SDE_DATA_DIR="" when the optional user_config knob is
+        // left unset, so an empty path must defer to the per-OS default.
+        let cfg = config_with_data_dir(Some(""));
+        assert_eq!(cfg.resolved_data_dir(), default_data_dir());
+    }
+
+    #[test]
+    fn unset_data_dir_uses_per_os_default() {
+        let cfg = config_with_data_dir(None);
+        assert_eq!(cfg.resolved_data_dir(), default_data_dir());
+    }
+
+    #[test]
+    fn explicit_data_dir_is_honored() {
+        let cfg = config_with_data_dir(Some("/custom/sde"));
+        assert_eq!(cfg.resolved_data_dir(), PathBuf::from("/custom/sde"));
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

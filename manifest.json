@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.3",
+  "name": "eve-sde-mcp",
+  "display_name": "EVE Online SDE",
+  "version": "0.1.0",
+  "description": "MCP server exposing EVE Online Static Data Export (SDE) game data to AI agents.",
+  "long_description": "A stdio MCP server that exposes the EVE Online Static Data Export (SDE) — types, blueprints, dogma attributes/effects, market groups, the solar-system graph, skill plans, and more — to AI agents. The SDE (~81 MB) is downloaded and indexed on first run; lookups are served from byte-offset indexes with no database.",
+  "author": {
+    "name": "snipereagle1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/snipereagle1/eve-online-sde-mcp"
+  },
+  "homepage": "https://github.com/snipereagle1/eve-online-sde-mcp",
+  "documentation": "https://github.com/snipereagle1/eve-online-sde-mcp",
+  "keywords": ["eve-online", "sde", "mcp", "stdio", "game-data"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/x86_64-unknown-linux-gnu/eve-sde-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/x86_64-unknown-linux-gnu/eve-sde-mcp",
+      "args": [],
+      "env": {
+        "SDE_DATA_DIR": "${user_config.data_dir}",
+        "SDE_LANGUAGE": "${user_config.language}"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/x86_64-pc-windows-msvc/eve-sde-mcp.exe"
+        },
+        "darwin": {
+          "command": "${__dirname}/server/aarch64-apple-darwin/eve-sde-mcp"
+        }
+      }
+    }
+  },
+  "user_config": {
+    "data_dir": {
+      "type": "directory",
+      "title": "SDE Data Directory",
+      "description": "Where the downloaded SDE cache is stored. Leave unset to use the per-OS default (e.g. ~/.local/share/eve-sde-mcp on Linux, %APPDATA%\\eve-sde-mcp on Windows).",
+      "required": false,
+      "default": ""
+    },
+    "language": {
+      "type": "string",
+      "title": "Language Filter",
+      "description": "Filter localized name fields to a single language (e.g. en, de, fr, ja, ru, zh, ko, es). Falls back to English when a translation is missing.",
+      "required": false,
+      "default": "en"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"]
+  }
+}
