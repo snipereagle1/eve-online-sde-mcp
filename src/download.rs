@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -129,8 +129,7 @@ fn download_zip(client: &Client, url: &str, dest: &Path) -> Result<()> {
         .progress_chars("#>-"),
     );
 
-    let mut file =
-        fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut file = fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
 
     let mut downloaded = 0u64;
     let mut buf = vec![0u8; 65536];
@@ -153,8 +152,7 @@ fn download_zip(client: &Client, url: &str, dest: &Path) -> Result<()> {
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
-    let file =
-        fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
+    let file = fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
     let mut archive = ZipArchive::new(file).context("open zip archive")?;
 
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
@@ -187,8 +185,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
             }
             let mut out = fs::File::create(&out_path)
                 .with_context(|| format!("create {}", out_path.display()))?;
-            io::copy(&mut entry, &mut out)
-                .with_context(|| format!("extract {raw_name}"))?;
+            io::copy(&mut entry, &mut out).with_context(|| format!("extract {raw_name}"))?;
         }
     }
 
@@ -228,8 +225,7 @@ fn find_sde_meta(dir: &Path) -> Result<PathBuf> {
 
 fn read_release_date(sde_dir: &Path) -> Result<String> {
     let path = find_sde_meta(sde_dir)?;
-    let file =
-        fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let reader = io::BufReader::new(file);
     for line in reader.lines() {
         let line = line.context("read _sde.jsonl line")?;
@@ -250,8 +246,7 @@ mod tests {
 
     #[test]
     fn parse_build_extracts_number_from_redirect_url() {
-        let url =
-            "https://data.eveonline.com/tranquility/eve-online-static-data-3333874-jsonl.zip";
+        let url = "https://data.eveonline.com/tranquility/eve-online-static-data-3333874-jsonl.zip";
         assert_eq!(parse_build(url).unwrap(), 3333874);
     }
 
@@ -263,8 +258,7 @@ mod tests {
 
     #[test]
     fn parse_build_returns_error_when_no_trailing_dash() {
-        let url =
-            "https://data.eveonline.com/tranquility/eve-online-static-data-3333874.zip";
+        let url = "https://data.eveonline.com/tranquility/eve-online-static-data-3333874.zip";
         assert!(parse_build(url).is_err());
     }
 
@@ -295,9 +289,6 @@ mod tests {
             .build()
             .unwrap();
         let (build, _etag, _url) = head_check(&client).unwrap();
-        assert!(
-            build >= pinned,
-            "expected build >= {pinned}, got {build}"
-        );
+        assert!(build >= pinned, "expected build >= {pinned}, got {build}");
     }
 }

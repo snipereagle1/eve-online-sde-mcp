@@ -28,8 +28,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let types = scan_index(&root.join("types.jsonl"), &pb)?;
     let groups = scan_index(&root.join("groups.jsonl"), &pb)?;
     let categories = scan_index(&root.join("categories.jsonl"), &pb)?;
-    let (blueprints, product_to_blueprint) =
-        scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
+    let (blueprints, product_to_blueprint) = scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
     let (type_dogma, effect_to_types) = scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
@@ -101,10 +100,7 @@ pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
 }
 
 #[cfg(test)]
-pub fn scan_blueprints_pub(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, u64>)> {
+pub fn scan_blueprints_pub(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, u64>)> {
     scan_blueprints(path, pb)
 }
 
@@ -116,8 +112,7 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
             .into_owned(),
     );
 
-    let file =
-        fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut name_index = HashMap::new();
@@ -155,10 +150,7 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     })
 }
 
-fn scan_blueprints(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, u64>)> {
+fn scan_blueprints(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, u64>)> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -186,8 +178,7 @@ fn scan_blueprints(
         type_id: u64,
     }
 
-    let file =
-        fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut product_to_blueprint = HashMap::new();
@@ -241,10 +232,7 @@ fn scan_blueprints(
 /// so `sde_get_modifiers` direction-b can name the actual bonus source (e.g.
 /// Astrogeology, not just Mining). Mirrors `scan_blueprints`'s tuple-returning,
 /// typed-inner-struct pattern.
-fn scan_type_dogma(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
+fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -299,7 +287,10 @@ fn scan_type_dogma(
         };
         id_index.insert(parsed.key, line_start);
         for e in parsed.dogma_effects.into_iter().flatten() {
-            effect_to_types.entry(e.effect_id).or_default().push(parsed.key);
+            effect_to_types
+                .entry(e.effect_id)
+                .or_default()
+                .push(parsed.key);
         }
     }
 
@@ -397,15 +388,18 @@ fn scan_dogma_effects(
             let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
                 continue;
             };
-            attribute_modifiers.entry(modified).or_default().push(ModifierRef {
-                effect_id: parsed.key,
-                modifying_attribute_id: modifying,
-                modified_attribute_id: modified,
-                operation: m.operation.unwrap_or(0),
-                func: m.func,
-                domain: m.domain,
-                skill_type_id: m.skill_type_id,
-            });
+            attribute_modifiers
+                .entry(modified)
+                .or_default()
+                .push(ModifierRef {
+                    effect_id: parsed.key,
+                    modifying_attribute_id: modifying,
+                    modified_attribute_id: modified,
+                    operation: m.operation.unwrap_or(0),
+                    func: m.func,
+                    domain: m.domain,
+                    skill_type_id: m.skill_type_id,
+                });
         }
     }
 
@@ -448,8 +442,7 @@ fn scan_stargates(path: &Path, pb: &ProgressBar) -> Result<HashMap<u64, Vec<u64>
         system_id: u64,
     }
 
-    let file =
-        fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut stargate_graph: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut buf = String::new();
@@ -556,47 +549,79 @@ mod tests {
 
     #[test]
     fn scan_sde_fixture_dir_indexes_all_17_files() {
-        let fixture_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
-        let store =
-            scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        let store = scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
 
         assert_eq!(store.build, crate::sde_version::PINNED_BUILD);
         assert_eq!(store.files_scanned, 17);
 
         assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
-        assert!(store.types.name_index.contains_key("tritanium"), "Tritanium name index missing");
+        assert!(
+            store.types.name_index.contains_key("tritanium"),
+            "Tritanium name index missing"
+        );
         assert!(store.types.id_index.contains_key(&16227), "Ferox missing");
 
-        assert!(store.map_solar_systems.id_index.contains_key(&30000142), "Jita missing");
-        assert!(store.map_solar_systems.id_index.contains_key(&30000144), "Perimeter missing");
-        assert!(store.map_solar_systems.name_index.contains_key("jita"), "Jita name index missing");
+        assert!(
+            store.map_solar_systems.id_index.contains_key(&30000142),
+            "Jita missing"
+        );
+        assert!(
+            store.map_solar_systems.id_index.contains_key(&30000144),
+            "Perimeter missing"
+        );
+        assert!(
+            store.map_solar_systems.name_index.contains_key("jita"),
+            "Jita name index missing"
+        );
 
-        assert!(store.blueprints.id_index.contains_key(&16228), "Ferox Blueprint missing");
+        assert!(
+            store.blueprints.id_index.contains_key(&16228),
+            "Ferox Blueprint missing"
+        );
         assert_eq!(
             store.product_to_blueprint.get(&16227),
             Some(&16228),
             "Ferox product->blueprint map missing"
         );
 
-        assert!(store.market_groups.id_index.contains_key(&1857), "Minerals market group missing");
-        assert!(store.factions.id_index.contains_key(&500001), "Caldari State faction missing");
-        assert!(store.npc_corporations.id_index.contains_key(&1000035), "Caldari Navy corp missing");
+        assert!(
+            store.market_groups.id_index.contains_key(&1857),
+            "Minerals market group missing"
+        );
+        assert!(
+            store.factions.id_index.contains_key(&500001),
+            "Caldari State faction missing"
+        );
+        assert!(
+            store.npc_corporations.id_index.contains_key(&1000035),
+            "Caldari Navy corp missing"
+        );
         assert!(store.skins.id_index.contains_key(&50), "Ferox skin missing");
-        assert!(store.dogma_attributes.id_index.contains_key(&263), "shieldCapacity attr missing");
-        assert!(store.type_dogma.id_index.contains_key(&16227), "Ferox typeDogma missing");
+        assert!(
+            store.dogma_attributes.id_index.contains_key(&263),
+            "shieldCapacity attr missing"
+        );
+        assert!(
+            store.type_dogma.id_index.contains_key(&16227),
+            "Ferox typeDogma missing"
+        );
 
-        let jita_neighbors = store.stargate_graph.get(&30000142).expect("Jita has no stargate neighbors");
-        assert!(jita_neighbors.contains(&30000144), "Jita->Perimeter stargate missing");
+        let jita_neighbors = store
+            .stargate_graph
+            .get(&30000142)
+            .expect("Jita has no stargate neighbors");
+        assert!(
+            jita_neighbors.contains(&30000144),
+            "Jita->Perimeter stargate missing"
+        );
     }
 
     #[test]
     fn fixture_fetch_by_id_and_search_by_name() {
         use crate::tools::query;
-        let fixture_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
-        let store =
-            scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        let store = scan_sde(&fixture_dir, crate::sde_version::PINNED_BUILD, "2024-01-15").unwrap();
 
         let tritanium = query::fetch_by_id(&store.types, 34).unwrap();
         assert_eq!(tritanium["_key"], 34);
@@ -604,7 +629,10 @@ mod tests {
 
         let results = query::search_by_name(&store.types, "ferox", 10).unwrap();
         let keys: Vec<_> = results.iter().filter_map(|v| v["_key"].as_u64()).collect();
-        assert!(keys.contains(&16227), "search 'ferox' should find Ferox type");
+        assert!(
+            keys.contains(&16227),
+            "search 'ferox' should find Ferox type"
+        );
 
         let jita = query::fetch_by_id(&store.map_solar_systems, 30000142).unwrap();
         assert_eq!(jita["_key"], 30000142);
@@ -612,7 +640,9 @@ mod tests {
 
         let ferox_bp = query::fetch_by_id(&store.blueprints, 16228).unwrap();
         assert_eq!(ferox_bp["_key"], 16228);
-        let products = ferox_bp["activities"]["manufacturing"]["products"].as_array().unwrap();
+        let products = ferox_bp["activities"]["manufacturing"]["products"]
+            .as_array()
+            .unwrap();
         assert_eq!(products[0]["typeID"], 16227);
     }
 
@@ -728,7 +758,10 @@ mod tests {
         let (idx, mods) = scan_dogma_effects(&path, &pb).unwrap();
 
         assert!(idx.id_index.contains_key(&391));
-        assert!(idx.id_index.contains_key(&11), "effect with no usable modifier still indexed by id");
+        assert!(
+            idx.id_index.contains_key(&11),
+            "effect with no usable modifier still indexed by id"
+        );
 
         let to_mining = mods.get(&77).expect("attribute 77 has modifiers");
         assert_eq!(to_mining.len(), 1);
@@ -756,7 +789,10 @@ mod tests {
 
         assert!(idx.id_index.contains_key(&3386));
         assert!(idx.id_index.contains_key(&3410));
-        assert!(idx.id_index.contains_key(&34), "type with no effects still indexed by id");
+        assert!(
+            idx.id_index.contains_key(&34),
+            "type with no effects still indexed by id"
+        );
 
         let owners = eff_to_types.get(&391).expect("effect 391 has owning types");
         assert_eq!(owners.len(), 2);

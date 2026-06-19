@@ -1,17 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use rmcp::{
-    ServerHandler,
+    ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
-    ErrorData,
 };
 use serde::Deserialize;
 
-use crate::store::SdeStore;
 use super::query;
+use crate::store::SdeStore;
 
 // ── Parameter structs ────────────────────────────────────────────────────────
 
@@ -205,8 +204,9 @@ impl SdeMcpServer {
         id: u64,
         label: &str,
     ) -> Result<String, ErrorData> {
-        let mut val = query::fetch_by_id(index, id)
-            .map_err(|_| ErrorData::invalid_params(format!("ID {id} not found in {label}"), None))?;
+        let mut val = query::fetch_by_id(index, id).map_err(|_| {
+            ErrorData::invalid_params(format!("ID {id} not found in {label}"), None)
+        })?;
         self.filter(&mut val);
         Ok(serde_json::to_string(&val).unwrap())
     }
@@ -256,7 +256,10 @@ impl SdeMcpServer {
     /// In-place: annotate each dogmaAttribute with `attributeName`, and decode
     /// skill-prerequisite slots (182/183/184 + 277/278/279) into a `requiredSkill` object.
     fn annotate_dogma_names(&self, val: &mut serde_json::Value) {
-        let Some(attrs) = val.get_mut("dogmaAttributes").and_then(|a| a.as_array_mut()) else {
+        let Some(attrs) = val
+            .get_mut("dogmaAttributes")
+            .and_then(|a| a.as_array_mut())
+        else {
             return;
         };
         // First pass: collect prereq slot levels so we can pair skill id with its level.
@@ -322,7 +325,9 @@ impl SdeMcpServer {
         if let Some(effects) = dogma.get("dogmaEffects").and_then(|e| e.as_array()) {
             for e in effects {
                 let Some(eid) = e.get("effectID").and_then(|x| x.as_u64()) else {
-                    tracing::warn!("type {type_id}: dogmaEffects entry has non-integer effectID; skipping");
+                    tracing::warn!(
+                        "type {type_id}: dogmaEffects entry has non-integer effectID; skipping"
+                    );
                     continue;
                 };
                 let effect = match query::fetch_by_id(&self.store.dogma_effects, eid) {
@@ -418,7 +423,12 @@ impl SdeMcpServer {
     ) -> Result<serde_json::Value, ErrorData> {
         // Distinguish "valid attribute nobody modifies" (empty list) from "no such
         // attribute" (error) — otherwise a typo'd id returns a confident empty answer.
-        if !self.store.dogma_attributes.id_index.contains_key(&attribute_id) {
+        if !self
+            .store
+            .dogma_attributes
+            .id_index
+            .contains_key(&attribute_id)
+        {
             return Err(ErrorData::invalid_params(
                 format!("ID {attribute_id} not found in dogmaAttributes"),
                 None,
@@ -442,18 +452,21 @@ impl SdeMcpServer {
                 let push_row = |source: Option<u64>| {
                     // Magnitude is the modifying attribute's value on the *owning* type.
                     let magnitude = source.and_then(|sid| {
-                        query::fetch_by_id(&self.store.type_dogma, sid).ok().and_then(|d| {
-                            d.get("dogmaAttributes")
-                                .and_then(|a| a.as_array())
-                                .and_then(|attrs| {
-                                    attrs.iter().find_map(|a| {
-                                        let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
-                                        (aid == m.modifying_attribute_id)
-                                            .then(|| a.get("value").and_then(|x| x.as_f64()))
-                                            .flatten()
+                        query::fetch_by_id(&self.store.type_dogma, sid)
+                            .ok()
+                            .and_then(|d| {
+                                d.get("dogmaAttributes")
+                                    .and_then(|a| a.as_array())
+                                    .and_then(|attrs| {
+                                        attrs.iter().find_map(|a| {
+                                            let aid =
+                                                a.get("attributeID").and_then(|x| x.as_u64())?;
+                                            (aid == m.modifying_attribute_id)
+                                                .then(|| a.get("value").and_then(|x| x.as_f64()))
+                                                .flatten()
+                                        })
                                     })
-                                })
-                        })
+                            })
                     });
                     let mut row = serde_json::json!({
                         "effect_id": m.effect_id,
@@ -471,7 +484,8 @@ impl SdeMcpServer {
                     }
                     if resolve_names {
                         row["modifying_attribute_name"] =
-                            serde_json::to_value(self.attribute_name(m.modifying_attribute_id)).unwrap();
+                            serde_json::to_value(self.attribute_name(m.modifying_attribute_id))
+                                .unwrap();
                         if let Some(sid) = source {
                             row["source_type_name"] =
                                 serde_json::to_value(self.type_name(sid)).unwrap();
@@ -572,8 +586,10 @@ impl SdeMcpServer {
                 }
                 // Skills first, then by id for determinism, so the training-relevant
                 // levers survive the MAX_SOURCES cap even amid many item sources.
-                let mut sources: Vec<(u64, bool)> =
-                    source_ids.iter().map(|&id| (id, self.is_skill(id))).collect();
+                let mut sources: Vec<(u64, bool)> = source_ids
+                    .iter()
+                    .map(|&id| (id, self.is_skill(id)))
+                    .collect();
                 sources.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
                 let source_count = sources.len();
                 let truncated = source_count > MAX_SOURCES;
@@ -618,7 +634,9 @@ impl SdeMcpServer {
 
 #[tool_router]
 impl SdeMcpServer {
-    #[tool(description = "Get SDE metadata: build number, release date, data directory, files scanned")]
+    #[tool(
+        description = "Get SDE metadata: build number, release date, data directory, files scanned"
+    )]
     async fn sde_status(&self) -> String {
         serde_json::to_string(&serde_json::json!({
             "build": self.store.build,
@@ -647,7 +665,11 @@ impl SdeMcpServer {
         let published_only = p.published_only.unwrap_or(false);
         let mut results = self.search_filtered(&self.store.types, &p.query, limit)?;
         if published_only {
-            results.retain(|v| v.get("published").and_then(|b| b.as_bool()).unwrap_or(false));
+            results.retain(|v| {
+                v.get("published")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false)
+            });
         }
         Ok(serde_json::to_string(&results).unwrap())
     }
@@ -676,7 +698,9 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.type_materials, p.type_id, "typeMaterials")
     }
 
-    #[tool(description = "Get the dogma attributes and effects of a type by its type ID (e.g. skill rank/skillTimeConstant attribute 275, module stats). Set resolve_names to annotate each attribute with its name and decode skill-prerequisite attributes into readable requiredSkill objects.")]
+    #[tool(
+        description = "Get the dogma attributes and effects of a type by its type ID (e.g. skill rank/skillTimeConstant attribute 275, module stats). Set resolve_names to annotate each attribute with its name and decode skill-prerequisite attributes into readable requiredSkill objects."
+    )]
     async fn sde_get_type_dogma(
         &self,
         Parameters(p): Parameters<TypeDogmaParam>,
@@ -691,7 +715,9 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&val).unwrap())
     }
 
-    #[tool(description = "Build a recursive skill-prerequisite training plan for one or more target type IDs (ships, modules, or skills). Returns each target's full prerequisite tree plus one merged, deduped (to the highest level demanded), topologically-sorted plan with per-skill rank, SP cost, running cumulative SP, the per-level SP curve (sp_by_level), and which targets require it.")]
+    #[tool(
+        description = "Build a recursive skill-prerequisite training plan for one or more target type IDs (ships, modules, or skills). Returns each target's full prerequisite tree plus one merged, deduped (to the highest level demanded), topologically-sorted plan with per-skill rank, SP cost, running cumulative SP, the per-level SP curve (sp_by_level), and which targets require it."
+    )]
     async fn sde_get_skill_plan(
         &self,
         Parameters(p): Parameters<SkillPlanParam>,
@@ -708,7 +734,9 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&plan).unwrap())
     }
 
-    #[tool(description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows.")]
+    #[tool(
+        description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows."
+    )]
     async fn sde_get_modifiers(
         &self,
         Parameters(p): Parameters<ModifierQueryParam>,
@@ -727,9 +755,16 @@ impl SdeMcpServer {
             };
         }
         match (p.type_id, p.attribute_id, p.effect_id) {
-            (Some(id), None, None) => Ok(serde_json::to_string(&self.modifiers_for_type(id, resolve_names)?).unwrap()),
-            (None, Some(attr), None) => Ok(serde_json::to_string(&self.modifiers_for_attribute(attr, resolve_names)?).unwrap()),
-            (None, None, Some(eid)) => Ok(serde_json::to_string(&self.modifiers_for_effect(eid, resolve_names)?).unwrap()),
+            (Some(id), None, None) => {
+                Ok(serde_json::to_string(&self.modifiers_for_type(id, resolve_names)?).unwrap())
+            }
+            (None, Some(attr), None) => Ok(serde_json::to_string(
+                &self.modifiers_for_attribute(attr, resolve_names)?,
+            )
+            .unwrap()),
+            (None, None, Some(eid)) => {
+                Ok(serde_json::to_string(&self.modifiers_for_effect(eid, resolve_names)?).unwrap())
+            }
             _ => Err(ErrorData::invalid_params(
                 "Provide exactly one of type_id, attribute_id, or effect_id",
                 None,
@@ -737,7 +772,9 @@ impl SdeMcpServer {
         }
     }
 
-    #[tool(description = "Batch-get multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false rather than failing the call.")]
+    #[tool(
+        description = "Batch-get multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false rather than failing the call."
+    )]
     async fn sde_get_types(
         &self,
         Parameters(p): Parameters<TypeIdsParam>,
@@ -756,7 +793,9 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&out).unwrap())
     }
 
-    #[tool(description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false.")]
+    #[tool(
+        description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false."
+    )]
     async fn sde_get_types_dogma(
         &self,
         Parameters(p): Parameters<TypeIdsParam>,
@@ -775,13 +814,18 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&out).unwrap())
     }
 
-    #[tool(description = "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records.")]
+    #[tool(
+        description = "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records."
+    )]
     async fn sde_resolve_types(
         &self,
         Parameters(p): Parameters<ResolveTypesParam>,
     ) -> Result<String, ErrorData> {
         if p.type_ids.is_none() && p.names.is_none() {
-            return Err(ErrorData::invalid_params("Provide type_ids and/or names", None));
+            return Err(ErrorData::invalid_params(
+                "Provide type_ids and/or names",
+                None,
+            ));
         }
         let by_id: Vec<_> = p
             .type_ids
@@ -796,23 +840,32 @@ impl SdeMcpServer {
             .names
             .unwrap_or_default()
             .iter()
-            .map(|name| match self.store.types.name_index.get(&name.to_lowercase()) {
-                Some(&offset) => {
-                    let id = query::fetch_at_offset(&self.store.types.path, offset)
-                        .ok()
-                        .and_then(|v| v.get("_key").and_then(|k| k.as_u64()));
-                    match id {
-                        Some(id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
-                        None => serde_json::json!({"name": name, "found": false}),
+            .map(
+                |name| match self.store.types.name_index.get(&name.to_lowercase()) {
+                    Some(&offset) => {
+                        let id = query::fetch_at_offset(&self.store.types.path, offset)
+                            .ok()
+                            .and_then(|v| v.get("_key").and_then(|k| k.as_u64()));
+                        match id {
+                            Some(id) => {
+                                serde_json::json!({"name": name, "type_id": id, "found": true})
+                            }
+                            None => serde_json::json!({"name": name, "found": false}),
+                        }
                     }
-                }
-                None => serde_json::json!({"name": name, "found": false}),
-            })
+                    None => serde_json::json!({"name": name, "found": false}),
+                },
+            )
             .collect();
-        Ok(serde_json::to_string(&serde_json::json!({"by_id": by_id, "by_name": by_name})).unwrap())
+        Ok(
+            serde_json::to_string(&serde_json::json!({"by_id": by_id, "by_name": by_name}))
+                .unwrap(),
+        )
     }
 
-    #[tool(description = "Get the SP cost curve (levels 1-5: cumulative sp_to_reach and per-level increment) for a skill. Provide rank directly, or type_id to look its rank up.")]
+    #[tool(
+        description = "Get the SP cost curve (levels 1-5: cumulative sp_to_reach and per-level increment) for a skill. Provide rank directly, or type_id to look its rank up."
+    )]
     async fn sde_get_skill_sp(
         &self,
         Parameters(p): Parameters<SkillSpParam>,
@@ -861,14 +914,18 @@ impl SdeMcpServer {
         Parameters(p): Parameters<SolarSystemParam>,
     ) -> Result<String, ErrorData> {
         match (p.system_id, p.name) {
-            (Some(id), _) => self.fetch_filtered(&self.store.map_solar_systems, id, "mapSolarSystems"),
+            (Some(id), _) => {
+                self.fetch_filtered(&self.store.map_solar_systems, id, "mapSolarSystems")
+            }
             (None, Some(name)) => {
                 let results = self.search_filtered(&self.store.map_solar_systems, &name, 1)?;
                 results
                     .into_iter()
                     .next()
                     .map(|v| serde_json::to_string(&v).unwrap())
-                    .ok_or_else(|| ErrorData::invalid_params(format!("Solar system '{name}' not found"), None))
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(format!("Solar system '{name}' not found"), None)
+                    })
             }
             (None, None) => Err(ErrorData::invalid_params("Provide system_id or name", None)),
         }
@@ -897,7 +954,9 @@ impl SdeMcpServer {
                     .into_iter()
                     .next()
                     .map(|v| serde_json::to_string(&v).unwrap())
-                    .ok_or_else(|| ErrorData::invalid_params(format!("Region '{name}' not found"), None))
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(format!("Region '{name}' not found"), None)
+                    })
             }
             (None, None) => Err(ErrorData::invalid_params("Provide region_id or name", None)),
         }
@@ -908,7 +967,11 @@ impl SdeMcpServer {
         &self,
         Parameters(p): Parameters<ConstellationIdParam>,
     ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.map_constellations, p.constellation_id, "mapConstellations")
+        self.fetch_filtered(
+            &self.store.map_constellations,
+            p.constellation_id,
+            "mapConstellations",
+        )
     }
 
     #[tool(description = "Get an NPC station by its station ID")]
@@ -919,7 +982,9 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.npc_stations, p.station_id, "npcStations")
     }
 
-    #[tool(description = "Find the shortest route between two solar systems; returns jump count and system ID path")]
+    #[tool(
+        description = "Find the shortest route between two solar systems; returns jump count and system ID path"
+    )]
     async fn sde_find_route(
         &self,
         Parameters(p): Parameters<RouteParam>,
@@ -948,7 +1013,9 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.market_groups, p.market_group_id, "marketGroups")
     }
 
-    #[tool(description = "Get the full ancestor chain for a market group, from root to the given group")]
+    #[tool(
+        description = "Get the full ancestor chain for a market group, from root to the given group"
+    )]
     async fn sde_get_market_group_tree(
         &self,
         Parameters(p): Parameters<MarketGroupIdParam>,
@@ -983,7 +1050,11 @@ impl SdeMcpServer {
         &self,
         Parameters(p): Parameters<AttributeIdParam>,
     ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.dogma_attributes, p.attribute_id, "dogmaAttributes")
+        self.fetch_filtered(
+            &self.store.dogma_attributes,
+            p.attribute_id,
+            "dogmaAttributes",
+        )
     }
 
     #[tool(description = "Get a dogma effect by its effect ID")]
@@ -1007,7 +1078,11 @@ impl SdeMcpServer {
         &self,
         Parameters(p): Parameters<CorporationIdParam>,
     ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.npc_corporations, p.corporation_id, "npcCorporations")
+        self.fetch_filtered(
+            &self.store.npc_corporations,
+            p.corporation_id,
+            "npcCorporations",
+        )
     }
 
     #[tool(description = "Get a SKIN (ship SKINs) by its skin ID")]
@@ -1157,7 +1232,9 @@ fn direct_prereqs(store: &SdeStore, type_id: u64) -> Vec<(u64, u8)> {
     let value_of = |attr_id: u64| -> Option<f64> {
         attrs.iter().find_map(|a| {
             let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
-            (aid == attr_id).then(|| a.get("value").and_then(|x| x.as_f64())).flatten()
+            (aid == attr_id)
+                .then(|| a.get("value").and_then(|x| x.as_f64()))
+                .flatten()
         })
     };
     let mut out = Vec::new();
@@ -1206,7 +1283,11 @@ fn sp_breakdown(rank: u64) -> Vec<SpLevel> {
             let sp_to_reach = skill_sp(rank, level);
             let increment = sp_to_reach - prev;
             prev = sp_to_reach;
-            SpLevel { level, sp_to_reach, increment }
+            SpLevel {
+                level,
+                sp_to_reach,
+                increment,
+            }
         })
         .collect()
 }
@@ -1268,10 +1349,14 @@ fn build_node(
     path: &mut Vec<u64>,
 ) -> Result<PrereqNode, String> {
     if path.contains(&skill_id) {
-        return Err(format!("skill prerequisite cycle detected at skill {skill_id}"));
+        return Err(format!(
+            "skill prerequisite cycle detected at skill {skill_id}"
+        ));
     }
     if path.len() >= MAX_SKILL_DEPTH {
-        return Err(format!("skill prerequisite depth exceeds {MAX_SKILL_DEPTH}"));
+        return Err(format!(
+            "skill prerequisite depth exceeds {MAX_SKILL_DEPTH}"
+        ));
     }
     let (rank, rank_assumed) = match skill_rank(store, skill_id) {
         Some(r) => (r, false),
@@ -1294,13 +1379,24 @@ fn build_node(
     let mut prerequisites = Vec::new();
     for (prereq_id, prereq_level) in direct_prereqs(store, skill_id) {
         acc.edges.entry(prereq_id).or_default().insert(skill_id);
-        prerequisites.push(build_node(store, lang, prereq_id, prereq_level, target_id, acc, path)?);
+        prerequisites.push(build_node(
+            store,
+            lang,
+            prereq_id,
+            prereq_level,
+            target_id,
+            acc,
+            path,
+        )?);
     }
     path.pop();
     Ok(PrereqNode {
         skill_id,
         skill_name: pick_name(
-            query::fetch_by_id(&store.types, skill_id).ok().as_ref().and_then(|v| v.get("name")),
+            query::fetch_by_id(&store.types, skill_id)
+                .ok()
+                .as_ref()
+                .and_then(|v| v.get("name")),
             lang,
         ),
         required_level: level,
@@ -1327,19 +1423,38 @@ fn build_skill_plan(
             // Target is itself a skill: train it (to override or 5) plus its prereqs.
             let _ = rank;
             let level = target.level_override.unwrap_or(5).clamp(1, 5);
-            vec![build_node(store, lang, target.type_id, level, target.type_id, &mut acc, &mut path)?]
+            vec![build_node(
+                store,
+                lang,
+                target.type_id,
+                level,
+                target.type_id,
+                &mut acc,
+                &mut path,
+            )?]
         } else {
             // Ship/module: expand its direct skill prerequisites.
             let mut nodes = Vec::new();
             for (skill_id, level) in direct_prereqs(store, target.type_id) {
-                nodes.push(build_node(store, lang, skill_id, level, target.type_id, &mut acc, &mut path)?);
+                nodes.push(build_node(
+                    store,
+                    lang,
+                    skill_id,
+                    level,
+                    target.type_id,
+                    &mut acc,
+                    &mut path,
+                )?);
             }
             nodes
         };
         target_trees.push(TargetTree {
             type_id: target.type_id,
             name: pick_name(
-                query::fetch_by_id(&store.types, target.type_id).ok().as_ref().and_then(|v| v.get("name")),
+                query::fetch_by_id(&store.types, target.type_id)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("name")),
                 lang,
             ),
             tree,
@@ -1357,7 +1472,10 @@ fn build_skill_plan(
         plan.push(PlanStep {
             skill_id,
             skill_name: pick_name(
-                query::fetch_by_id(&store.types, skill_id).ok().as_ref().and_then(|v| v.get("name")),
+                query::fetch_by_id(&store.types, skill_id)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("name")),
                 lang,
             ),
             required_level: m.level,
@@ -1370,7 +1488,11 @@ fn build_skill_plan(
         });
     }
 
-    Ok(SkillPlan { targets: target_trees, plan, total_sp: cumulative })
+    Ok(SkillPlan {
+        targets: target_trees,
+        plan,
+        total_sp: cumulative,
+    })
 }
 
 /// Kahn's algorithm over the merged skill set, popping lowest skill_id first for
@@ -1519,9 +1641,8 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_type_returns_record_for_known_id() {
-        let (_f, types) = make_index(
-            "{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n",
-        );
+        let (_f, types) =
+            make_index("{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n");
         let server = SdeMcpServer::new(
             Arc::new(SdeStore {
                 types,
@@ -1650,9 +1771,8 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_type_materials_returns_record_for_known_id() {
-        let (_f, type_materials) = make_index(
-            "{\"_key\":34,\"materials\":[{\"typeID\":35,\"quantity\":10}]}\n",
-        );
+        let (_f, type_materials) =
+            make_index("{\"_key\":34,\"materials\":[{\"typeID\":35,\"quantity\":10}]}\n");
         let server = SdeMcpServer::new(
             Arc::new(SdeStore {
                 type_materials,
@@ -1692,7 +1812,10 @@ mod tests {
             None,
         );
         let result = server
-            .sde_get_type_dogma(Parameters(TypeDogmaParam { type_id: 3386, resolve_names: None }))
+            .sde_get_type_dogma(Parameters(TypeDogmaParam {
+                type_id: 3386,
+                resolve_names: None,
+            }))
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1705,7 +1828,10 @@ mod tests {
     async fn sde_get_type_dogma_returns_error_for_missing_id() {
         let server = make_server();
         let result = server
-            .sde_get_type_dogma(Parameters(TypeDogmaParam { type_id: 99, resolve_names: None }))
+            .sde_get_type_dogma(Parameters(TypeDogmaParam {
+                type_id: 99,
+                resolve_names: None,
+            }))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("99"));
@@ -1735,11 +1861,7 @@ mod tests {
         });
         let client = DummyClient.serve(client_transport).await?;
         let tools = client.list_all_tools().await?;
-        assert!(
-            tools.len() >= 28,
-            "expected ≥28 tools, got {}",
-            tools.len()
-        );
+        assert!(tools.len() >= 28, "expected ≥28 tools, got {}", tools.len());
         let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"sde_status"));
         assert!(names.contains(&"sde_find_route"));
@@ -1856,7 +1978,11 @@ mod tests {
 
     fn make_blueprint_index(
         content: &str,
-    ) -> (tempfile::NamedTempFile, crate::store::SdeIndex, HashMap<u64, u64>) {
+    ) -> (
+        tempfile::NamedTempFile,
+        crate::store::SdeIndex,
+        HashMap<u64, u64>,
+    ) {
         let mut f = tempfile::Builder::new()
             .suffix(".jsonl")
             .tempfile()
@@ -1930,11 +2056,13 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_market_group_returns_record_for_known_id() {
-        let (_f, market_groups) = make_index(
-            "{\"_key\":4,\"name\":{\"en\":\"Ships\"},\"parentGroupID\":null}\n",
-        );
+        let (_f, market_groups) =
+            make_index("{\"_key\":4,\"name\":{\"en\":\"Ships\"},\"parentGroupID\":null}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { market_groups, ..default_store() }),
+            Arc::new(SdeStore {
+                market_groups,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -1949,7 +2077,9 @@ mod tests {
     async fn sde_get_market_group_returns_error_for_missing_id() {
         let server = make_server();
         let result = server
-            .sde_get_market_group(Parameters(MarketGroupIdParam { market_group_id: 99 }))
+            .sde_get_market_group(Parameters(MarketGroupIdParam {
+                market_group_id: 99,
+            }))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("99"));
@@ -1965,7 +2095,10 @@ mod tests {
         );
         let (_f, market_groups) = make_index(fixture);
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { market_groups, ..default_store() }),
+            Arc::new(SdeStore {
+                market_groups,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -1982,10 +2115,12 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_market_group_tree_single_node_has_no_parent() {
-        let (_f, market_groups) =
-            make_index("{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n");
+        let (_f, market_groups) = make_index("{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { market_groups, ..default_store() }),
+            Arc::new(SdeStore {
+                market_groups,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -1999,11 +2134,13 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_dogma_attribute_returns_record_for_known_id() {
-        let (_f, dogma_attributes) = make_index(
-            "{\"_key\":37,\"name\":{\"en\":\"CPU\"},\"unitID\":5}\n",
-        );
+        let (_f, dogma_attributes) =
+            make_index("{\"_key\":37,\"name\":{\"en\":\"CPU\"},\"unitID\":5}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { dogma_attributes, ..default_store() }),
+            Arc::new(SdeStore {
+                dogma_attributes,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2027,11 +2164,13 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_dogma_effect_returns_record_for_known_id() {
-        let (_f, dogma_effects) = make_index(
-            "{\"_key\":11,\"name\":{\"en\":\"loPower\"},\"effectCategory\":0}\n",
-        );
+        let (_f, dogma_effects) =
+            make_index("{\"_key\":11,\"name\":{\"en\":\"loPower\"},\"effectCategory\":0}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { dogma_effects, ..default_store() }),
+            Arc::new(SdeStore {
+                dogma_effects,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2048,7 +2187,10 @@ mod tests {
             "{\"_key\":500001,\"name\":{\"en\":\"Caldari State\"},\"corporationID\":1000035}\n",
         );
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { factions, ..default_store() }),
+            Arc::new(SdeStore {
+                factions,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2065,11 +2207,16 @@ mod tests {
             "{\"_key\":1000035,\"name\":{\"en\":\"Caldari Navy\"},\"factionID\":500001}\n",
         );
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { npc_corporations, ..default_store() }),
+            Arc::new(SdeStore {
+                npc_corporations,
+                ..default_store()
+            }),
             None,
         );
         let result = server
-            .sde_get_npc_corporation(Parameters(CorporationIdParam { corporation_id: 1000035 }))
+            .sde_get_npc_corporation(Parameters(CorporationIdParam {
+                corporation_id: 1000035,
+            }))
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2079,11 +2226,13 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_skin_returns_record_for_known_id() {
-        let (_f, skins) = make_index(
-            "{\"_key\":1001,\"name\":{\"en\":\"Caldari Navy SKIN\"},\"typeID\":638}\n",
-        );
+        let (_f, skins) =
+            make_index("{\"_key\":1001,\"name\":{\"en\":\"Caldari Navy SKIN\"},\"typeID\":638}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { skins, ..default_store() }),
+            Arc::new(SdeStore {
+                skins,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2112,7 +2261,10 @@ mod tests {
              {\"_key\":30000144,\"name\":{\"en\":\"Perimeter\"},\"securityStatus\":0.9531}\n",
         );
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { map_solar_systems, ..default_store() }),
+            Arc::new(SdeStore {
+                map_solar_systems,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2129,10 +2281,12 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_region_returns_record_by_id() {
-        let (_f, map_regions) =
-            make_index("{\"_key\":10000002,\"name\":{\"en\":\"The Forge\"}}\n");
+        let (_f, map_regions) = make_index("{\"_key\":10000002,\"name\":{\"en\":\"The Forge\"}}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { map_regions, ..default_store() }),
+            Arc::new(SdeStore {
+                map_regions,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2152,7 +2306,10 @@ mod tests {
             "{\"_key\":20000020,\"name\":{\"en\":\"Kimotoro\"},\"regionID\":10000002}\n",
         );
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { map_constellations, ..default_store() }),
+            Arc::new(SdeStore {
+                map_constellations,
+                ..default_store()
+            }),
             None,
         );
         let result = server
@@ -2167,15 +2324,19 @@ mod tests {
 
     #[tokio::test]
     async fn sde_get_npc_station_returns_record_for_known_id() {
-        let (_f, npc_stations) = make_index(
-            "{\"_key\":60003760,\"solarSystemID\":30000142,\"ownerID\":1000035}\n",
-        );
+        let (_f, npc_stations) =
+            make_index("{\"_key\":60003760,\"solarSystemID\":30000142,\"ownerID\":1000035}\n");
         let server = SdeMcpServer::new(
-            Arc::new(SdeStore { npc_stations, ..default_store() }),
+            Arc::new(SdeStore {
+                npc_stations,
+                ..default_store()
+            }),
             None,
         );
         let result = server
-            .sde_get_npc_station(Parameters(StationIdParam { station_id: 60003760 }))
+            .sde_get_npc_station(Parameters(StationIdParam {
+                station_id: 60003760,
+            }))
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2184,7 +2345,10 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_all_21_tools_via_fixture_data() -> anyhow::Result<()> {
-        use rmcp::{ClientHandler, ServiceExt as _, model::{ClientInfo, CallToolRequestParams}};
+        use rmcp::{
+            ClientHandler, ServiceExt as _,
+            model::{CallToolRequestParams, ClientInfo},
+        };
 
         #[derive(Clone, Default)]
         struct DummyClient;
@@ -2208,8 +2372,8 @@ mod tests {
             v.as_object().unwrap().clone()
         }
 
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/sde");
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
         let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
 
         let (server_transport, client_transport) = tokio::io::duplex(65536);
@@ -2224,195 +2388,297 @@ mod tests {
         let client = DummyClient.serve(client_transport).await?;
 
         // sde_status
-        let r = text_json(&client.call_tool(CallToolRequestParams::new("sde_status")).await?);
+        let r = text_json(
+            &client
+                .call_tool(CallToolRequestParams::new("sde_status"))
+                .await?,
+        );
         assert_eq!(r["build"], 3333874);
         assert_eq!(r["release_date"], "2024-01-15");
         assert!(r["files_scanned"].as_u64().unwrap() > 0);
 
         // sde_get_type
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_type").with_arguments(obj(serde_json::json!({"type_id": 34}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_type")
+                        .with_arguments(obj(serde_json::json!({"type_id": 34}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 34);
         assert_eq!(r["name"], "Tritanium");
 
         // sde_search_types
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_search_types")
-                .with_arguments(obj(serde_json::json!({"query": "trit"}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_search_types")
+                        .with_arguments(obj(serde_json::json!({"query": "trit"}))),
+                )
+                .await?,
+        );
         assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 34));
 
         // sde_get_group
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_group").with_arguments(obj(serde_json::json!({"group_id": 18}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_group")
+                        .with_arguments(obj(serde_json::json!({"group_id": 18}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 18);
         assert_eq!(r["name"], "Mineral");
 
         // sde_get_category
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_category")
-                .with_arguments(obj(serde_json::json!({"category_id": 4}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_category")
+                        .with_arguments(obj(serde_json::json!({"category_id": 4}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 4);
         assert_eq!(r["name"], "Material");
 
         // sde_get_type_materials
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_type_materials")
-                .with_arguments(obj(serde_json::json!({"type_id": 1230}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_type_materials")
+                        .with_arguments(obj(serde_json::json!({"type_id": 1230}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 1230);
         assert!(r["materials"].as_array().is_some());
 
         // sde_get_type_dogma (Ferox has dogma attributes in fixture)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_type_dogma")
-                .with_arguments(obj(serde_json::json!({"type_id": 16227}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_type_dogma")
+                        .with_arguments(obj(serde_json::json!({"type_id": 16227}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 16227);
         assert!(r["dogmaAttributes"].as_array().is_some());
 
         // sde_get_blueprint
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_blueprint")
-                .with_arguments(obj(serde_json::json!({"blueprint_type_id": 16228}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_blueprint")
+                        .with_arguments(obj(serde_json::json!({"blueprint_type_id": 16228}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 16228);
         assert!(r["activities"]["manufacturing"].is_object());
 
         // sde_get_blueprint_for_product (Ferox blueprint makes Ferox)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_blueprint_for_product")
-                .with_arguments(obj(serde_json::json!({"product_type_id": 16227}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_blueprint_for_product")
+                        .with_arguments(obj(serde_json::json!({"product_type_id": 16227}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 16228);
 
         // sde_get_solar_system (by ID)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_solar_system")
-                .with_arguments(obj(serde_json::json!({"system_id": 30000142}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_solar_system")
+                        .with_arguments(obj(serde_json::json!({"system_id": 30000142}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 30000142);
         assert_eq!(r["name"], "Jita");
 
         // sde_search_solar_systems
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_search_solar_systems")
-                .with_arguments(obj(serde_json::json!({"query": "jita"}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_search_solar_systems")
+                        .with_arguments(obj(serde_json::json!({"query": "jita"}))),
+                )
+                .await?,
+        );
         assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
 
         // sde_get_region (by ID)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_region")
-                .with_arguments(obj(serde_json::json!({"region_id": 10000002}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_region")
+                        .with_arguments(obj(serde_json::json!({"region_id": 10000002}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 10000002);
         assert_eq!(r["name"], "The Forge");
 
         // sde_get_constellation
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_constellation")
-                .with_arguments(obj(serde_json::json!({"constellation_id": 20000020}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_constellation")
+                        .with_arguments(obj(serde_json::json!({"constellation_id": 20000020}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 20000020);
         assert_eq!(r["name"], "Kimotoro");
 
         // sde_get_npc_station
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_npc_station")
-                .with_arguments(obj(serde_json::json!({"station_id": 60003760}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_npc_station")
+                        .with_arguments(obj(serde_json::json!({"station_id": 60003760}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 60003760);
         assert_eq!(r["solarSystemID"], 30000142);
 
         // sde_find_route: Jita → Perimeter (1 jump)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_find_route").with_arguments(obj(serde_json::json!({
-                "from_system_id": 30000142,
-                "to_system_id": 30000144,
-            }))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_find_route").with_arguments(obj(
+                        serde_json::json!({
+                            "from_system_id": 30000142,
+                            "to_system_id": 30000144,
+                        }),
+                    )),
+                )
+                .await?,
+        );
         assert_eq!(r["jumps"], 1);
         assert_eq!(r["path"].as_array().unwrap().len(), 2);
         assert_eq!(r["path"][0], 30000142);
         assert_eq!(r["path"][1], 30000144);
 
         // sde_find_route: unreachable system → error response (Ikuchi has no stargates)
-        let err = client.call_tool(
-            CallToolRequestParams::new("sde_find_route").with_arguments(obj(serde_json::json!({
-                "from_system_id": 30000142,
-                "to_system_id": 30000138,
-            }))),
-        ).await;
+        let err = client
+            .call_tool(
+                CallToolRequestParams::new("sde_find_route").with_arguments(obj(
+                    serde_json::json!({
+                        "from_system_id": 30000142,
+                        "to_system_id": 30000138,
+                    }),
+                )),
+            )
+            .await;
         assert!(err.is_err(), "expected error for unreachable system");
 
         // sde_get_market_group
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_market_group")
-                .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_market_group")
+                        .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 1857);
         assert_eq!(r["name"], "Minerals");
 
         // sde_get_market_group_tree (Minerals → Materials → Manufacture & Research)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_market_group_tree")
-                .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_market_group_tree")
+                        .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
+                )
+                .await?,
+        );
         let arr = r.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["_key"], 475); // root: Manufacture & Research
         assert_eq!(arr[2]["_key"], 1857); // leaf: Minerals
 
         // sde_get_dogma_attribute
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_dogma_attribute")
-                .with_arguments(obj(serde_json::json!({"attribute_id": 30}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_dogma_attribute")
+                        .with_arguments(obj(serde_json::json!({"attribute_id": 30}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 30);
         assert_eq!(r["name"], "power");
 
         // sde_get_dogma_effect
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_dogma_effect")
-                .with_arguments(obj(serde_json::json!({"effect_id": 11}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_dogma_effect")
+                        .with_arguments(obj(serde_json::json!({"effect_id": 11}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 11);
         assert_eq!(r["name"], "loPower");
 
         // sde_get_faction
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_faction")
-                .with_arguments(obj(serde_json::json!({"faction_id": 500001}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_faction")
+                        .with_arguments(obj(serde_json::json!({"faction_id": 500001}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 500001);
         assert_eq!(r["name"], "Caldari State");
 
         // sde_get_npc_corporation
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_npc_corporation")
-                .with_arguments(obj(serde_json::json!({"corporation_id": 1000035}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_npc_corporation")
+                        .with_arguments(obj(serde_json::json!({"corporation_id": 1000035}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 1000035);
         assert_eq!(r["name"], "Caldari Navy");
 
         // sde_get_skin
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_skin")
-                .with_arguments(obj(serde_json::json!({"skin_id": 50}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_skin")
+                        .with_arguments(obj(serde_json::json!({"skin_id": 50}))),
+                )
+                .await?,
+        );
         assert_eq!(r["_key"], 50);
         assert_eq!(r["internalName"], "Ferox Caldari Union Day YC124");
 
         // sde_get_skill_plan: Covetor + ORE Deep Core Strip Miner → one merged plan
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_skill_plan").with_arguments(obj(serde_json::json!({
-                "targets": [{"type_id": 17476}, {"type_id": 87562}]
-            }))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_skill_plan").with_arguments(obj(
+                        serde_json::json!({
+                            "targets": [{"type_id": 17476}, {"type_id": 87562}]
+                        }),
+                    )),
+                )
+                .await?,
+        );
         let plan = r["plan"].as_array().unwrap();
         // Mining deduped to level 5 (module demands 5), prereqs before dependents.
         assert_eq!(plan[0]["skill_id"], 3386);
@@ -2423,10 +2689,14 @@ mod tests {
         assert_eq!(r["total_sp"], 312000);
 
         // sde_get_modifiers direction-b: what modifies miningAmount (77)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_modifiers")
-                .with_arguments(obj(serde_json::json!({"attribute_id": 77}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_modifiers")
+                        .with_arguments(obj(serde_json::json!({"attribute_id": 77}))),
+                )
+                .await?,
+        );
         let mods = r["modified_by"].as_array().unwrap();
         // One row per owning type: effect 391 is owned by BOTH Mining (3386) and
         // Astrogeology (3410), each granting +5% via its own attr 434. The old code
@@ -2434,68 +2704,117 @@ mod tests {
         assert!(mods.iter().any(|m| m["source_type_id"] == 3386
             && m["source_type_name"] == "Mining"
             && m["magnitude"] == 5.0));
-        assert!(mods.iter().any(|m| m["source_type_id"] == 3410
-            && m["source_type_name"] == "Astrogeology"
-            && m["magnitude"] == 5.0), "Astrogeology must surface as a yield source");
+        assert!(
+            mods.iter().any(|m| m["source_type_id"] == 3410
+                && m["source_type_name"] == "Astrogeology"
+                && m["magnitude"] == 5.0),
+            "Astrogeology must surface as a yield source"
+        );
         // operation_name decodes op 6 as percent so the +5 isn't read as flat m³.
-        assert!(mods.iter().any(|m| m["source_type_id"] == 3410
-            && m["operation"] == 6
-            && m["operation_name"].as_str().is_some_and(|s| s.starts_with("postPercent"))));
+        assert!(mods.iter().any(|m| {
+            m["source_type_id"] == 3410
+                && m["operation"] == 6
+                && m["operation_name"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("postPercent"))
+        }));
         // The skillTypeID filter is now a distinct field, not mislabeled as the source.
-        assert!(mods.iter().all(|m| m["skill_type_id"].is_null() && m["skill_name"].is_null()),
-            "old skill_type_id/skill_name keys removed (renamed to required_skill_*)");
-        assert!(mods.iter().any(|m| m["required_skill_id"] == 3386
-            && m["required_skill_name"] == "Mining"));
+        assert!(
+            mods.iter()
+                .all(|m| m["skill_type_id"].is_null() && m["skill_name"].is_null()),
+            "old skill_type_id/skill_name keys removed (renamed to required_skill_*)"
+        );
+        assert!(
+            mods.iter()
+                .any(|m| m["required_skill_id"] == 3386 && m["required_skill_name"] == "Mining")
+        );
 
         // sde_get_modifiers direction-a: Mining skill's outgoing modifiers
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_modifiers")
-                .with_arguments(obj(serde_json::json!({"type_id": 3386}))),
-        ).await?);
-        assert!(r["modifies"].as_array().unwrap().iter().any(|m| m["modified_attribute_id"] == 77));
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_modifiers")
+                        .with_arguments(obj(serde_json::json!({"type_id": 3386}))),
+                )
+                .await?,
+        );
+        assert!(
+            r["modifies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["modified_attribute_id"] == 77)
+        );
 
         // sde_get_modifiers direction-c: a dogma effect's raw modifierInfo
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_modifiers")
-                .with_arguments(obj(serde_json::json!({"effect_id": 391}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_modifiers")
+                        .with_arguments(obj(serde_json::json!({"effect_id": 391}))),
+                )
+                .await?,
+        );
         let m = &r["modifiers"][0];
         assert_eq!(m["modified_attribute_id"], 77);
         assert_eq!(m["modifying_attribute_id"], 434);
         assert_eq!(m["skill_type_id"], 3386);
 
         // sde_get_type_dogma resolve_names: decode Mining Barge prereqs
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_type_dogma")
-                .with_arguments(obj(serde_json::json!({"type_id": 17940, "resolve_names": true}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_type_dogma").with_arguments(obj(
+                        serde_json::json!({"type_id": 17940, "resolve_names": true}),
+                    )),
+                )
+                .await?,
+        );
         let attrs = r["dogmaAttributes"].as_array().unwrap();
-        assert!(attrs.iter().any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology" && a["requiredSkill"]["level"] == 3));
+        assert!(
+            attrs
+                .iter()
+                .any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology"
+                    && a["requiredSkill"]["level"] == 3)
+        );
 
         // sde_get_types batch with a missing id
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_types")
-                .with_arguments(obj(serde_json::json!({"type_ids": [34, 999999]}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_types")
+                        .with_arguments(obj(serde_json::json!({"type_ids": [34, 999999]}))),
+                )
+                .await?,
+        );
         let arr = r.as_array().unwrap();
         assert_eq!(arr[0]["found"], true);
         assert_eq!(arr[0]["type"]["name"], "Tritanium");
         assert_eq!(arr[1]["found"], false);
 
         // sde_resolve_types both directions
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_resolve_types")
-                .with_arguments(obj(serde_json::json!({"type_ids": [87562], "names": ["Covetor", "Mining"]}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_resolve_types").with_arguments(obj(
+                        serde_json::json!({"type_ids": [87562], "names": ["Covetor", "Mining"]}),
+                    )),
+                )
+                .await?,
+        );
         assert_eq!(r["by_id"][0]["name"], "ORE Deep Core Strip Miner");
         assert_eq!(r["by_name"][0]["type_id"], 17476);
         assert_eq!(r["by_name"][1]["type_id"], 3386);
 
         // sde_get_skill_sp by type_id (Astrogeology = rank 3)
-        let r = text_json(&client.call_tool(
-            CallToolRequestParams::new("sde_get_skill_sp")
-                .with_arguments(obj(serde_json::json!({"type_id": 3410}))),
-        ).await?);
+        let r = text_json(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("sde_get_skill_sp")
+                        .with_arguments(obj(serde_json::json!({"type_id": 3410}))),
+                )
+                .await?,
+        );
         assert_eq!(r["rank"], 3);
         let lvls = r["levels"].as_array().unwrap();
         assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
@@ -2519,7 +2838,8 @@ mod tests {
     }
 
     fn fixture_store() -> Arc<SdeStore> {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
         crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15").unwrap()
     }
 
@@ -2527,17 +2847,34 @@ mod tests {
     fn build_skill_plan_dedupes_to_highest_level_and_topo_sorts() {
         let store = fixture_store();
         let targets = vec![
-            SkillPlanTarget { type_id: 17476, level_override: None }, // Covetor (ship)
-            SkillPlanTarget { type_id: 87562, level_override: None }, // ORE module → Mining 5
+            SkillPlanTarget {
+                type_id: 17476,
+                level_override: None,
+            }, // Covetor (ship)
+            SkillPlanTarget {
+                type_id: 87562,
+                level_override: None,
+            }, // ORE module → Mining 5
         ];
         let plan = build_skill_plan(&store, &targets, Some("en")).unwrap();
 
         let ids: Vec<u64> = plan.plan.iter().map(|s| s.skill_id).collect();
-        assert_eq!(ids, vec![3386, 3410, 17940], "Mining → Astrogeology → Mining Barge");
+        assert_eq!(
+            ids,
+            vec![3386, 3410, 17940],
+            "Mining → Astrogeology → Mining Barge"
+        );
 
         let mining = &plan.plan[0];
-        assert_eq!(mining.required_level, 5, "deduped to highest demanded level");
-        assert_eq!(mining.required_by, vec![17476, 87562], "provenance unions both targets");
+        assert_eq!(
+            mining.required_level, 5,
+            "deduped to highest demanded level"
+        );
+        assert_eq!(
+            mining.required_by,
+            vec![17476, 87562],
+            "provenance unions both targets"
+        );
         assert_eq!(mining.sp_for_level, 256000);
         assert_eq!(plan.total_sp, 312000);
         assert_eq!(plan.plan.last().unwrap().cumulative_sp, 312000);
@@ -2558,8 +2895,15 @@ mod tests {
         let (_t, types) = make_index(
             "{\"_key\":100,\"name\":{\"en\":\"Loop A\"}}\n{\"_key\":101,\"name\":{\"en\":\"Loop B\"}}\n",
         );
-        let store = Arc::new(SdeStore { type_dogma, types, ..default_store() });
-        let targets = vec![SkillPlanTarget { type_id: 100, level_override: None }];
+        let store = Arc::new(SdeStore {
+            type_dogma,
+            types,
+            ..default_store()
+        });
+        let targets = vec![SkillPlanTarget {
+            type_id: 100,
+            level_override: None,
+        }];
         let err = build_skill_plan(&store, &targets, None).unwrap_err();
         assert!(err.contains("cycle"), "expected cycle error, got: {err}");
     }
@@ -2581,7 +2925,10 @@ mod tests {
         let store = fixture_store();
         let plan = build_skill_plan(
             &store,
-            &[SkillPlanTarget { type_id: 87562, level_override: None }],
+            &[SkillPlanTarget {
+                type_id: 87562,
+                level_override: None,
+            }],
             Some("en"),
         )
         .unwrap();
@@ -2596,7 +2943,13 @@ mod tests {
     async fn sde_get_modifiers_requires_exactly_one_arg() {
         let server = make_server();
         let err = server
-            .sde_get_modifiers(Parameters(ModifierQueryParam { type_id: None, attribute_id: None, effect_id: None, levers: None, resolve_names: None }))
+            .sde_get_modifiers(Parameters(ModifierQueryParam {
+                type_id: None,
+                attribute_id: None,
+                effect_id: None,
+                levers: None,
+                resolve_names: None,
+            }))
             .await;
         assert!(err.is_err());
     }
@@ -2613,10 +2966,17 @@ mod tests {
             ));
         }
         // Leaf skill at the end of the chain (has rank, no further prereq).
-        dogma.push_str("{\"_key\":115,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n");
+        dogma
+            .push_str("{\"_key\":115,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n");
         let (_d, type_dogma) = make_index(&dogma);
-        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
-        let targets = vec![SkillPlanTarget { type_id: 100, level_override: None }];
+        let store = Arc::new(SdeStore {
+            type_dogma,
+            ..default_store()
+        });
+        let targets = vec![SkillPlanTarget {
+            type_id: 100,
+            level_override: None,
+        }];
         let err = build_skill_plan(&store, &targets, None).unwrap_err();
         assert!(err.contains("depth"), "expected depth error, got: {err}");
     }
@@ -2638,8 +2998,14 @@ mod tests {
             "{\"_key\":200,\"dogmaAttributes\":[{\"attributeID\":182,\"value\":201.0},{\"attributeID\":277,\"value\":3.0}]}\n\
              {\"_key\":201,\"dogmaAttributes\":[]}\n",
         );
-        let store = Arc::new(SdeStore { type_dogma, ..default_store() });
-        let targets = vec![SkillPlanTarget { type_id: 200, level_override: None }];
+        let store = Arc::new(SdeStore {
+            type_dogma,
+            ..default_store()
+        });
+        let targets = vec![SkillPlanTarget {
+            type_id: 200,
+            level_override: None,
+        }];
         let plan = build_skill_plan(&store, &targets, None).unwrap();
         let step = plan.plan.iter().find(|s| s.skill_id == 201).unwrap();
         assert!(step.rank_assumed, "rank-less skill should be flagged");
@@ -2649,7 +3015,10 @@ mod tests {
     #[test]
     fn operation_label_decodes_canonical_dogma_operators() {
         // op 6 is the one that bit the benchmark: percent, not flat.
-        assert_eq!(operation_label(6), "postPercent (+magnitude% per stacking source)");
+        assert_eq!(
+            operation_label(6),
+            "postPercent (+magnitude% per stacking source)"
+        );
         assert_eq!(operation_label(2), "modAdd (additive, flat)");
         assert_eq!(operation_label(4), "postMul (multiply)");
         assert_eq!(operation_label(0), "preMul (multiply)");
@@ -2683,10 +3052,8 @@ mod tests {
             domain: None,
             skill_type_id: Some(3386),
         };
-        let attribute_modifiers = HashMap::from([
-            (77u64, vec![mk(501, 77)]),
-            (5967u64, vec![mk(500, 5967)]),
-        ]);
+        let attribute_modifiers =
+            HashMap::from([(77u64, vec![mk(501, 77)]), (5967u64, vec![mk(500, 5967)])]);
         let effect_to_types = HashMap::from([(500u64, vec![90727u64]), (501u64, vec![3386u64])]);
         let store = Arc::new(SdeStore {
             type_dogma,
@@ -2703,7 +3070,10 @@ mod tests {
         // which has no modifiers) — completeness, no silent omission.
         assert_eq!(attrs.len(), 3, "every module attribute must appear");
 
-        let crit = attrs.iter().find(|a| a["attribute_id"] == 5967).expect("crit attr present");
+        let crit = attrs
+            .iter()
+            .find(|a| a["attribute_id"] == 5967)
+            .expect("crit attr present");
         assert_eq!(crit["modifier_count"], 1);
         let src = &crit["sources"][0];
         assert_eq!(src["type_id"], 90727); // Mining Precision surfaces as the lever
@@ -2734,8 +3104,12 @@ mod tests {
     #[tokio::test]
     async fn sde_get_modifiers_returns_empty_for_unmodified_attribute() {
         // Attribute exists but nothing modifies it → empty list, not an error.
-        let (_a, dogma_attributes) = make_index("{\"_key\":77,\"name\":{\"en\":\"miningAmount\"}}\n");
-        let store = Arc::new(SdeStore { dogma_attributes, ..default_store() });
+        let (_a, dogma_attributes) =
+            make_index("{\"_key\":77,\"name\":{\"en\":\"miningAmount\"}}\n");
+        let store = Arc::new(SdeStore {
+            dogma_attributes,
+            ..default_store()
+        });
         let server = SdeMcpServer::new(store, None);
         let out = server
             .sde_get_modifiers(Parameters(ModifierQueryParam {
