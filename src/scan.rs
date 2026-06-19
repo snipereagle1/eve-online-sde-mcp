@@ -31,7 +31,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let (blueprints, product_to_blueprint) =
         scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
-    let type_dogma = scan_index(&root.join("typeDogma.jsonl"), &pb)?;
+    let (type_dogma, effect_to_types) = scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
     let map_constellations = scan_index(&root.join("mapConstellations.jsonl"), &pb)?;
     let map_regions = scan_index(&root.join("mapRegions.jsonl"), &pb)?;
@@ -78,6 +78,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         product_to_blueprint,
         stargate_graph,
         attribute_modifiers,
+        effect_to_types,
     }))
 }
 
@@ -229,6 +230,95 @@ fn scan_blueprints(
             name_index: HashMap::new(),
         },
         product_to_blueprint,
+    ))
+}
+
+/// Scan typeDogma.jsonl into the id→offset index (like every other file) and a
+/// reverse `effect_to_types` map keyed by `effectID`. A dogma effect's
+/// `modifierInfo.skillTypeID` is only a required-skill *filter* on the boosted
+/// modules, not the effect's source — the real source is the type whose
+/// `dogmaEffects` array owns the effect. This reverse map records that ownership
+/// so `sde_get_modifiers` direction-b can name the actual bonus source (e.g.
+/// Astrogeology, not just Mining). Mirrors `scan_blueprints`'s tuple-returning,
+/// typed-inner-struct pattern.
+fn scan_type_dogma(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
+    pb.set_message(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    #[derive(serde::Deserialize)]
+    struct Line {
+        #[serde(rename = "_key")]
+        key: u64,
+        #[serde(rename = "dogmaEffects")]
+        dogma_effects: Option<Vec<EffectRef>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct EffectRef {
+        #[serde(rename = "effectID")]
+        effect_id: u64,
+    }
+
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(65536, file);
+    let mut id_index = HashMap::new();
+    let mut effect_to_types: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut buf = String::new();
+    let mut offset = 0u64;
+    let mut parse_failures = 0u64;
+
+    loop {
+        let line_start = offset;
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = match serde_json::from_str::<Line>(trimmed) {
+            Ok(parsed) => parsed,
+            // Count rather than swallow: a schema drift would otherwise empty the
+            // effect→owner map silently, making every modifier look source-less.
+            Err(_) => {
+                parse_failures += 1;
+                continue;
+            }
+        };
+        id_index.insert(parsed.key, line_start);
+        for e in parsed.dogma_effects.into_iter().flatten() {
+            effect_to_types.entry(e.effect_id).or_default().push(parsed.key);
+        }
+    }
+
+    if parse_failures > 0 {
+        tracing::warn!(
+            "{}: {parse_failures} typeDogma line(s) failed to parse; \
+             effect_to_types reverse map may be incomplete (possible SDE schema change)",
+            path.display()
+        );
+    }
+
+    pb.inc(1);
+    Ok((
+        SdeIndex {
+            path: path.to_path_buf(),
+            id_index,
+            name_index: HashMap::new(),
+        },
+        effect_to_types,
     ))
 }
 
@@ -649,6 +739,29 @@ mod tests {
         assert_eq!(m.operation, 6);
         // The modifier missing modifiedAttributeID was skipped, not indexed.
         assert!(mods.values().flatten().all(|m| m.effect_id != 11));
+    }
+
+    #[test]
+    fn scan_type_dogma_builds_effect_to_types_reverse_map() {
+        // Effect 391 is owned by BOTH Mining (3386) and Astrogeology (3410) — each
+        // type's dogmaEffects lists it. The reverse map must surface both owners, so
+        // sde_get_modifiers can name Astrogeology as a yield source, not just Mining.
+        let fixture = r#"{"_key":3386,"dogmaAttributes":[{"attributeID":434,"value":5.0}],"dogmaEffects":[{"effectID":391,"isDefault":false}]}
+{"_key":3410,"dogmaAttributes":[{"attributeID":434,"value":5.0}],"dogmaEffects":[{"effectID":391,"isDefault":false}]}
+{"_key":34,"dogmaAttributes":[],"dogmaEffects":[]}
+"#;
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (idx, eff_to_types) = scan_type_dogma(&path, &pb).unwrap();
+
+        assert!(idx.id_index.contains_key(&3386));
+        assert!(idx.id_index.contains_key(&3410));
+        assert!(idx.id_index.contains_key(&34), "type with no effects still indexed by id");
+
+        let owners = eff_to_types.get(&391).expect("effect 391 has owning types");
+        assert_eq!(owners.len(), 2);
+        assert!(owners.contains(&3386), "Mining owns effect 391");
+        assert!(owners.contains(&3410), "Astrogeology owns effect 391");
     }
 
     #[test]
