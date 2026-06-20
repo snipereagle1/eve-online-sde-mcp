@@ -11,6 +11,35 @@ pub(crate) struct SdeIndex {
 /// effect it came from. Built into the reverse index `attribute_modifiers`
 /// (keyed by `modified_attribute_id`) at scan time so "which skills/ships modify
 /// attribute Y" is an O(1) lookup with no prose parsing.
+/// Which blueprint activity yields a product. Manufacturing and reaction are the
+/// two activities that have `products`; they are mutually exclusive per product
+/// (the mfg-product and reaction-product sets are disjoint in the SDE), so a single
+/// reverse map keyed by product can carry the activity tag unambiguously.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Activity {
+    Manufacturing,
+    Reaction,
+}
+
+impl Activity {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Activity::Manufacturing => "manufacturing",
+            Activity::Reaction => "reaction",
+        }
+    }
+}
+
+/// A product's source blueprint plus the activity that produces it. Built into the
+/// reverse index `product_to_blueprint` at scan time so callers can distinguish a
+/// reaction output from a raw material (both previously looked like a bare `null`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BlueprintRef {
+    pub(crate) blueprint_id: u64,
+    pub(crate) activity: Activity,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ModifierRef {
     pub(crate) effect_id: u64,
@@ -44,7 +73,7 @@ pub(crate) struct SdeStore {
     pub(crate) factions: SdeIndex,
     pub(crate) npc_corporations: SdeIndex,
     pub(crate) skins: SdeIndex,
-    pub(crate) product_to_blueprint: HashMap<u64, u64>,
+    pub(crate) product_to_blueprint: HashMap<u64, BlueprintRef>,
     pub(crate) stargate_graph: HashMap<u64, Vec<u64>>,
     /// modifiedAttributeID -> dogma modifiers that target it (reverse of dogmaEffects.modifierInfo)
     pub(crate) attribute_modifiers: HashMap<u64, Vec<ModifierRef>>,

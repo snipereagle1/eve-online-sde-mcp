@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use rmcp::{
     ErrorData, ServerHandler,
@@ -9,6 +12,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use super::manufacturing;
 use super::query;
 use crate::store::SdeStore;
 
@@ -177,6 +181,33 @@ pub struct SkillSpParam {
     pub rank: Option<u64>,
     /// Or a skill's type ID — its rank is looked up from dogma
     pub type_id: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct BuildTypeParam {
+    /// The Type ID you want to manufacture/build (a ship, module, component, etc.)
+    pub product_type_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ProductionChainParam {
+    /// The Type ID you want to build.
+    pub product_type_id: u64,
+    /// Number of runs (units, when output-per-run is 1) of the target to build. Default 1.
+    pub runs: Option<u64>,
+    /// Which decomposable origins to build rather than buy: any of "manufactured",
+    /// "reaction-output". Defaults to both (build the whole tree). Anything not built
+    /// lands in the shopping list.
+    pub build_origins: Option<Vec<String>>,
+    /// Force these Type IDs to be bought even when their origin is being built
+    /// (e.g. buy fuel blocks instead of decomposing them into ice + PI).
+    pub buy_type_ids: Option<Vec<u64>>,
+    /// Default material efficiency (%) applied to every manufacturing job. Default 0.
+    /// Reactions always ignore ME.
+    pub me: Option<i64>,
+    /// Per-Type material-efficiency overrides (%), keyed by Type ID; overrides `me`
+    /// for those types only.
+    pub me_overrides: Option<HashMap<u64, i64>>,
 }
 
 // ── Server ───────────────────────────────────────────────────────────────────
@@ -735,6 +766,74 @@ impl SdeMcpServer {
     }
 
     #[tool(
+        description = "Plan how to manufacture / build / produce a Type (ship, module, component, …): the FIRST tool to call for 'how do I build X', 'what do I need to make X', 'bill of materials', or 'production chain'. Classifies the whole build tree and returns: whether the target is buildable (and its material-efficiency mode), the distinct decomposable origins present (manufactured vs reaction-output), per-origin buy-vs-build decision gates (each input tagged with its origin, ME mode, and required skills), the aggregate blueprint-job skills across the chain, and any out-of-scope leaves (invention or planetary-industry items you must buy). This is the classify-only router — neutral facts, no recommendations. Once the player picks what to build vs buy, call sde_get_production_chain for the resolved quantities and shopping list."
+    )]
+    async fn sde_build_type(
+        &self,
+        Parameters(p): Parameters<BuildTypeParam>,
+    ) -> Result<String, ErrorData> {
+        let store = Arc::clone(&self.store);
+        let lang = self.language.clone();
+        let target_id = p.product_type_id;
+        let result = tokio::task::spawn_blocking(move || {
+            manufacturing::build_type(&store, target_id, lang.as_deref())
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(serde_json::to_string(&result).unwrap())
+    }
+
+    #[tool(
+        description = "Compute the resolved production chain for a build: given the player's buy-vs-build decisions, returns per-Type build jobs (runs, output-per-run, leftover from run-rounding) and one consolidated shopping list grouped by origin (minerals, moon materials, PI, etc.), plus the aggregate job skills. Material efficiency reduces manufacturing material cost (floored at one unit per run); reactions ignore ME. Shared intermediates are counted once across the whole tree before run-rounding. Decisions: build_origins toggles which decomposable origins to build (default: build everything), buy_type_ids force-buys specific Types (e.g. fuel blocks), me / me_overrides set material efficiency. Call sde_build_type first to discover the decision gates."
+    )]
+    async fn sde_get_production_chain(
+        &self,
+        Parameters(p): Parameters<ProductionChainParam>,
+    ) -> Result<String, ErrorData> {
+        let build_origins: HashSet<manufacturing::Origin> = match p.build_origins {
+            Some(keys) => {
+                let mut set = HashSet::new();
+                for key in keys {
+                    let origin = manufacturing::Origin::from_key(&key).ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            format!(
+                                "unknown build_origin '{key}' (expected 'manufactured' or 'reaction-output')"
+                            ),
+                            None,
+                        )
+                    })?;
+                    set.insert(origin);
+                }
+                set
+            }
+            None => HashSet::from([
+                manufacturing::Origin::Manufactured,
+                manufacturing::Origin::ReactionOutput,
+            ]),
+        };
+
+        let params = manufacturing::ChainParams {
+            target_id: p.product_type_id,
+            runs: p.runs.unwrap_or(1),
+            build_origins,
+            buy_type_ids: p.buy_type_ids.unwrap_or_default().into_iter().collect(),
+            me_default: p.me.unwrap_or(0),
+            me_overrides: p.me_overrides.unwrap_or_default(),
+        };
+
+        let store = Arc::clone(&self.store);
+        let lang = self.language.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            manufacturing::production_chain(&store, &params, lang.as_deref())
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(serde_json::to_string(&result).unwrap())
+    }
+
+    #[tool(
         description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows."
     )]
     async fn sde_get_modifiers(
@@ -897,15 +996,29 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.blueprints, p.blueprint_type_id, "blueprints")
     }
 
-    #[tool(description = "Get the blueprint that manufactures a given product type")]
+    #[tool(
+        description = "Get the blueprint that produces a given product type, tagged with the activity that makes it. Returns {\"blueprint\": {...}, \"activity\": \"manufacturing\"|\"reaction\"} — the activity tells you whether the product is manufactured or comes out of a reaction (the two are distinct production paths with different rules; reactions ignore material efficiency). {\"result\": null} means the product has no blueprint at all (a raw material you must buy/mine). For a full multi-tier bill of materials, prefer sde_build_type."
+    )]
     async fn sde_get_blueprint_for_product(
         &self,
         Parameters(p): Parameters<ProductTypeIdParam>,
     ) -> Result<String, ErrorData> {
-        let Some(&bp_id) = self.store.product_to_blueprint.get(&p.product_type_id) else {
+        let Some(&bp_ref) = self.store.product_to_blueprint.get(&p.product_type_id) else {
             return Ok(serde_json::json!({"result": null}).to_string());
         };
-        self.fetch_filtered(&self.store.blueprints, bp_id, "blueprints")
+        let mut blueprint = query::fetch_by_id(&self.store.blueprints, bp_ref.blueprint_id)
+            .map_err(|_| {
+                ErrorData::internal_error(
+                    format!("blueprint {} missing from index", bp_ref.blueprint_id),
+                    None,
+                )
+            })?;
+        self.filter(&mut blueprint);
+        Ok(serde_json::json!({
+            "blueprint": blueprint,
+            "activity": bp_ref.activity.as_str(),
+        })
+        .to_string())
     }
 
     #[tool(description = "Get a solar system by ID or name")]
@@ -1105,6 +1218,7 @@ Pick the most direct tool — most questions are ONE call, not a fan-out:
 - Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery.
 - Several types or dogma records at once → sde_get_types / sde_get_types_dogma (batched), not many single calls.
 - Decoding skill prereqs from raw dogma → pass resolve_names:true to sde_get_type_dogma instead of memorizing attribute IDs 182/277 etc.
+- \"How do I build / manufacture / produce X\" or \"bill of materials / production chain\" → sde_build_type FIRST (classifies the whole build tree + buy-vs-build gates), then sde_get_production_chain for quantities. Do NOT give fitting advice (modules/tank/DPS) for a build request unless the user explicitly asks about fitting.
 
 Not in the SDE: market prices and fitted-yield simulation (stacking penalties). Compute yield/ISK math yourself from the dogma attributes the tools return.";
 
@@ -1981,7 +2095,7 @@ mod tests {
     ) -> (
         tempfile::NamedTempFile,
         crate::store::SdeIndex,
-        HashMap<u64, u64>,
+        HashMap<u64, crate::store::BlueprintRef>,
     ) {
         let mut f = tempfile::Builder::new()
             .suffix(".jsonl")
@@ -2038,7 +2152,8 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 683);
+        assert_eq!(v["blueprint"]["_key"], 683);
+        assert_eq!(v["activity"], "manufacturing");
     }
 
     #[tokio::test]
@@ -2489,7 +2604,8 @@ mod tests {
                 )
                 .await?,
         );
-        assert_eq!(r["_key"], 16228);
+        assert_eq!(r["blueprint"]["_key"], 16228);
+        assert_eq!(r["activity"], "manufacturing");
 
         // sde_get_solar_system (by ID)
         let r = text_json(
