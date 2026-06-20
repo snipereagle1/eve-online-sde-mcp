@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::{ModifierRef, SdeIndex, SdeStore};
+use crate::store::{Activity, BlueprintRef, ModifierRef, SdeIndex, SdeStore};
 
 const SDE_FILE_COUNT: u64 = 17;
 
@@ -100,7 +100,10 @@ pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
 }
 
 #[cfg(test)]
-pub fn scan_blueprints_pub(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, u64>)> {
+pub fn scan_blueprints_pub(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, BlueprintRef>)> {
     scan_blueprints(path, pb)
 }
 
@@ -150,7 +153,10 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     })
 }
 
-fn scan_blueprints(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, u64>)> {
+fn scan_blueprints(
+    path: &Path,
+    pb: &ProgressBar,
+) -> Result<(SdeIndex, HashMap<u64, BlueprintRef>)> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -166,16 +172,45 @@ fn scan_blueprints(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
     }
     #[derive(serde::Deserialize)]
     struct Activities {
-        manufacturing: Option<Manufacturing>,
+        manufacturing: Option<ActivityProducts>,
+        reaction: Option<ActivityProducts>,
     }
+    // Manufacturing and reaction share the `{products: [...]}` shape, so one struct
+    // deserializes both arms.
     #[derive(serde::Deserialize)]
-    struct Manufacturing {
+    struct ActivityProducts {
         products: Option<Vec<Product>>,
     }
     #[derive(serde::Deserialize)]
     struct Product {
         #[serde(rename = "typeID")]
         type_id: u64,
+    }
+
+    fn index_activity(
+        map: &mut HashMap<u64, BlueprintRef>,
+        activity: Option<ActivityProducts>,
+        blueprint_id: u64,
+        kind: Activity,
+    ) {
+        let Some(mut products) = activity.and_then(|a| a.products) else {
+            return;
+        };
+        if products.is_empty() {
+            return;
+        }
+        let product = products.swap_remove(0);
+        map.entry(product.type_id)
+            .and_modify(|existing| {
+                if blueprint_id < existing.blueprint_id {
+                    existing.blueprint_id = blueprint_id;
+                    existing.activity = kind;
+                }
+            })
+            .or_insert(BlueprintRef {
+                blueprint_id,
+                activity: kind,
+            });
     }
 
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -202,13 +237,23 @@ fn scan_blueprints(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
         }
         if let Ok(parsed) = serde_json::from_str::<Line>(trimmed) {
             id_index.insert(parsed.key, line_start);
-            if let Some(acts) = parsed.activities
-                && let Some(mfg) = acts.manufacturing
-                && let Some(mut products) = mfg.products
-                && !products.is_empty()
-            {
-                let product = products.swap_remove(0);
-                product_to_blueprint.insert(product.type_id, parsed.key);
+            if let Some(acts) = parsed.activities {
+                // Each BP has exactly one product (verified), but a product can in
+                // principle have several BPs; index the lowest blueprint ID
+                // deterministically. Manufacturing and reaction product sets are
+                // disjoint, so the activity tag is unambiguous.
+                index_activity(
+                    &mut product_to_blueprint,
+                    acts.manufacturing,
+                    parsed.key,
+                    Activity::Manufacturing,
+                );
+                index_activity(
+                    &mut product_to_blueprint,
+                    acts.reaction,
+                    parsed.key,
+                    Activity::Reaction,
+                );
             }
         }
     }
@@ -579,11 +624,12 @@ mod tests {
             store.blueprints.id_index.contains_key(&16228),
             "Ferox Blueprint missing"
         );
-        assert_eq!(
-            store.product_to_blueprint.get(&16227),
-            Some(&16228),
-            "Ferox product->blueprint map missing"
-        );
+        let ferox_bp = store
+            .product_to_blueprint
+            .get(&16227)
+            .expect("Ferox product->blueprint map missing");
+        assert_eq!(ferox_bp.blueprint_id, 16228);
+        assert_eq!(ferox_bp.activity, Activity::Manufacturing);
 
         assert!(
             store.market_groups.id_index.contains_key(&1857),
@@ -742,8 +788,36 @@ mod tests {
 
         assert!(idx.id_index.contains_key(&683));
         assert!(idx.id_index.contains_key(&684));
-        assert_eq!(p2b.get(&582), Some(&683));
+        let r = p2b.get(&582).unwrap();
+        assert_eq!(r.blueprint_id, 683);
+        assert_eq!(r.activity, Activity::Manufacturing);
         assert!(!p2b.contains_key(&684));
+    }
+
+    #[test]
+    fn scan_blueprints_tags_reaction_products() {
+        let fixture = r#"{"_key":57493,"activities":{"reaction":{"products":[{"typeID":57457,"quantity":200}],"time":3600}}}
+"#;
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (_idx, p2b) = scan_blueprints(&path, &pb).unwrap();
+
+        let r = p2b.get(&57457).unwrap();
+        assert_eq!(r.blueprint_id, 57493);
+        assert_eq!(r.activity, Activity::Reaction);
+    }
+
+    #[test]
+    fn scan_blueprints_keeps_lowest_blueprint_id_per_product() {
+        // Two manufacturing BPs yield the same product; the lower BP ID wins.
+        let fixture = r#"{"_key":900,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}]}}}
+{"_key":800,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}]}}}
+"#;
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (_idx, p2b) = scan_blueprints(&path, &pb).unwrap();
+
+        assert_eq!(p2b.get(&582).unwrap().blueprint_id, 800);
     }
 
     #[test]
