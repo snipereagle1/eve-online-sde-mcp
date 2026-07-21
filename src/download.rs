@@ -29,27 +29,46 @@ pub(crate) fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
     let (build, etag, final_url) = head_check(&client)?;
 
     let meta_path = cfg.meta_path()?;
-    let existing = Meta::load(&meta_path)?;
 
-    if !cfg.redownload
-        && let Some(ref meta) = existing
-        && meta.build == build
-    {
-        return Ok(DownloadResult {
-            build,
-            release_date: meta.release_date.clone(),
-            was_downloaded: false,
-        });
+    // Fast path: already current, no lock needed.
+    if let Some(result) = current_result(cfg, &meta_path, build)? {
+        return Ok(result);
     }
 
     let data_dir = cfg.resolved_data_dir()?;
 
-    let zip_tmp = data_dir.join(format!("sde-{build}.zip.tmp"));
+    // Serialize the download+extract across concurrent instances. Claude Desktop
+    // spawns several server processes against the same data dir; without this
+    // they race — duplicating the ~81 MB download and interleaving writes into
+    // the same sde-{build}/ dir. The lock is an OS advisory lock, released
+    // automatically when this process exits or crashes, so there is no stale
+    // lockfile to clean up.
+    let lock_path = data_dir.join(".download.lock");
+    let lock_file = fs::File::create(&lock_path)
+        .with_context(|| format!("create lock file {}", lock_path.display()))?;
+    lock_file.lock().context("acquire SDE download lock")?;
+
+    // Re-check under the lock: another instance may have finished the download
+    // while we were blocked, in which case there is nothing left to do.
+    if let Some(result) = current_result(cfg, &meta_path, build)? {
+        return Ok(result); // lock released when lock_file drops
+    }
+
+    // Per-process temp name so a stray temp zip from another instance can never
+    // be mistaken for ours (belt-and-suspenders alongside the lock above).
+    let zip_tmp = data_dir.join(format!("sde-{build}.{}.zip.tmp", std::process::id()));
     download_zip(&client, &final_url, &zip_tmp)?;
 
     let sde_dir = cfg.sde_dir(build)?;
     extract_zip(&zip_tmp, &sde_dir)?;
-    fs::remove_file(&zip_tmp).context("remove temp zip")?;
+    // Cleanup only: a missing temp zip (another instance already removed it, or
+    // AV quarantined it) is harmless and must never abort startup — doing so
+    // would leave meta.json unwritten and trap the server in a re-download loop.
+    if let Err(e) = fs::remove_file(&zip_tmp)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove temp zip {}: {e}", zip_tmp.display());
+    }
 
     let release_date = read_release_date(&sde_dir)?;
 
@@ -70,6 +89,24 @@ pub(crate) fn check_and_update(cfg: &Config) -> Result<DownloadResult> {
         release_date,
         was_downloaded: true,
     })
+}
+
+/// Return a "no download needed" result if `meta.json` already records the
+/// current `build` (and `--redownload` was not requested), else `None`.
+fn current_result(cfg: &Config, meta_path: &Path, build: u64) -> Result<Option<DownloadResult>> {
+    if cfg.redownload {
+        return Ok(None);
+    }
+    if let Some(meta) = Meta::load(meta_path)?
+        && meta.build == build
+    {
+        return Ok(Some(DownloadResult {
+            build,
+            release_date: meta.release_date,
+            was_downloaded: false,
+        }));
+    }
+    Ok(None)
 }
 
 fn head_check(client: &Client) -> Result<(u64, String, String)> {
