@@ -184,4 +184,3 @@ On each commit it runs `cargo fmt --all` and re-stages the formatted Rust files 
 ## Data attribution
 
 The Static Data Export is published by **CCP Games**. EVE Online and all related material are trademarks of CCP hf. This project is an unofficial tool and is not affiliated with or endorsed by CCP.
-</content>
