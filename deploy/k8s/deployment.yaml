@@ -1,0 +1,86 @@
+# Reference Deployment for the hosted HTTP transport. Generic on purpose —
+# copy into your GitOps setup and adapt namespace / ingress / replicas.
+#
+# Storage: emptyDir. Each pod downloads its own ~81 MB SDE on start into
+# node-local scratch (no PVC / storage-class coupling). The server is stateless
+# over an immutable, read-only store, so scaling replicas needs no shared volume
+# or session affinity. Updates are restart-driven (the SDE build is checked once
+# at startup) — roll the Deployment to pick up a new build.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eve-sde-mcp
+  labels:
+    app: eve-sde-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eve-sde-mcp
+  template:
+    metadata:
+      labels:
+        app: eve-sde-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: eve-sde-mcp
+          image: ghcr.io/snipereagle1/eve-online-sde-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # SDE_TRANSPORT / SDE_BIND are baked into the image; set here too as
+            # living documentation of how the endpoint is configured.
+            - name: SDE_TRANSPORT
+              value: "http"
+            - name: SDE_BIND
+              value: "0.0.0.0:8080"
+            - name: SDE_LANGUAGE
+              value: "en"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sde-data
+              mountPath: /data
+          # The port only binds after the cold ~81 MB download + scan completes,
+          # so the startupProbe gives that up to ~5 min (30 × 10s) before k8s
+          # gives up. Liveness/readiness only take over once startup succeeds,
+          # so they never race the download.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          # Measured steady-state RSS post-scan is ~32 MiB (byte-offset indexes,
+          # not the full SDE, are held in memory). These leave comfortable
+          # headroom; tune for your build.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: sde-data
+          emptyDir: {}

@@ -1,0 +1,22 @@
+# ClusterIP Service fronting the Deployment. MCP is reachable in-cluster at
+# http://eve-sde-mcp:8080/mcp (health at /health).
+#
+# To expose it outside the cluster, add an Ingress / Gateway pointing at this
+# Service. There is no built-in auth (the SDE is public, read-only data), so put
+# any access control / rate limiting / TLS termination at that ingress layer —
+# it is also where inbound Host/Origin validation belongs, since the server
+# disables its own loopback-only Host guard in HTTP mode.
+apiVersion: v1
+kind: Service
+metadata:
+  name: eve-sde-mcp
+  labels:
+    app: eve-sde-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: eve-sde-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

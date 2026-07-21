@@ -1,0 +1,20 @@
+# Build artifacts and caches — never send to the build context.
+target/
+.git/
+.github/
+
+# MCPB bundle output and SDE caches.
+*.mcpb
+sde/
+sde-data/
+
+# Docs and local tooling not needed to build the binary.
+docs/
+README.md
+CONTEXT.md
+CLAUDE.md
+compose.yaml
+deploy/
+.mcp.json
+.mcpbignore
+.codegraph/

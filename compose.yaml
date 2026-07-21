@@ -1,0 +1,37 @@
+# One-command hosted deployment of the EVE SDE MCP server over HTTP.
+#
+#   docker compose up
+#
+# The MCP endpoint is then reachable at http://localhost:8080/mcp and a health
+# probe at http://localhost:8080/health. The SDE (~81 MB) downloads on first
+# start into the named volume and is reused across restarts.
+#
+# There is no built-in authentication — the SDE is public, read-only game data.
+# If you want to gate access or rate-limit, front this with a reverse proxy.
+
+services:
+  eve-sde-mcp:
+    image: ghcr.io/snipereagle1/eve-online-sde-mcp:latest
+    # To build locally instead of pulling, comment `image:` above and uncomment:
+    # build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Named volume avoids re-downloading the SDE on every restart. Prefer this
+      # over a bind mount: the container runs as uid 65532, so a host bind-mount
+      # dir would need `chown 65532` to be writable.
+      - sde-data:/data
+    environment:
+      # SDE_TRANSPORT=http and SDE_BIND=0.0.0.0:8080 are already baked into the
+      # image; set SDE_LANGUAGE here to filter localized names (e.g. "de").
+      SDE_LANGUAGE: en
+    restart: unless-stopped
+    healthcheck:
+      # Distroless has no shell/curl, so probe with the binary itself would fail;
+      # Docker's healthcheck needs a command in the image. The binary can't curl,
+      # so rely on your orchestrator/proxy for HTTP health, or add a sidecar.
+      # Kept here as documentation — see deploy/k8s for real HTTP probes.
+      disable: true
+
+volumes:
+  sde-data:
