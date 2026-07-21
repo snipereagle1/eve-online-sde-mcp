@@ -1,12 +1,13 @@
 mod config;
 mod download;
+mod http;
 mod scan;
 mod sde_version;
 mod store;
 mod tools;
 
 use clap::Parser;
-use config::Config;
+use config::{Config, Transport};
 use rmcp::ServiceExt;
 use tools::SdeMcpServer;
 
@@ -21,8 +22,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Values needed after the blocking startup task, cloned out before `cfg`
+    // is moved into the closure.
     let language = cfg.language.clone();
+    let transport = cfg.transport;
+    let bind = cfg.bind.clone();
+    let path = cfg.path.clone();
 
+    // Build + scan are identical for both transports; only serving differs. The
+    // store carries the build/release_date that HTTP mode's /health reports.
     let store = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let result = download::check_and_update(&cfg)?;
 
@@ -48,8 +56,15 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1)
     });
 
-    let server = SdeMcpServer::new(store, language);
-    let transport = rmcp::transport::io::stdio();
-    server.serve(transport).await?.waiting().await?;
+    match transport {
+        Transport::Stdio => {
+            let server = SdeMcpServer::new(store, language);
+            let transport = rmcp::transport::io::stdio();
+            server.serve(transport).await?.waiting().await?;
+        }
+        Transport::Http => {
+            http::serve(&bind, &path, store, language).await?;
+        }
+    }
     Ok(())
 }

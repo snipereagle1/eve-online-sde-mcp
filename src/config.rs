@@ -3,6 +3,17 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Transport the server speaks MCP over.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Transport {
+    /// Local stdio (default): an MCP client spawns the process and talks over
+    /// stdin/stdout. One process serves one client.
+    Stdio,
+    /// Network-reachable Streamable HTTP: one long-lived process serves many
+    /// remote clients. Intended for hosted/containerized deployments.
+    Http,
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "EVE Online SDE MCP server")]
 pub(crate) struct Config {
@@ -24,6 +35,22 @@ pub(crate) struct Config {
     /// Language for localized names (e.g. "en", "de"). Defaults to "en" to reduce token usage.
     #[arg(long, env = "SDE_LANGUAGE", default_value = "en")]
     pub(crate) language: Option<String>,
+
+    /// Transport to serve MCP over: `stdio` (default, local spawn) or `http`
+    /// (network-reachable Streamable HTTP for hosted deployments).
+    #[arg(long, env = "SDE_TRANSPORT", value_enum, default_value_t = Transport::Stdio)]
+    pub(crate) transport: Transport,
+
+    /// Address to bind in `--transport http` mode. Defaults to loopback so the
+    /// bare binary is not exposed to the network; containers override this to
+    /// `0.0.0.0:8080`. Ignored in stdio mode.
+    #[arg(long, env = "SDE_BIND", default_value = "127.0.0.1:8080")]
+    pub(crate) bind: String,
+
+    /// URL path the MCP endpoint is mounted at in `--transport http` mode.
+    /// Ignored in stdio mode.
+    #[arg(long, env = "SDE_PATH", default_value = "/mcp")]
+    pub(crate) path: String,
 }
 
 impl Config {
@@ -95,6 +122,9 @@ mod tests {
             log_level: "warn".to_string(),
             redownload: false,
             language: Some("en".to_string()),
+            transport: Transport::Stdio,
+            bind: "127.0.0.1:8080".to_string(),
+            path: "/mcp".to_string(),
         }
     }
 

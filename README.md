@@ -1,6 +1,6 @@
 # eve-online-sde-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that exposes EVE Online's **Static Data Export (SDE)** to AI agents over stdio. It gives a model fast, structured access to EVE's game data — items, ships, blueprints, dogma attributes, market groups, factions, and the full solar-system map — without a database.
+An [MCP](https://modelcontextprotocol.io) server that exposes EVE Online's **Static Data Export (SDE)** to AI agents — over stdio locally, or over HTTP as a [hosted service](#hosted-docker--kubernetes). It gives a model fast, structured access to EVE's game data — items, ships, blueprints, dogma attributes, market groups, factions, and the full solar-system map — without a database.
 
 ## Highlights
 
@@ -49,6 +49,9 @@ On first run the server downloads and extracts the SDE (~81 MB zip). This takes 
 |---|---|---|
 | `--data-dir` / `SDE_DATA_DIR` | `~/.local/share/eve-sde-mcp` | SDE cache directory |
 | `--language` / `SDE_LANGUAGE` | `en` | Language for localized name fields |
+| `--transport` / `SDE_TRANSPORT` | `stdio` | Transport: `stdio` (local spawn) or `http` (hosted) |
+| `--bind` / `SDE_BIND` | `127.0.0.1:8080` | Address to bind in `--transport http` mode |
+| `--path` / `SDE_PATH` | `/mcp` | URL path the MCP endpoint is mounted at (http mode) |
 | `--log-level` | `warn` | Tracing level (override with `RUST_LOG`) |
 | `--redownload` | `false` | Force re-download even if the build is current |
 
@@ -59,6 +62,48 @@ RUST_LOG=debug cargo run     # run with debug logging
 ```
 
 > The data directory defaults to `%APPDATA%` on Windows and honors `XDG_DATA_HOME` on Linux.
+
+## Hosted (Docker / Kubernetes)
+
+The server can also run as a long-lived process that serves many remote clients over
+**Streamable HTTP**, instead of being spawned per session over stdio. Point an MCP client at
+`http://<host>:8080/mcp`; a `GET /health` endpoint backs container/orchestrator probes.
+
+The HTTP endpoint has **no built-in authentication** — the SDE is public, read-only game data.
+If you want to gate access, rate-limit, or terminate TLS, put a reverse proxy / ingress in front;
+that is also where inbound `Host`/`Origin` validation belongs (the server disables its own
+loopback-only host guard in HTTP mode so it can serve traffic via any hostname).
+
+### Docker
+
+```bash
+docker run -p 8080:8080 -v eve-sde:/data ghcr.io/snipereagle1/eve-online-sde-mcp:latest
+curl localhost:8080/health   # {"status":"ok","build":...,"release_date":...}
+```
+
+The image runs as a non-root user (uid 65532), defaults to `--transport http --bind 0.0.0.0:8080`,
+and caches the SDE under `/data`. Use a **named volume** (as above) so restarts reuse the cached
+build; a bind mount would need `chown 65532` since the container is non-root.
+
+Or with the bundled Compose file:
+
+```bash
+docker compose up            # serves on http://localhost:8080/mcp
+```
+
+### Kubernetes
+
+Reference manifests live in [`deploy/k8s/`](deploy/k8s) (Deployment + Service):
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+They use an `emptyDir` (each pod downloads its own SDE — no PVC needed) and a **`startupProbe`**
+that gives the cold ~81 MB download up to ~5 minutes before liveness/readiness take over, so a
+slow first boot can't trigger CrashLoopBackOff. The server is stateless over an immutable store, so
+you can scale replicas freely. Updates are restart-driven — roll the Deployment to pick up a new
+SDE build.
 
 ## Tools
 
@@ -139,4 +184,3 @@ On each commit it runs `cargo fmt --all` and re-stages the formatted Rust files 
 ## Data attribution
 
 The Static Data Export is published by **CCP Games**. EVE Online and all related material are trademarks of CCP hf. This project is an unofficial tool and is not affiliated with or endorsed by CCP.
-</content>
