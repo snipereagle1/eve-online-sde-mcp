@@ -231,9 +231,9 @@ pub struct FindTypesParam {
     /// attribute's DefaultValue are never returned — see the response's
     /// `attribute_semantics`.
     pub attribute: Option<AttributePredicate>,
-    /// Maximum rows to return (default: 100). Predicates apply to the whole
-    /// candidate set first, so `total_matched` is the real count even when
-    /// `truncated` is true.
+    /// Maximum rows to return (default: 100, capped at 1000). Predicates apply to
+    /// the whole candidate set first, so `total_matched` is the real count even
+    /// when `truncated` is true.
     pub limit: Option<u64>,
 }
 
@@ -399,7 +399,10 @@ impl SdeMcpServer {
             .filter(|&(_, value)| op.admits(value, want, default_value))
             .collect();
 
-        let limit = p.limit.unwrap_or(DEFAULT_FIND_TYPES_LIMIT) as usize;
+        let limit = p
+            .limit
+            .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
+            .min(MAX_FIND_TYPES_LIMIT) as usize;
         let total_matched = matched.len();
         let types: Vec<FoundType> = matched
             .into_iter()
@@ -1394,6 +1397,12 @@ const MAX_SKILL_DEPTH: usize = 12;
 // ── sde_find_types ───────────────────────────────────────────────────────────
 
 const DEFAULT_FIND_TYPES_LIMIT: u64 = 100;
+
+/// Hard ceiling on rows per call. A caller asking for more is clamped rather than
+/// refused: `total_matched` still reports the true size and `truncated` still says
+/// the page is partial, so the answer stays honest. Category 91 holds 11,836 Types
+/// and no client wants them inline.
+const MAX_FIND_TYPES_LIMIT: u64 = 1000;
 
 /// Stated on every attribute-predicate response. The whole point of the tool is
 /// that "no row" and "no value" are different, so the caller is told which one a

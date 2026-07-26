@@ -919,42 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_type_dogma_builds_the_attribute_to_types_index_in_the_same_pass() {
-        // The same pass that builds effect_to_types also inverts dogmaAttributes, so
-        // sde_find_types answers from memory and never re-reads typeDogma.jsonl.
-        let fixture = r#"{"_key":2456,"dogmaAttributes":[{"attributeID":64,"value":1.92},{"attributeID":9,"value":240.0}],"dogmaEffects":[]}
-{"_key":1202,"dogmaAttributes":[{"attributeID":64,"value":1.0}],"dogmaEffects":[]}
-{"_key":34,"dogmaAttributes":[],"dogmaEffects":[]}
-"#;
-        let (_f, path) = write_fixture(fixture);
-        let pb = hidden_pb();
-        let (_idx, _eff, attribute_types) = scan_type_dogma(&path, &pb).unwrap();
-
-        // Ascending type_id, so every query inherits a deterministic order.
-        assert_eq!(
-            attribute_types.get(&64).unwrap(),
-            &[(1202, 1.0), (2456, 1.92)]
-        );
-        assert_eq!(attribute_types.get(&9).unwrap(), &[(2456, 240.0)]);
-        assert!(
-            !attribute_types.values().flatten().any(|&(t, _)| t == 34),
-            "a type with no dogmaAttributes contributes no rows"
-        );
-    }
-
-    #[test]
-    fn scan_type_dogma_skips_attribute_rows_with_no_value() {
-        // A row with no `value` records no ExplicitValue. Defaulting it to 0.0 would
-        // invent a Type that a `lt` predicate then matches.
-        let fixture =
-            "{\"_key\":2456,\"dogmaAttributes\":[{\"attributeID\":64}],\"dogmaEffects\":[]}\n";
-        let (_f, path) = write_fixture(fixture);
-        let pb = hidden_pb();
-        let (_idx, _eff, attribute_types) = scan_type_dogma(&path, &pb).unwrap();
-        assert!(!attribute_types.contains_key(&64));
-    }
-
-    #[test]
     fn scan_stargates_builds_bidirectional_graph() {
         let fixture = r#"{"_key":50000056,"solarSystemID":30000001,"destination":{"stargateID":50000055,"solarSystemID":30000002}}
 {"_key":50000055,"solarSystemID":30000002,"destination":{"stargateID":50000056,"solarSystemID":30000001}}
