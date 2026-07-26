@@ -105,7 +105,19 @@ were considered, and `attribute_default`, echoing the DefaultValue. A row is
 `attributes` under `project_attributes`.
 
 Calling with no predicate at all is an error naming the available predicates,
-never a full dump.
+never a full dump — naming only the ones that already work, so the message stays
+truthful as later passes extend it.
+
+The contract above is the finished shape, not the shape after any one ticket. It
+is delivered by #40 (`attribute`, `limit`, and the `total_matched` / `returned` /
+`truncated` / `attribute_semantics` / `attribute_default` envelope), #41
+(`group_ids`, `category_ids`, `published_only`, and the `groups` rollup), #42
+(`meta_group_ids` and `excluded_no_meta_group`), and #48 (`query`, `type_ids`,
+`project_attributes`). A request field is added by the ticket that makes it do
+something: a field that appears in the JSON schema while silently doing nothing
+is worse than an absent one, because a caller passing `group_ids` would read an
+unfiltered result as filtered. So a key missing from an earlier pass is that
+schedule working, not an omission to fix.
 
 ## Considered Options
 
