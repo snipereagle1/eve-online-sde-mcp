@@ -41,6 +41,16 @@ Every `groupID` a type references is declared, every group resolves to a
 declared category, and every `attributeID` in `typeDogma.jsonl` is declared in
 `dogmaAttributes.jsonl`.
 
+Epic #37 asked for this by declaring the four groups the old fixture referenced
+but never defined — 257, 268, 463 and 54. It was reached the other way: the
+types that pointed at 268 and 54 were pointing at the wrong groups, so they were
+moved to the ones the real SDE gives them (the Mining Barge skill to 257
+Spaceship Command, the strip miner to 464 Strip Miner, the Mining and
+Astrogeology skills to 1218 Resource Processing) and those were declared
+instead. Declaring 268 "Production" as the home of a skill the SDE files under
+Spaceship Command would have closed the hole with a wrong answer. Nothing now
+references 268 or 54, so neither is declared.
+
 ## The two deliberate divergences
 
 1. **`typeDogma` rows for 16227, 34, 3386, 3410, 17940, 17476 and 87562 are
