@@ -76,6 +76,37 @@ stays correct under truncation — which is what lets it subsume
 whenever `meta_group_ids` is active, since 74% of Types have no `metaGroupID`
 and absence must not read as Tech I.
 
+### The wire contract
+
+`sde_find_types` is built over three tickets (#40 attribute predicate, #41
+taxonomy, #42 MetaGroup) that are three passes over one handler. They are
+coupled by the shape of the response, not by the file, so the names are decided
+here rather than discovered three times.
+
+Request: `query`, `type_ids`, `group_ids`, `category_ids`, `meta_group_ids`,
+`published_only`, `project_attributes`, `limit`, and `attribute: {id, op?,
+value?}`. All predicates AND. `limit` defaults to **100**.
+
+`op` is one of `exists` (the default when `op` is omitted; `value` is ignored),
+`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, and `not_default`. Every operator is
+already restricted to Types holding an ExplicitValue — `exists` is that
+restriction alone, and `not_default` further drops rows whose ExplicitValue
+equals the DogmaAttribute's DefaultValue. `ne` compares against a caller-supplied
+`value`; `not_default` compares against the attribute's own default. They are
+different questions and both are needed. The comparison operators require
+`value`; omitting it is an error, not a silent fallback to `exists`.
+
+Response: `types` (the rows), `total_matched`, `returned`, `truncated`,
+`groups` (the rollup, over the full match set), and — when `meta_group_ids` is
+active — `excluded_no_meta_group`. When an `attribute` predicate is present the
+response also carries `attribute_semantics`, stating that only ExplicitValues
+were considered, and `attribute_default`, echoing the DefaultValue. A row is
+`{type_id, name, group_id}`, plus `value` under an attribute predicate and
+`attributes` under `project_attributes`.
+
+Calling with no predicate at all is an error naming the available predicates,
+never a full dump.
+
 ## Considered Options
 
 - **Four narrow tools**, as originally proposed — rejected. The server already
