@@ -95,6 +95,14 @@ pub(crate) struct SdeStore {
     /// a predicate over the full match set never costs a seek and parse per Type —
     /// a single DogmaAttribute can match 5,921 Types and a Category 11,836.
     pub(crate) type_group: HashMap<u32, u32>,
+    /// typeID -> its MetaGroup, for the ~26% of Types that have one. Sparse on
+    /// purpose and held in one direction only, unlike Type↔Group: a MetaGroup
+    /// narrows a candidate set produced by another predicate, it does not produce
+    /// one. Absence of a key is absence of a MetaGroup — never Tech I — which is
+    /// what `sde_find_types` counts into `excluded_no_meta_group`. Also the source
+    /// for `manufacturing::me_mode`, which used to seek and full-parse a Type
+    /// record per node of a production chain to read the same field.
+    pub(crate) type_meta_group: HashMap<u32, u32>,
     /// groupID -> the Types in it, ascending. The candidate set for a taxonomy-only
     /// `sde_find_types` call, sorted once at scan time exactly like
     /// `attribute_types`.

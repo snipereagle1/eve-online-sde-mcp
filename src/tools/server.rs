@@ -236,6 +236,11 @@ pub struct FindTypesParam {
     /// Restrict to Types whose Group belongs to any of these Categories (e.g. 6
     /// Ship). Combined with `group_ids` it narrows further: both must hold.
     pub category_ids: Option<Vec<u64>>,
+    /// Restrict to Types whose MetaGroup is any of these (1 Tech I, 2 Tech II,
+    /// 4 Faction, …). Most Types carry no MetaGroup at all; those are excluded and
+    /// counted in the response's `excluded_no_meta_group` rather than being read as
+    /// Tech I. Narrows a candidate set; it cannot be the only predicate.
+    pub meta_group_ids: Option<Vec<u64>>,
     /// Drop unpublished Types. Applied before `limit`, so asking for N published
     /// Types returns N when N exist. Narrows a candidate set; it cannot be the
     /// only predicate.
@@ -402,7 +407,8 @@ impl SdeMcpServer {
             (None, None) => {
                 return Err(ErrorData::invalid_params(
                     "sde_find_types needs at least one predicate; available: attribute \
-                     {id, op?, value?}, group_ids, category_ids",
+                     {id, op?, value?}, group_ids, category_ids. meta_group_ids and \
+                     published_only narrow a candidate set but cannot produce one",
                     None,
                 ));
             }
@@ -414,7 +420,9 @@ impl SdeMcpServer {
         // — a request for N published Types returns N when N exist — and what lets
         // the rollup below count matches instead of returned rows.
         let published_only = p.published_only.unwrap_or(false);
-        if group_filter.is_some() || published_only {
+        let meta_group_filter = resolve_meta_group_filter(p);
+        let mut excluded_no_meta_group = 0u64;
+        if group_filter.is_some() || published_only || meta_group_filter.is_some() {
             matched.retain(|&(type_id, _)| {
                 let in_group = group_filter.as_ref().is_none_or(|groups| {
                     self.store
@@ -422,7 +430,23 @@ impl SdeMcpServer {
                         .get(&type_id)
                         .is_some_and(|g| groups.contains(g))
                 });
-                in_group && (!published_only || self.store.published_types.contains(&type_id))
+                if !in_group || (published_only && !self.store.published_types.contains(&type_id)) {
+                    return false;
+                }
+                let Some(wanted) = meta_group_filter.as_ref() else {
+                    return true;
+                };
+                // Judged last, and only on candidates every other predicate kept, so
+                // the count answers "how many of the Types you were asking about
+                // could not be classified" rather than inflating with rows that were
+                // never in the running.
+                match self.store.type_meta_group.get(&type_id) {
+                    Some(meta_group) => wanted.contains(meta_group),
+                    None => {
+                        excluded_no_meta_group += 1;
+                        false
+                    }
+                }
             });
         }
 
@@ -461,6 +485,12 @@ impl SdeMcpServer {
             types,
             total_matched,
             groups: self.roll_up_groups(&matched),
+            // Reported whenever the filter ran, including as a zero: "none of your
+            // candidates lacked a MetaGroup" is an answer, and its absence when the
+            // filter is inactive keeps the key from reading as "none were dropped".
+            excluded_no_meta_group: meta_group_filter
+                .is_some()
+                .then_some(excluded_no_meta_group),
             attribute_semantics: p
                 .attribute
                 .as_ref()
@@ -973,7 +1003,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); published_only drops unpublished Types. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types. meta_group_ids and published_only narrow a candidate set and cannot be the only predicate. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
     )]
     async fn sde_find_types(
         &self,
@@ -1575,6 +1605,22 @@ const ATTRIBUTE_SEMANTICS: &str = "ExplicitValue only: rows are Types that recor
      DogmaAttribute in typeDogma. Every other Type still HAS the attribute, at \
      attribute_default, and is deliberately not listed.";
 
+/// The MetaGroups a call is restricted to, or `None` when it names none. Unlike
+/// [`SdeMcpServer::resolve_group_filter`] this validates nothing: `metaGroups.jsonl`
+/// is deliberately not scanned, so the server holds no list of declared MetaGroups
+/// to check an ID against and cannot tell a typo from a MetaGroup no Type uses. An
+/// ID too large to be one is dropped rather than errored for the same reason — it
+/// simply matches nothing, which is what the response then reports.
+fn resolve_meta_group_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
+    let named = p.meta_group_ids.as_deref().filter(|ids| !ids.is_empty())?;
+    Some(
+        named
+            .iter()
+            .filter_map(|&id| u32::try_from(id).ok())
+            .collect(),
+    )
+}
+
 /// One row of a `sde_find_types` answer. `value` is `f32` so it serializes as the
 /// value the SDE stores (`1.92`), not the f64 widening of it (`1.9199999570846558`).
 #[derive(Debug, serde::Serialize)]
@@ -1607,6 +1653,12 @@ pub(crate) struct FindTypesResult {
     returned: usize,
     truncated: bool,
     groups: Vec<GroupRollup>,
+    /// Candidates dropped for carrying no MetaGroup at all, present only when
+    /// `meta_group_ids` was given. Most Types have no MetaGroup, so a MetaGroup
+    /// filter silently discards the majority; this is what stops a caller reading
+    /// the survivors as the whole population.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_no_meta_group: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attribute_semantics: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2134,6 +2186,7 @@ mod tests {
             attribute_types: HashMap::new(),
             type_group: HashMap::new(),
             group_types: HashMap::new(),
+            type_meta_group: HashMap::new(),
             category_groups: HashMap::new(),
             published_types: HashSet::new(),
         }
@@ -3954,6 +4007,169 @@ mod tests {
                 )
                 .await;
             assert!(r.is_err(), "published_only alone must not dump every Type");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_filters_by_meta_group_and_reports_the_absences() -> anyhow::Result<()> {
+            // The five Types carrying attribute 1971 are Badger (MetaGroup 1),
+            // Hoarder (none at all), Redeemer and Sin (2) and Python (4). Scoping to
+            // Tech II keeps the two Black Ops; the Hoarder is not one of them, but
+            // neither is it a non-match — it has no MetaGroup to judge, and saying so
+            // is the difference between "these are the T2 ones" and "one candidate
+            // could not be classified".
+            let seam = Seam::boot().await?;
+            let tech_two = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}, "meta_group_ids": [2]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&tech_two), vec![22428, 22430]);
+            assert_eq!(tech_two["total_matched"], 2);
+            assert_eq!(tech_two["excluded_no_meta_group"], 1);
+
+            // The same call for Tech I: the Hoarder is still excluded and still
+            // counted, because absence of a MetaGroup must never read as Tech I.
+            let tech_one = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}, "meta_group_ids": [1]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&tech_one), vec![648]);
+            assert_eq!(tech_one["excluded_no_meta_group"], 1);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_composes_the_meta_group_filter_with_taxonomy() -> anyhow::Result<()> {
+            // Group 101 Mining Drone holds the Civilian (MetaGroup 1), the Harvester
+            // (4) and the two unnamed-tier drones (none). Scoping to Tech I keeps the
+            // Civilian; the Harvester is a definite non-match and is *not* counted,
+            // while the two with no MetaGroup are — a wrong tier and no tier are
+            // different answers.
+            let seam = Seam::boot().await?;
+            let tech_one_drones = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [101], "meta_group_ids": [1]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&tech_one_drones), vec![1202]);
+            assert_eq!(tech_one_drones["excluded_no_meta_group"], 2);
+
+            // Category 6 Ship reaches its Types through five Groups; only the two
+            // Black Ops are Tech II, and only the Hoarder has no MetaGroup.
+            let tech_two_ships = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [6], "meta_group_ids": [2]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&tech_two_ships), vec![22428, 22430]);
+            assert_eq!(tech_two_ships["excluded_no_meta_group"], 1);
+
+            // Several MetaGroups at once, ORed among themselves the way group_ids is.
+            let tiered_ships = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [6], "meta_group_ids": [2, 4]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&tiered_ships), vec![22428, 22430, 85236]);
+            assert_eq!(tiered_ships["excluded_no_meta_group"], 1);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_counts_meta_group_absences_across_the_full_candidate_set()
+        -> anyhow::Result<()> {
+            // Group 18 Mineral's eight Types have no MetaGroup and group 898's three
+            // do. Asking for the Tech II ones under a limit of 1 returns a single row
+            // — a count scoped to the page could report at most that one, and a count
+            // scoped to the match set at most two. Eight can only come from every
+            // candidate the filter actually judged.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [18, 898], "meta_group_ids": [2], "limit": 1
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![22428]);
+            assert_eq!(r["returned"], 1);
+            assert_eq!(r["total_matched"], 2);
+            assert_eq!(r["truncated"], true);
+            assert_eq!(r["excluded_no_meta_group"], 8);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_counts_only_absences_the_other_predicates_left_standing()
+        -> anyhow::Result<()> {
+            // Both MetaGroup-less Types in group 101 are unpublished. With
+            // published_only they were already out of the running, so counting them
+            // as "excluded for having no MetaGroup" would overstate how much of the
+            // caller's own question went unanswered.
+            let seam = Seam::boot().await?;
+            let everything = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [101], "meta_group_ids": [1, 4]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&everything), vec![1202, 3218]);
+            assert_eq!(everything["excluded_no_meta_group"], 2);
+
+            let published = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [101], "meta_group_ids": [1, 4], "published_only": true
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&published), vec![1202, 3218]);
+            assert_eq!(published["excluded_no_meta_group"], 0);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_reports_no_meta_group_count_when_the_filter_is_inactive()
+        -> anyhow::Result<()> {
+            // Absent rather than zero: the same call returns Types with and without a
+            // MetaGroup, so a `0` here would claim nothing was dropped for a filter
+            // that never ran.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"group_ids": [101]}))
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218, 10248, 10252]);
+            assert!(
+                r.get("excluded_no_meta_group").is_none(),
+                "no MetaGroup filter ran: {r}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_meta_group_is_not_a_predicate_on_its_own() -> anyhow::Result<()> {
+            // Like published_only, it narrows a candidate set rather than producing
+            // one: the store maps Type → MetaGroup and not back, because "every Tech
+            // II item in EVE" is not a question this tool answers.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call("sde_find_types", serde_json::json!({"meta_group_ids": [2]}))
+                .await;
+            assert!(r.is_err(), "meta_group_ids alone must not dump every Type");
+            let message = format!("{}", r.unwrap_err());
+            assert!(
+                message.contains("meta_group_ids"),
+                "says why it was not enough: {message}"
+            );
             seam.shutdown().await
         }
 

@@ -124,11 +124,15 @@ fn category_of(store: &SdeStore, type_id: u64) -> Option<u64> {
         .as_u64()
 }
 
+/// The Type's MetaGroup, or `None` when it has none — which is most Types, and
+/// which [`MeMode::from_meta_group`] reads as "no invention or faction lock".
+///
+/// A scan-time map hit rather than the seek + read + full JSON parse this used to
+/// do. `me_mode` runs once per node of a production chain, so the parse was being
+/// paid per Type on the deepest call the server has.
 fn meta_group_of(store: &SdeStore, type_id: u64) -> Option<u64> {
-    query::fetch_by_id(&store.types, type_id)
-        .ok()?
-        .get("metaGroupID")?
-        .as_u64()
+    let type_id = u32::try_from(type_id).ok()?;
+    store.type_meta_group.get(&type_id).copied().map(u64::from)
 }
 
 fn type_name(store: &SdeStore, type_id: u64, lang: Option<&str>) -> Option<String> {
@@ -847,7 +851,13 @@ mod tests {
         blueprints_jsonl: &str,
         product_to_blueprint: HashMap<u64, BlueprintRef>,
     ) -> Fixtures {
-        let (f1, types) = index(types_jsonl);
+        // types.jsonl goes through the real `scan_types`, not the generic index
+        // scan: `meta_group_of` reads the `type_meta_group` map that pass builds, so
+        // a store wired by hand here would answer every `metaGroupID` question with
+        // "absent" and quietly turn every fixture into a Tech I item.
+        let (f1, types_path) = write_fixture(types_jsonl);
+        let types = crate::scan::scan_types_pub(&types_path, &indicatif::ProgressBar::hidden())
+            .expect("scan fixture types");
         let (f2, groups) = index(groups_jsonl);
         let (f3, blueprints) = index(blueprints_jsonl);
         let store = SdeStore {
@@ -856,7 +866,7 @@ mod tests {
             release_date: "2024-01-01".into(),
             files_scanned: 0,
             last_updated: "2024-01-01".into(),
-            types,
+            types: types.index,
             groups,
             categories: empty_index(),
             blueprints,
@@ -877,10 +887,11 @@ mod tests {
             attribute_modifiers: HashMap::new(),
             effect_to_types: HashMap::new(),
             attribute_types: HashMap::new(),
-            type_group: HashMap::new(),
-            group_types: HashMap::new(),
+            type_group: types.type_group,
+            group_types: types.group_types,
+            type_meta_group: types.type_meta_group,
             category_groups: HashMap::new(),
-            published_types: std::collections::HashSet::new(),
+            published_types: types.published_types,
         };
         Fixtures {
             _keep: vec![f1, f2, f3],

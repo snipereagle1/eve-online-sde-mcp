@@ -25,8 +25,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         .progress_chars("#>-"),
     );
 
-    let (types, type_group, group_types, published_types) =
-        scan_types(&root.join("types.jsonl"), &pb)?;
+    let types = scan_types(&root.join("types.jsonl"), &pb)?;
     let (groups, category_groups) = scan_groups(&root.join("groups.jsonl"), &pb)?;
     let categories = scan_index(&root.join("categories.jsonl"), &pb)?;
     let (blueprints, product_to_blueprint) = scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
@@ -60,7 +59,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         release_date: release_date.to_owned(),
         files_scanned: SDE_FILE_COUNT as usize,
         last_updated: release_date.to_owned(),
-        types,
+        types: types.index,
         groups,
         categories,
         blueprints,
@@ -81,10 +80,11 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         attribute_modifiers,
         effect_to_types,
         attribute_types,
-        type_group,
-        group_types,
+        type_group: types.type_group,
+        group_types: types.group_types,
+        type_meta_group: types.type_meta_group,
         category_groups,
-        published_types,
+        published_types: types.published_types,
     }))
 }
 
@@ -104,6 +104,14 @@ fn find_sde_root(sde_dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     scan_index(path, pb)
+}
+
+/// Exposed for `manufacturing`'s tests, whose stores have to carry the same
+/// derived maps a real scan produces now that `me_mode` reads `type_meta_group`
+/// instead of re-reading the Type record.
+#[cfg(test)]
+pub fn scan_types_pub(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
+    scan_types(path, pb)
 }
 
 #[cfg(test)]
@@ -173,25 +181,31 @@ fn scan_index_with(
     })
 }
 
-type TypesScan = (
-    SdeIndex,
-    HashMap<u32, u32>,
-    HashMap<u32, Vec<u32>>,
-    HashSet<u32>,
-);
+/// What one pass over types.jsonl yields. A struct rather than a tuple because
+/// `type_group` and `type_meta_group` are both `HashMap<u32, u32>` and a caller
+/// destructuring them the wrong way round would compile.
+pub(crate) struct TypesScan {
+    pub(crate) index: SdeIndex,
+    pub(crate) type_group: HashMap<u32, u32>,
+    pub(crate) group_types: HashMap<u32, Vec<u32>>,
+    pub(crate) type_meta_group: HashMap<u32, u32>,
+    pub(crate) published_types: HashSet<u32>,
+}
 
 /// Scan types.jsonl into the usual id/name indexes plus the Group taxonomy that
 /// `sde_find_types` filters and rolls up on: `type_group`, its inverse
-/// `group_types`, and the set of published Types.
+/// `group_types`, the MetaGroup of the Types that have one, and the set of
+/// published Types.
 ///
-/// `groupID` and `published` ride along in this pass rather than being seeked per
-/// Type at query time, because both are needed for the **whole** match set:
-/// `published_only` has to apply before the limit, and the `groups` rollup has to
-/// count every match rather than the returned page. Per-Type seeks would cost
-/// 11,836 reads for a single Category.
+/// `groupID`, `metaGroupID` and `published` ride along in this pass rather than
+/// being seeked per Type at query time, because all three are needed for the
+/// **whole** match set: `published_only` and the MetaGroup filter have to apply
+/// before the limit, and the `groups` rollup has to count every match rather than
+/// the returned page. Per-Type seeks would cost 11,836 reads for a single Category.
 fn scan_types(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
     let mut type_group: HashMap<u32, u32> = HashMap::new();
     let mut group_types: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut type_meta_group: HashMap<u32, u32> = HashMap::new();
     let mut published_types: HashSet<u32> = HashSet::new();
 
     let index = scan_index_with(path, pb, |key, line| {
@@ -206,6 +220,15 @@ fn scan_types(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
         };
         type_group.insert(type_id, group_id);
         group_types.entry(group_id).or_default().push(type_id);
+        // Sparse by design: 74% of Types have no `metaGroupID`, and the field is
+        // also written as an explicit `null`, which parses as absent here. Either
+        // way the Type stays out of the map, because a MetaGroup this scan invented
+        // would be read as a tier the SDE never assigned.
+        if let Some(Ok(meta_group_id)) =
+            extract_number_field(line, b"\"metaGroupID\":").map(u32::try_from)
+        {
+            type_meta_group.insert(type_id, meta_group_id);
+        }
         // Only a literal `true` enrolls a Type. Every Type in build 3444265
         // carries the field, so a missing one is unknown provenance and must not
         // slip past a `published_only` filter.
@@ -220,7 +243,13 @@ fn scan_types(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
         types.sort_unstable();
     }
 
-    Ok((index, type_group, group_types, published_types))
+    Ok(TypesScan {
+        index,
+        type_group,
+        group_types,
+        type_meta_group,
+        published_types,
+    })
 }
 
 /// Scan groups.jsonl into the usual indexes plus `categoryID -> groups`. A
