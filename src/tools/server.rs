@@ -2458,488 +2458,554 @@ mod tests {
         assert_eq!(v["_key"], 60003760);
     }
 
-    #[tokio::test]
-    async fn mcp_all_21_tools_via_fixture_data() -> anyhow::Result<()> {
+    /// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
+    /// and a real MCP client talking to it over an in-memory duplex transport.
+    /// Every test here drives a tool the way a client does — over the wire, not
+    /// by calling the handler method directly.
+    mod mcp_seam {
         use rmcp::{
-            ClientHandler, ServiceExt as _,
-            model::{CallToolRequestParams, ClientInfo},
+            ClientHandler, RoleClient, ServiceExt as _,
+            model::{CallToolRequestParams, CallToolResult, ClientInfo},
+            service::RunningService,
         };
+
+        use crate::tools::server::SdeMcpServer;
 
         #[derive(Clone, Default)]
         struct DummyClient;
+
         impl ClientHandler for DummyClient {
             fn get_info(&self) -> ClientInfo {
                 ClientInfo::default()
             }
         }
 
-        fn text_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
-            let text = result
-                .content
-                .first()
-                .and_then(|c| c.raw.as_text())
-                .map(|t| t.text.as_str())
-                .expect("expected text content");
-            serde_json::from_str(text).expect("invalid JSON in tool response")
+        /// A booted client/server pair. Call [`Seam::shutdown`] at the end of a
+        /// test to cancel the client and join the server task.
+        struct Seam {
+            client: RunningService<RoleClient, DummyClient>,
+            server: tokio::task::JoinHandle<anyhow::Result<()>>,
         }
 
-        fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-            v.as_object().unwrap().clone()
+        impl Seam {
+            /// Scan the JSONL fixtures and serve them to a live client.
+            async fn boot() -> anyhow::Result<Self> {
+                let fixture_dir =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
+                let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
+
+                let (server_transport, client_transport) = tokio::io::duplex(65536);
+                let server = tokio::spawn(async move {
+                    SdeMcpServer::new(store, Some("en".to_string()))
+                        .serve(server_transport)
+                        .await?
+                        .waiting()
+                        .await?;
+                    anyhow::Ok(())
+                });
+                let client = DummyClient.serve(client_transport).await?;
+                Ok(Self { client, server })
+            }
+
+            /// Call `tool` and parse its single text content block as JSON.
+            async fn call(
+                &self,
+                tool: &str,
+                args: serde_json::Value,
+            ) -> anyhow::Result<serde_json::Value> {
+                let result = self.try_call(tool, args).await?;
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|c| c.raw.as_text())
+                    .map(|t| t.text.as_str())
+                    .expect("expected text content");
+                Ok(serde_json::from_str(text).expect("invalid JSON in tool response"))
+            }
+
+            /// Call `tool` without interpreting the result — for asserting that a
+            /// call fails.
+            async fn try_call(
+                &self,
+                tool: &str,
+                args: serde_json::Value,
+            ) -> anyhow::Result<CallToolResult> {
+                let mut request = CallToolRequestParams::new(tool.to_string());
+                if let Some(map) = args.as_object().filter(|m| !m.is_empty()) {
+                    request = request.with_arguments(map.clone());
+                }
+                Ok(self.client.call_tool(request).await?)
+            }
+
+            async fn shutdown(self) -> anyhow::Result<()> {
+                self.client.cancel().await?;
+                let _ = self.server.await;
+                Ok(())
+            }
         }
 
-        let fixture_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
-        let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
+        #[tokio::test]
+        async fn status_reports_the_scanned_build() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam.call("sde_status", serde_json::json!({})).await?;
+            assert_eq!(r["build"], 3333874);
+            assert_eq!(r["release_date"], "2024-01-15");
+            assert!(r["files_scanned"].as_u64().unwrap() > 0);
+            seam.shutdown().await
+        }
 
-        let (server_transport, client_transport) = tokio::io::duplex(65536);
-        let server_handle = tokio::spawn(async move {
-            SdeMcpServer::new(store, Some("en".to_string()))
-                .serve(server_transport)
-                .await?
-                .waiting()
+        #[tokio::test]
+        async fn get_type_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_type", serde_json::json!({"type_id": 34}))
                 .await?;
-            anyhow::Ok(())
-        });
-        let client = DummyClient.serve(client_transport).await?;
+            assert_eq!(r["_key"], 34);
+            assert_eq!(r["name"], "Tritanium");
+            seam.shutdown().await
+        }
 
-        // sde_status
-        let r = text_json(
-            &client
-                .call_tool(CallToolRequestParams::new("sde_status"))
-                .await?,
-        );
-        assert_eq!(r["build"], 3333874);
-        assert_eq!(r["release_date"], "2024-01-15");
-        assert!(r["files_scanned"].as_u64().unwrap() > 0);
+        #[tokio::test]
+        async fn search_types_matches_a_name_substring() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_search_types", serde_json::json!({"query": "trit"}))
+                .await?;
+            assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 34));
+            seam.shutdown().await
+        }
 
-        // sde_get_type
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_type")
-                        .with_arguments(obj(serde_json::json!({"type_id": 34}))),
+        #[tokio::test]
+        async fn get_group_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_group", serde_json::json!({"group_id": 18}))
+                .await?;
+            assert_eq!(r["_key"], 18);
+            assert_eq!(r["name"], "Mineral");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_category_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_category", serde_json::json!({"category_id": 4}))
+                .await?;
+            assert_eq!(r["_key"], 4);
+            assert_eq!(r["name"], "Material");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_type_materials_returns_the_reprocessing_list() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_type_materials",
+                    serde_json::json!({"type_id": 1230}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 34);
-        assert_eq!(r["name"], "Tritanium");
+                .await?;
+            assert_eq!(r["_key"], 1230);
+            assert!(r["materials"].as_array().is_some());
+            seam.shutdown().await
+        }
 
-        // sde_search_types
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_search_types")
-                        .with_arguments(obj(serde_json::json!({"query": "trit"}))),
+        #[tokio::test]
+        async fn get_type_dogma_returns_attributes_for_a_type() -> anyhow::Result<()> {
+            // Ferox has dogma attributes in the fixture.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_type_dogma", serde_json::json!({"type_id": 16227}))
+                .await?;
+            assert_eq!(r["_key"], 16227);
+            assert!(r["dogmaAttributes"].as_array().is_some());
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_type_dogma_resolve_names_decodes_skill_prereqs() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_type_dogma",
+                    serde_json::json!({"type_id": 17940, "resolve_names": true}),
                 )
-                .await?,
-        );
-        assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 34));
+                .await?;
+            let attrs = r["dogmaAttributes"].as_array().unwrap();
+            assert!(
+                attrs
+                    .iter()
+                    .any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology"
+                        && a["requiredSkill"]["level"] == 3)
+            );
+            seam.shutdown().await
+        }
 
-        // sde_get_group
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_group")
-                        .with_arguments(obj(serde_json::json!({"group_id": 18}))),
+        #[tokio::test]
+        async fn get_blueprint_returns_its_activities() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_blueprint",
+                    serde_json::json!({"blueprint_type_id": 16228}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 18);
-        assert_eq!(r["name"], "Mineral");
+                .await?;
+            assert_eq!(r["_key"], 16228);
+            assert!(r["activities"]["manufacturing"].is_object());
+            seam.shutdown().await
+        }
 
-        // sde_get_category
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_category")
-                        .with_arguments(obj(serde_json::json!({"category_id": 4}))),
+        #[tokio::test]
+        async fn get_blueprint_for_product_walks_the_reverse_map() -> anyhow::Result<()> {
+            // The Ferox blueprint makes the Ferox.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_blueprint_for_product",
+                    serde_json::json!({"product_type_id": 16227}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 4);
-        assert_eq!(r["name"], "Material");
+                .await?;
+            assert_eq!(r["blueprint"]["_key"], 16228);
+            assert_eq!(r["activity"], "manufacturing");
+            seam.shutdown().await
+        }
 
-        // sde_get_type_materials
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_type_materials")
-                        .with_arguments(obj(serde_json::json!({"type_id": 1230}))),
+        #[tokio::test]
+        async fn get_solar_system_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_solar_system",
+                    serde_json::json!({"system_id": 30000142}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 1230);
-        assert!(r["materials"].as_array().is_some());
+                .await?;
+            assert_eq!(r["_key"], 30000142);
+            assert_eq!(r["name"], "Jita");
+            seam.shutdown().await
+        }
 
-        // sde_get_type_dogma (Ferox has dogma attributes in fixture)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_type_dogma")
-                        .with_arguments(obj(serde_json::json!({"type_id": 16227}))),
+        #[tokio::test]
+        async fn search_solar_systems_matches_a_name_substring() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_solar_systems",
+                    serde_json::json!({"query": "jita"}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 16227);
-        assert!(r["dogmaAttributes"].as_array().is_some());
+                .await?;
+            assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
+            seam.shutdown().await
+        }
 
-        // sde_get_blueprint
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_blueprint")
-                        .with_arguments(obj(serde_json::json!({"blueprint_type_id": 16228}))),
+        #[tokio::test]
+        async fn get_region_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_region", serde_json::json!({"region_id": 10000002}))
+                .await?;
+            assert_eq!(r["_key"], 10000002);
+            assert_eq!(r["name"], "The Forge");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_constellation_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_constellation",
+                    serde_json::json!({"constellation_id": 20000020}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 16228);
-        assert!(r["activities"]["manufacturing"].is_object());
+                .await?;
+            assert_eq!(r["_key"], 20000020);
+            assert_eq!(r["name"], "Kimotoro");
+            seam.shutdown().await
+        }
 
-        // sde_get_blueprint_for_product (Ferox blueprint makes Ferox)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_blueprint_for_product")
-                        .with_arguments(obj(serde_json::json!({"product_type_id": 16227}))),
+        #[tokio::test]
+        async fn get_npc_station_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_npc_station",
+                    serde_json::json!({"station_id": 60003760}),
                 )
-                .await?,
-        );
-        assert_eq!(r["blueprint"]["_key"], 16228);
-        assert_eq!(r["activity"], "manufacturing");
+                .await?;
+            assert_eq!(r["_key"], 60003760);
+            assert_eq!(r["solarSystemID"], 30000142);
+            seam.shutdown().await
+        }
 
-        // sde_get_solar_system (by ID)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_solar_system")
-                        .with_arguments(obj(serde_json::json!({"system_id": 30000142}))),
+        #[tokio::test]
+        async fn find_route_returns_the_shortest_stargate_path() -> anyhow::Result<()> {
+            // Jita → Perimeter is 1 jump.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_route",
+                    serde_json::json!({
+                        "from_system_id": 30000142,
+                        "to_system_id": 30000144,
+                    }),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 30000142);
-        assert_eq!(r["name"], "Jita");
+                .await?;
+            assert_eq!(r["jumps"], 1);
+            assert_eq!(r["path"].as_array().unwrap().len(), 2);
+            assert_eq!(r["path"][0], 30000142);
+            assert_eq!(r["path"][1], 30000144);
+            seam.shutdown().await
+        }
 
-        // sde_search_solar_systems
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_search_solar_systems")
-                        .with_arguments(obj(serde_json::json!({"query": "jita"}))),
-                )
-                .await?,
-        );
-        assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
-
-        // sde_get_region (by ID)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_region")
-                        .with_arguments(obj(serde_json::json!({"region_id": 10000002}))),
-                )
-                .await?,
-        );
-        assert_eq!(r["_key"], 10000002);
-        assert_eq!(r["name"], "The Forge");
-
-        // sde_get_constellation
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_constellation")
-                        .with_arguments(obj(serde_json::json!({"constellation_id": 20000020}))),
-                )
-                .await?,
-        );
-        assert_eq!(r["_key"], 20000020);
-        assert_eq!(r["name"], "Kimotoro");
-
-        // sde_get_npc_station
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_npc_station")
-                        .with_arguments(obj(serde_json::json!({"station_id": 60003760}))),
-                )
-                .await?,
-        );
-        assert_eq!(r["_key"], 60003760);
-        assert_eq!(r["solarSystemID"], 30000142);
-
-        // sde_find_route: Jita → Perimeter (1 jump)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_find_route").with_arguments(obj(
-                        serde_json::json!({
-                            "from_system_id": 30000142,
-                            "to_system_id": 30000144,
-                        }),
-                    )),
-                )
-                .await?,
-        );
-        assert_eq!(r["jumps"], 1);
-        assert_eq!(r["path"].as_array().unwrap().len(), 2);
-        assert_eq!(r["path"][0], 30000142);
-        assert_eq!(r["path"][1], 30000144);
-
-        // sde_find_route: unreachable system → error response (Ikuchi has no stargates)
-        let err = client
-            .call_tool(
-                CallToolRequestParams::new("sde_find_route").with_arguments(obj(
+        #[tokio::test]
+        async fn find_route_errors_when_no_path_exists() -> anyhow::Result<()> {
+            // Ikuchi has no stargates in the fixture, so it is unreachable.
+            let seam = Seam::boot().await?;
+            let err = seam
+                .try_call(
+                    "sde_find_route",
                     serde_json::json!({
                         "from_system_id": 30000142,
                         "to_system_id": 30000138,
                     }),
-                )),
-            )
-            .await;
-        assert!(err.is_err(), "expected error for unreachable system");
-
-        // sde_get_market_group
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_market_group")
-                        .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 1857);
-        assert_eq!(r["name"], "Minerals");
+                .await;
+            assert!(err.is_err(), "expected error for unreachable system");
+            seam.shutdown().await
+        }
 
-        // sde_get_market_group_tree (Minerals → Materials → Manufacture & Research)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_market_group_tree")
-                        .with_arguments(obj(serde_json::json!({"market_group_id": 1857}))),
+        #[tokio::test]
+        async fn get_market_group_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_market_group",
+                    serde_json::json!({"market_group_id": 1857}),
                 )
-                .await?,
-        );
-        let arr = r.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["_key"], 475); // root: Manufacture & Research
-        assert_eq!(arr[2]["_key"], 1857); // leaf: Minerals
+                .await?;
+            assert_eq!(r["_key"], 1857);
+            assert_eq!(r["name"], "Minerals");
+            seam.shutdown().await
+        }
 
-        // sde_get_dogma_attribute
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_dogma_attribute")
-                        .with_arguments(obj(serde_json::json!({"attribute_id": 30}))),
+        #[tokio::test]
+        async fn get_market_group_tree_returns_root_to_leaf_ancestry() -> anyhow::Result<()> {
+            // Minerals → Materials → Manufacture & Research.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_market_group_tree",
+                    serde_json::json!({"market_group_id": 1857}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 30);
-        assert_eq!(r["name"], "power");
+                .await?;
+            let arr = r.as_array().unwrap();
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0]["_key"], 475); // root: Manufacture & Research
+            assert_eq!(arr[2]["_key"], 1857); // leaf: Minerals
+            seam.shutdown().await
+        }
 
-        // sde_get_dogma_effect
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_dogma_effect")
-                        .with_arguments(obj(serde_json::json!({"effect_id": 11}))),
+        #[tokio::test]
+        async fn get_dogma_attribute_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_dogma_attribute",
+                    serde_json::json!({"attribute_id": 30}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 11);
-        assert_eq!(r["name"], "loPower");
+                .await?;
+            assert_eq!(r["_key"], 30);
+            assert_eq!(r["name"], "power");
+            seam.shutdown().await
+        }
 
-        // sde_get_faction
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_faction")
-                        .with_arguments(obj(serde_json::json!({"faction_id": 500001}))),
+        #[tokio::test]
+        async fn get_dogma_effect_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_dogma_effect", serde_json::json!({"effect_id": 11}))
+                .await?;
+            assert_eq!(r["_key"], 11);
+            assert_eq!(r["name"], "loPower");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_faction_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_faction", serde_json::json!({"faction_id": 500001}))
+                .await?;
+            assert_eq!(r["_key"], 500001);
+            assert_eq!(r["name"], "Caldari State");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_npc_corporation_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_npc_corporation",
+                    serde_json::json!({"corporation_id": 1000035}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 500001);
-        assert_eq!(r["name"], "Caldari State");
+                .await?;
+            assert_eq!(r["_key"], 1000035);
+            assert_eq!(r["name"], "Caldari Navy");
+            seam.shutdown().await
+        }
 
-        // sde_get_npc_corporation
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_npc_corporation")
-                        .with_arguments(obj(serde_json::json!({"corporation_id": 1000035}))),
+        #[tokio::test]
+        async fn get_skin_returns_the_record_for_an_id() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_skin", serde_json::json!({"skin_id": 50}))
+                .await?;
+            assert_eq!(r["_key"], 50);
+            assert_eq!(r["internalName"], "Ferox Caldari Union Day YC124");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_skill_plan_merges_multiple_targets_into_one_plan() -> anyhow::Result<()> {
+            // Covetor + ORE Deep Core Strip Miner → one merged plan.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_skill_plan",
+                    serde_json::json!({
+                        "targets": [{"type_id": 17476}, {"type_id": 87562}]
+                    }),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 1000035);
-        assert_eq!(r["name"], "Caldari Navy");
+                .await?;
+            let plan = r["plan"].as_array().unwrap();
+            // Mining deduped to level 5 (module demands 5), prereqs before dependents.
+            assert_eq!(plan[0]["skill_id"], 3386);
+            assert_eq!(plan[0]["required_level"], 5);
+            assert_eq!(plan[0]["sp_for_level"], 256000);
+            assert_eq!(plan[0]["required_by"].as_array().unwrap().len(), 2);
+            assert_eq!(plan.last().unwrap()["skill_id"], 17940); // Mining Barge last
+            assert_eq!(r["total_sp"], 312000);
+            seam.shutdown().await
+        }
 
-        // sde_get_skin
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_skin")
-                        .with_arguments(obj(serde_json::json!({"skin_id": 50}))),
+        #[tokio::test]
+        async fn get_modifiers_by_attribute_lists_every_owning_type() -> anyhow::Result<()> {
+            // Direction-b: what modifies miningAmount (77).
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_modifiers", serde_json::json!({"attribute_id": 77}))
+                .await?;
+            let mods = r["modified_by"].as_array().unwrap();
+            // One row per owning type: effect 391 is owned by BOTH Mining (3386) and
+            // Astrogeology (3410), each granting +5% via its own attr 434. The old code
+            // collapsed this to a single "Mining" row and hid Astrogeology entirely.
+            assert!(mods.iter().any(|m| m["source_type_id"] == 3386
+                && m["source_type_name"] == "Mining"
+                && m["magnitude"] == 5.0));
+            assert!(
+                mods.iter().any(|m| m["source_type_id"] == 3410
+                    && m["source_type_name"] == "Astrogeology"
+                    && m["magnitude"] == 5.0),
+                "Astrogeology must surface as a yield source"
+            );
+            // operation_name decodes op 6 as percent so the +5 isn't read as flat m³.
+            assert!(mods.iter().any(|m| {
+                m["source_type_id"] == 3410
+                    && m["operation"] == 6
+                    && m["operation_name"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("postPercent"))
+            }));
+            // The skillTypeID filter is now a distinct field, not mislabeled as the source.
+            assert!(
+                mods.iter()
+                    .all(|m| m["skill_type_id"].is_null() && m["skill_name"].is_null()),
+                "old skill_type_id/skill_name keys removed (renamed to required_skill_*)"
+            );
+            assert!(
+                mods.iter()
+                    .any(|m| m["required_skill_id"] == 3386 && m["required_skill_name"] == "Mining")
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_modifiers_by_type_lists_outgoing_modifiers() -> anyhow::Result<()> {
+            // Direction-a: the Mining skill's outgoing modifiers.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_modifiers", serde_json::json!({"type_id": 3386}))
+                .await?;
+            assert!(
+                r["modifies"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["modified_attribute_id"] == 77)
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_modifiers_by_effect_returns_raw_modifier_info() -> anyhow::Result<()> {
+            // Direction-c: a dogma effect's raw modifierInfo.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_modifiers", serde_json::json!({"effect_id": 391}))
+                .await?;
+            let m = &r["modifiers"][0];
+            assert_eq!(m["modified_attribute_id"], 77);
+            assert_eq!(m["modifying_attribute_id"], 434);
+            assert_eq!(m["skill_type_id"], 3386);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_batch_flags_missing_ids() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_types",
+                    serde_json::json!({"type_ids": [34, 999999]}),
                 )
-                .await?,
-        );
-        assert_eq!(r["_key"], 50);
-        assert_eq!(r["internalName"], "Ferox Caldari Union Day YC124");
+                .await?;
+            let arr = r.as_array().unwrap();
+            assert_eq!(arr[0]["found"], true);
+            assert_eq!(arr[0]["type"]["name"], "Tritanium");
+            assert_eq!(arr[1]["found"], false);
+            seam.shutdown().await
+        }
 
-        // sde_get_skill_plan: Covetor + ORE Deep Core Strip Miner → one merged plan
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_skill_plan").with_arguments(obj(
-                        serde_json::json!({
-                            "targets": [{"type_id": 17476}, {"type_id": 87562}]
-                        }),
-                    )),
+        #[tokio::test]
+        async fn resolve_types_maps_ids_and_names_in_both_directions() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_resolve_types",
+                    serde_json::json!({"type_ids": [87562], "names": ["Covetor", "Mining"]}),
                 )
-                .await?,
-        );
-        let plan = r["plan"].as_array().unwrap();
-        // Mining deduped to level 5 (module demands 5), prereqs before dependents.
-        assert_eq!(plan[0]["skill_id"], 3386);
-        assert_eq!(plan[0]["required_level"], 5);
-        assert_eq!(plan[0]["sp_for_level"], 256000);
-        assert_eq!(plan[0]["required_by"].as_array().unwrap().len(), 2);
-        assert_eq!(plan.last().unwrap()["skill_id"], 17940); // Mining Barge last
-        assert_eq!(r["total_sp"], 312000);
+                .await?;
+            assert_eq!(r["by_id"][0]["name"], "ORE Deep Core Strip Miner");
+            assert_eq!(r["by_name"][0]["type_id"], 17476);
+            assert_eq!(r["by_name"][1]["type_id"], 3386);
+            seam.shutdown().await
+        }
 
-        // sde_get_modifiers direction-b: what modifies miningAmount (77)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_modifiers")
-                        .with_arguments(obj(serde_json::json!({"attribute_id": 77}))),
-                )
-                .await?,
-        );
-        let mods = r["modified_by"].as_array().unwrap();
-        // One row per owning type: effect 391 is owned by BOTH Mining (3386) and
-        // Astrogeology (3410), each granting +5% via its own attr 434. The old code
-        // collapsed this to a single "Mining" row and hid Astrogeology entirely.
-        assert!(mods.iter().any(|m| m["source_type_id"] == 3386
-            && m["source_type_name"] == "Mining"
-            && m["magnitude"] == 5.0));
-        assert!(
-            mods.iter().any(|m| m["source_type_id"] == 3410
-                && m["source_type_name"] == "Astrogeology"
-                && m["magnitude"] == 5.0),
-            "Astrogeology must surface as a yield source"
-        );
-        // operation_name decodes op 6 as percent so the +5 isn't read as flat m³.
-        assert!(mods.iter().any(|m| {
-            m["source_type_id"] == 3410
-                && m["operation"] == 6
-                && m["operation_name"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("postPercent"))
-        }));
-        // The skillTypeID filter is now a distinct field, not mislabeled as the source.
-        assert!(
-            mods.iter()
-                .all(|m| m["skill_type_id"].is_null() && m["skill_name"].is_null()),
-            "old skill_type_id/skill_name keys removed (renamed to required_skill_*)"
-        );
-        assert!(
-            mods.iter()
-                .any(|m| m["required_skill_id"] == 3386 && m["required_skill_name"] == "Mining")
-        );
-
-        // sde_get_modifiers direction-a: Mining skill's outgoing modifiers
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_modifiers")
-                        .with_arguments(obj(serde_json::json!({"type_id": 3386}))),
-                )
-                .await?,
-        );
-        assert!(
-            r["modifies"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["modified_attribute_id"] == 77)
-        );
-
-        // sde_get_modifiers direction-c: a dogma effect's raw modifierInfo
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_modifiers")
-                        .with_arguments(obj(serde_json::json!({"effect_id": 391}))),
-                )
-                .await?,
-        );
-        let m = &r["modifiers"][0];
-        assert_eq!(m["modified_attribute_id"], 77);
-        assert_eq!(m["modifying_attribute_id"], 434);
-        assert_eq!(m["skill_type_id"], 3386);
-
-        // sde_get_type_dogma resolve_names: decode Mining Barge prereqs
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_type_dogma").with_arguments(obj(
-                        serde_json::json!({"type_id": 17940, "resolve_names": true}),
-                    )),
-                )
-                .await?,
-        );
-        let attrs = r["dogmaAttributes"].as_array().unwrap();
-        assert!(
-            attrs
-                .iter()
-                .any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology"
-                    && a["requiredSkill"]["level"] == 3)
-        );
-
-        // sde_get_types batch with a missing id
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_types")
-                        .with_arguments(obj(serde_json::json!({"type_ids": [34, 999999]}))),
-                )
-                .await?,
-        );
-        let arr = r.as_array().unwrap();
-        assert_eq!(arr[0]["found"], true);
-        assert_eq!(arr[0]["type"]["name"], "Tritanium");
-        assert_eq!(arr[1]["found"], false);
-
-        // sde_resolve_types both directions
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_resolve_types").with_arguments(obj(
-                        serde_json::json!({"type_ids": [87562], "names": ["Covetor", "Mining"]}),
-                    )),
-                )
-                .await?,
-        );
-        assert_eq!(r["by_id"][0]["name"], "ORE Deep Core Strip Miner");
-        assert_eq!(r["by_name"][0]["type_id"], 17476);
-        assert_eq!(r["by_name"][1]["type_id"], 3386);
-
-        // sde_get_skill_sp by type_id (Astrogeology = rank 3)
-        let r = text_json(
-            &client
-                .call_tool(
-                    CallToolRequestParams::new("sde_get_skill_sp")
-                        .with_arguments(obj(serde_json::json!({"type_id": 3410}))),
-                )
-                .await?,
-        );
-        assert_eq!(r["rank"], 3);
-        let lvls = r["levels"].as_array().unwrap();
-        assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
-        assert_eq!(lvls[4]["sp_to_reach"], 768000); // rank3 L5 = 3 × 256000
-        assert_eq!(lvls[4]["increment"], 768000 - 3 * 45255);
-
-        client.cancel().await?;
-        let _ = server_handle.await;
-        Ok(())
+        #[tokio::test]
+        async fn get_skill_sp_returns_the_full_curve_for_a_skill() -> anyhow::Result<()> {
+            // Astrogeology is rank 3.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_skill_sp", serde_json::json!({"type_id": 3410}))
+                .await?;
+            assert_eq!(r["rank"], 3);
+            let lvls = r["levels"].as_array().unwrap();
+            assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
+            assert_eq!(lvls[4]["sp_to_reach"], 768000); // rank3 L5 = 3 × 256000
+            assert_eq!(lvls[4]["increment"], 768000 - 3 * 45255);
+            seam.shutdown().await
+        }
     }
 
     #[test]
