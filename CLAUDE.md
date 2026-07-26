@@ -4,8 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Skills
 
-- `/ccpm` — use for all delivery work: writing PRDs, decomposing epics, syncing GitHub issues, checking status, running standups, completing numbered tasks
-- `/rust-best-practices` — always consult when writing new Rust code, reviewing ownership/borrowing patterns, or implementing error handling
+- `sde` — how to read the EVE Static Data Export: JSON Lines layout, per-file schemas, ID/name resolution, dogma, blueprints, the map. Consult before touching scanning or query code for an SDE file you haven't worked with.
+- `sde-vs-esi` — decide whether a piece of data belongs to the SDE or to ESI. Read this first whenever a request could plausibly want live/character data; this server only serves static data.
+- `esi` — ESI API discipline (auth, caching, error limits). Only relevant for judging what stays out of scope here.
+- `domain-modeling` — maintaining `CONTEXT.md` and `docs/adr/`; use when introducing or renaming domain terms, or recording an architectural decision.
+- `tdd` — for new tools and bug fixes; tests use `tempfile` JSONL fixtures (see "Important constraints").
+- `diagnosing-bugs` — for reported breakage, scan/parse failures, or startup performance regressions.
+
+Delivery work is tracked in GitHub Issues, not in a planning skill — see "Agent skills" below.
 
 ## Commands
 
@@ -59,7 +65,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 - `scan_index` uses `memchr::memmem` for fast byte-pattern matching to extract `_key` and `name.en` without full JSON parsing — the hot path for startup.
 - Tests use `tempfile` JSONL fixtures; the `scan_index_pub` re-export in `scan.rs` exists solely to expose the private function to tests in `tools/server.rs`.
 
-## Agent skills
+## Agent conventions
 
 ### Issue tracker
 
