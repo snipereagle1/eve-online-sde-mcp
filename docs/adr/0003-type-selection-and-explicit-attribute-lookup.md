@@ -147,6 +147,15 @@ schedule working, not an omission to fix.
   request and 128Mi limit. The added indexes are `attribute_types` (~7.4 MB),
   `groupID` + `metaGroupID` extracted in the existing `types.jsonl` memmem pass
   (~0.9 MB, +40 ms), and a dogma text corpus for `sde_search_dogma` (<1 MB).
+
+  Measured after #41: the `types.jsonl` pass costs +23 ms against that +40 ms
+  budget, and the taxonomy indexes come to ~1.35 MB against the ~0.9 MB line
+  item. The gap is the published-Type set, which the line item never sited —
+  `published_only` has to apply before the limit, which means answering it over
+  the whole match set, which means membership in memory rather than a seek per
+  candidate. It is a budgeting omission, not index drift. The worst rollup in
+  the build is category 11 at 391 Groups: 5.9 ms and 32 KB, of which ~25 KB is
+  rollup, and #42 adds to that same envelope.
 - `manufacturing.rs::meta_group_of` stops doing a seek + read + full JSON parse
   per Type and becomes an O(1) map hit — a side win on deep production chains.
 - `query.rs::search_by_name` changes from *iterate `HashMap` → take(limit)* to
