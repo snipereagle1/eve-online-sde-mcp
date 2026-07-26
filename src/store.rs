@@ -7,10 +7,6 @@ pub(crate) struct SdeIndex {
     pub(crate) name_index: HashMap<String, u64>,
 }
 
-/// One entry from a dogma effect's `modifierInfo` array, flattened with the
-/// effect it came from. Built into the reverse index `attribute_modifiers`
-/// (keyed by `modified_attribute_id`) at scan time so "which skills/ships modify
-/// attribute Y" is an O(1) lookup with no prose parsing.
 /// Which blueprint activity yields a product. Manufacturing and reaction are the
 /// two activities that have `products`; they are mutually exclusive per product
 /// (the mfg-product and reaction-product sets are disjoint in the SDE), so a single
@@ -40,6 +36,10 @@ pub(crate) struct BlueprintRef {
     pub(crate) activity: Activity,
 }
 
+/// One entry from a dogma effect's `modifierInfo` array, flattened with the
+/// effect it came from. Built into the reverse index `attribute_modifiers`
+/// (keyed by `modified_attribute_id`) at scan time so "which skills/ships modify
+/// attribute Y" is an O(1) lookup with no prose parsing.
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ModifierRef {
     pub(crate) effect_id: u64,
