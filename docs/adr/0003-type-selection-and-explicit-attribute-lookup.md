@@ -106,7 +106,22 @@ were considered, and `attribute_default`, echoing the DefaultValue. A row is
 
 Calling with no predicate at all is an error naming the available predicates,
 never a full dump — naming only the ones that already work, so the message stays
-truthful as later passes extend it.
+truthful as later passes extend it. That message is also the one place stating
+which predicates **produce** a candidate set (`attribute`, `group_ids`,
+`category_ids`) and which only **narrow** one (`meta_group_ids`,
+`published_only`, and later `query` / `type_ids`). Any other text needing that
+distinction — over-broad-query guidance, tool descriptions — should derive from
+it rather than restate it, or the two drift the next time a predicate is added.
+
+**Self-description keys are present exactly when the thing they describe ran,
+and omitted otherwise — never null, never empty.** `attribute_semantics` appears
+only under an attribute predicate; `excluded_no_meta_group` appears only under a
+MetaGroup filter, including as a `0`. This is what lets a zero read as "nothing
+you asked about was unclassifiable" rather than "no filter ran"; emitting the key
+always would collapse those two into one ambiguous value. Any later
+self-description — empty-result pointers, truncation guidance — follows the same
+rule, and any count it quotes reads `total_matched`, never `returned`, for the
+same reason the `groups` rollup does.
 
 The contract above is the finished shape, not the shape after any one ticket. It
 is delivered by #40 (`attribute`, `limit`, and the `total_matched` / `returned` /
