@@ -165,5 +165,14 @@ schedule working, not an omission to fix.
   but `"jump fatigue"` — the phrasing an agent reaches for first — finds nothing
   by name and only resolves via `"Jump Fatigue Multiplier"` / `"Multiplier for
   jump fatigue distance"`.
+- A `sde_find_types` call costs one O(1) seek for the queried attribute's
+  `DefaultValue` plus one per returned row. Caching the 2,141 defaults in memory
+  would remove exactly one seek of a default-limit query's 101, so it is not
+  worth a fourth custom scanner over `dogmaAttributes.jsonl` on its own — but
+  `sde_search_dogma` has to hold every attribute's name, `displayName` and
+  `description` in memory anyway, at which point `defaultValue` rides along for
+  nearly nothing. It belongs with that corpus, not before it. Revisit if
+  multiple simultaneous attribute predicates land, since the seek count then
+  scales with predicate count.
 - Deferred, not rejected: multiple simultaneous attribute predicates, offset
   pagination, and `effect_ids` projection.
