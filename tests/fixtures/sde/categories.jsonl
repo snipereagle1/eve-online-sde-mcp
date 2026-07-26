@@ -1,4 +1,7 @@
-{"_key": 4, "name": {"en": "Material"}, "published": true}
-{"_key": 6, "name": {"en": "Ship"}, "published": true}
-{"_key": 9, "name": {"en": "Blueprint"}, "published": true}
-{"_key": 25, "name": {"en": "Asteroid"}, "published": true}
+{"_key": 4, "name": {"de": "Material", "en": "Material", "es": "Material", "fr": "Matériau", "ja": "資源", "ko": "자원", "ru": "Материал", "zh": "材料"}, "published": true}
+{"_key": 6, "name": {"de": "Schiff", "en": "Ship", "es": "Nave", "fr": "Vaisseau", "ja": "艦船", "ko": "함선", "ru": "Корабль", "zh": "舰船"}, "published": true}
+{"_key": 7, "name": {"de": "Modul", "en": "Module", "es": "Módulo", "fr": "Module", "ja": "モジュール", "ko": "모듈", "ru": "Модуль", "zh": "装备"}, "published": true}
+{"_key": 9, "name": {"de": "Blueprint", "en": "Blueprint", "es": "Plano", "fr": "Plan de construction", "ja": "ブループリント", "ko": "블루프린트", "ru": "Чертеж", "zh": "蓝图"}, "published": true}
+{"_key": 16, "name": {"de": "Skill", "en": "Skill", "es": "Habilidad", "fr": "Compétence", "ja": "スキル", "ko": "스킬", "ru": "Навык", "zh": "技能"}, "published": true}
+{"_key": 18, "name": {"de": "Drohne", "en": "Drone", "es": "Dron", "fr": "Drone", "ja": "ドローン", "ko": "드론", "ru": "Дрон", "zh": "无人机"}, "published": true}
+{"_key": 25, "name": {"de": "Asteroid", "en": "Asteroid", "es": "Asteroide", "fr": "Astéroïde", "ja": "アステロイド", "ko": "소행성", "ru": "Астероид", "zh": "小行星"}, "published": true}

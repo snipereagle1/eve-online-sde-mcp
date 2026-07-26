@@ -38,7 +38,10 @@ pub fn fetch_at_offset(path: &Path, offset: u64) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(line.trim())?)
 }
 
-const LANG_CODES: &[&str] = &["en", "de", "fr", "ja", "ko", "ru", "zh"];
+/// Every language the SDE ships, per `translationLanguages.jsonl`. `is_localized`
+/// requires a map's keys to be a subset of these, so a missing code makes every
+/// real record look non-localized and silently disables `--language` entirely.
+const LANG_CODES: &[&str] = &["en", "de", "es", "fr", "ja", "ko", "ru", "zh"];
 
 pub fn apply_language_filter(value: &mut Value, lang: &str) {
     match value {
@@ -148,6 +151,23 @@ mod tests {
         });
         apply_language_filter(&mut val, "ja");
         assert_eq!(val["name"], "Tritanium");
+    }
+
+    #[test]
+    fn apply_language_filter_handles_all_eight_sde_languages() {
+        // The real SDE ships de/en/es/fr/ja/ko/ru/zh. A code missing from
+        // LANG_CODES makes `is_localized` reject every production record, so the
+        // filter turns into a no-op against real data while passing on any
+        // fixture that happens to omit that language.
+        let mut val = serde_json::json!({
+            "name": {
+                "de": "Mineralien", "en": "Mineral", "es": "Mineral",
+                "fr": "Minéral", "ja": "無機物", "ko": "광물",
+                "ru": "Минералы", "zh": "矿物"
+            }
+        });
+        apply_language_filter(&mut val, "en");
+        assert_eq!(val["name"], "Mineral");
     }
 
     #[test]
