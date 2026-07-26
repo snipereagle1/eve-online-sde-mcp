@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memchr::memmem;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -25,8 +25,9 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         .progress_chars("#>-"),
     );
 
-    let types = scan_index(&root.join("types.jsonl"), &pb)?;
-    let groups = scan_index(&root.join("groups.jsonl"), &pb)?;
+    let (types, type_group, group_types, published_types) =
+        scan_types(&root.join("types.jsonl"), &pb)?;
+    let (groups, category_groups) = scan_groups(&root.join("groups.jsonl"), &pb)?;
     let categories = scan_index(&root.join("categories.jsonl"), &pb)?;
     let (blueprints, product_to_blueprint) = scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
@@ -80,6 +81,10 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         attribute_modifiers,
         effect_to_types,
         attribute_types,
+        type_group,
+        group_types,
+        category_groups,
+        published_types,
     }))
 }
 
@@ -110,6 +115,18 @@ pub fn scan_blueprints_pub(
 }
 
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
+    scan_index_with(path, pb, |_, _| {})
+}
+
+/// The generic memmem pass, with a hook that sees every keyed line. Files that
+/// need a derived map on top of `id`/`name` ride along here rather than reading
+/// the file a second time — the whole point of the memmem approach is one pass.
+/// `on_line` is called with the `_key` and the trimmed line bytes.
+fn scan_index_with(
+    path: &Path,
+    pb: &ProgressBar,
+    mut on_line: impl FnMut(u64, &[u8]),
+) -> Result<SdeIndex> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -141,6 +158,7 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
         }
         if let Some(key) = extract_key(trimmed) {
             id_index.insert(key, line_start);
+            on_line(key, trimmed);
         }
         if let Some(name) = extract_name_en(trimmed) {
             name_index.insert(name.to_lowercase(), line_start);
@@ -153,6 +171,82 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
         id_index,
         name_index,
     })
+}
+
+type TypesScan = (
+    SdeIndex,
+    HashMap<u32, u32>,
+    HashMap<u32, Vec<u32>>,
+    HashSet<u32>,
+);
+
+/// Scan types.jsonl into the usual id/name indexes plus the Group taxonomy that
+/// `sde_find_types` filters and rolls up on: `type_group`, its inverse
+/// `group_types`, and the set of published Types.
+///
+/// `groupID` and `published` ride along in this pass rather than being seeked per
+/// Type at query time, because both are needed for the **whole** match set:
+/// `published_only` has to apply before the limit, and the `groups` rollup has to
+/// count every match rather than the returned page. Per-Type seeks would cost
+/// 11,836 reads for a single Category.
+fn scan_types(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
+    let mut type_group: HashMap<u32, u32> = HashMap::new();
+    let mut group_types: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut published_types: HashSet<u32> = HashSet::new();
+
+    let index = scan_index_with(path, pb, |key, line| {
+        // Types and Groups are keyed `u32` here to match `attribute_types`; a
+        // `_key` beyond that range would be a schema change, and dropping it beats
+        // truncating it onto another Type.
+        let (Ok(type_id), Some(Ok(group_id))) = (
+            u32::try_from(key),
+            extract_number_field(line, b"\"groupID\":").map(u32::try_from),
+        ) else {
+            return;
+        };
+        type_group.insert(type_id, group_id);
+        group_types.entry(group_id).or_default().push(type_id);
+        // Only a literal `true` enrolls a Type. Every Type in build 3444265
+        // carries the field, so a missing one is unknown provenance and must not
+        // slip past a `published_only` filter.
+        if extract_bool_field(line, b"\"published\":") == Some(true) {
+            published_types.insert(type_id);
+        }
+    })?;
+
+    // Sorted once here, like `attribute_types`, so a taxonomy query inherits a
+    // stable ascending type_id order instead of re-sorting per call.
+    for types in group_types.values_mut() {
+        types.sort_unstable();
+    }
+
+    Ok((index, type_group, group_types, published_types))
+}
+
+/// Scan groups.jsonl into the usual indexes plus `categoryID -> groups`. A
+/// Category owns no Types directly, so `category_ids` resolves downward through
+/// this map — the lookup the SDE's own records only express upward.
+fn scan_groups(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u32, Vec<u32>>)> {
+    let mut category_groups: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    let index = scan_index_with(path, pb, |key, line| {
+        let (Ok(group_id), Some(Ok(category_id))) = (
+            u32::try_from(key),
+            extract_number_field(line, b"\"categoryID\":").map(u32::try_from),
+        ) else {
+            return;
+        };
+        category_groups
+            .entry(category_id)
+            .or_default()
+            .push(group_id);
+    })?;
+
+    for groups in category_groups.values_mut() {
+        groups.sort_unstable();
+    }
+
+    Ok((index, category_groups))
 }
 
 fn scan_blueprints(
@@ -561,9 +655,31 @@ fn scan_stargates(path: &Path, pb: &ProgressBar) -> Result<HashMap<u64, Vec<u64>
 }
 
 fn extract_key(line: &[u8]) -> Option<u64> {
-    let pos = memmem::find(line, b"\"_key\":")?;
-    let rest = line[pos + 7..].trim_ascii_start();
-    parse_u64_prefix(rest)
+    extract_number_field(line, b"\"_key\":")
+}
+
+/// Read an unsigned integer field out of a raw JSONL line. `field` carries its own
+/// opening quote (`"groupID":`), which is what keeps it from matching
+/// `marketGroupID`; a JSON string can never contain an unescaped `"`, so the
+/// needle cannot be found inside a localized name or description either.
+fn extract_number_field(line: &[u8], field: &[u8]) -> Option<u64> {
+    let pos = memmem::find(line, field)?;
+    parse_u64_prefix(line[pos + field.len()..].trim_ascii_start())
+}
+
+/// As [`extract_number_field`], for a JSON boolean. Returns `None` when the field
+/// is absent or holds something other than `true`/`false`, leaving the caller to
+/// decide what absence means.
+fn extract_bool_field(line: &[u8], field: &[u8]) -> Option<bool> {
+    let pos = memmem::find(line, field)?;
+    let rest = line[pos + field.len()..].trim_ascii_start();
+    if rest.starts_with(b"true") {
+        Some(true)
+    } else if rest.starts_with(b"false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn extract_name_en(line: &[u8]) -> Option<String> {

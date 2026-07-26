@@ -877,6 +877,10 @@ mod tests {
             attribute_modifiers: HashMap::new(),
             effect_to_types: HashMap::new(),
             attribute_types: HashMap::new(),
+            type_group: HashMap::new(),
+            group_types: HashMap::new(),
+            category_groups: HashMap::new(),
+            published_types: std::collections::HashSet::new(),
         };
         Fixtures {
             _keep: vec![f1, f2, f3],

@@ -231,6 +231,15 @@ pub struct FindTypesParam {
     /// attribute's DefaultValue are never returned — see the response's
     /// `attribute_semantics`.
     pub attribute: Option<AttributePredicate>,
+    /// Restrict to Types belonging to any of these Groups (e.g. 898 Black Ops).
+    pub group_ids: Option<Vec<u64>>,
+    /// Restrict to Types whose Group belongs to any of these Categories (e.g. 6
+    /// Ship). Combined with `group_ids` it narrows further: both must hold.
+    pub category_ids: Option<Vec<u64>>,
+    /// Drop unpublished Types. Applied before `limit`, so asking for N published
+    /// Types returns N when N exist. Narrows a candidate set; it cannot be the
+    /// only predicate.
+    pub published_only: Option<bool>,
     /// Maximum rows to return (default: 100, capped at 1000). Predicates apply to
     /// the whole candidate set first, so `total_matched` is the real count even
     /// when `truncated` is true.
@@ -361,12 +370,198 @@ impl SdeMcpServer {
     /// the surviving page. Kept off the `#[tool]` method so the growing predicate
     /// set stays testable as a plain function.
     fn find_types(&self, p: &FindTypesParam) -> Result<FindTypesResult, ErrorData> {
-        let Some(pred) = p.attribute.as_ref() else {
-            return Err(ErrorData::invalid_params(
-                "sde_find_types needs at least one predicate; available: attribute {id, op?, value?}",
-                None,
-            ));
+        let group_filter = self.resolve_group_filter(p)?;
+        let mut attribute_default = None;
+
+        // The candidate set comes from the narrowest index that any predicate
+        // names — the attribute inverted index when there is an attribute
+        // predicate, the Group index when the call is taxonomy-only. Each index is
+        // stored ascending at scan time, so filtering preserves the order that
+        // truncation then cuts.
+        let mut matched: Candidates = match (p.attribute.as_ref(), &group_filter) {
+            (Some(pred), _) => {
+                let (rows, default_value) = self.attribute_candidates(pred)?;
+                attribute_default = default_value;
+                rows
+            }
+            (None, Some(groups)) => {
+                let mut candidates: Candidates = groups
+                    .iter()
+                    .flat_map(|g| self.store.group_types.get(g).into_iter().flatten())
+                    .map(|&type_id| (type_id, None))
+                    .collect();
+                // Each Group's run is already ascending from scan time, so one
+                // Group needs no sort; a union of several interleaves them and does.
+                // `sort → truncate` is the ADR's own order, and it is what makes
+                // `truncated` honest about which rows were cut.
+                if groups.len() > 1 {
+                    candidates.sort_unstable_by_key(|&(type_id, _)| type_id);
+                }
+                candidates
+            }
+            (None, None) => {
+                return Err(ErrorData::invalid_params(
+                    "sde_find_types needs at least one predicate; available: attribute \
+                     {id, op?, value?}, group_ids, category_ids",
+                    None,
+                ));
+            }
         };
+
+        // Every remaining predicate is answered from an in-memory index, so filtering
+        // the *whole* match set costs a hash lookup per candidate rather than a
+        // seek and parse. That is what lets `published_only` apply before the limit
+        // — a request for N published Types returns N when N exist — and what lets
+        // the rollup below count matches instead of returned rows.
+        let published_only = p.published_only.unwrap_or(false);
+        if group_filter.is_some() || published_only {
+            matched.retain(|&(type_id, _)| {
+                let in_group = group_filter.as_ref().is_none_or(|groups| {
+                    self.store
+                        .type_group
+                        .get(&type_id)
+                        .is_some_and(|g| groups.contains(g))
+                });
+                in_group && (!published_only || self.store.published_types.contains(&type_id))
+            });
+        }
+
+        let limit = p
+            .limit
+            .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
+            .min(MAX_FIND_TYPES_LIMIT) as usize;
+        let total_matched = matched.len();
+        let types: Vec<FoundType> = matched
+            .iter()
+            .take(limit)
+            .map(|&(type_id, value)| {
+                let record = query::fetch_by_id(&self.store.types, type_id as u64).ok();
+                FoundType {
+                    type_id: type_id as u64,
+                    // Deliberately a single-language string even when the server
+                    // runs in all-languages mode (`--language` unset), unlike every
+                    // other tool. A selector row exists to be scanned, and eight
+                    // language variants cost ~5× per row for zero selection value;
+                    // callers escalate to sde_get_types for the full record. Do not
+                    // "fix" this to match the other tools.
+                    name: record
+                        .as_ref()
+                        .and_then(|r| pick_name(r.get("name"), self.language.as_deref())),
+                    group_id: record
+                        .as_ref()
+                        .and_then(|r| r.get("groupID").and_then(|g| g.as_u64())),
+                    value,
+                }
+            })
+            .collect();
+
+        Ok(FindTypesResult {
+            returned: types.len(),
+            truncated: total_matched > types.len(),
+            types,
+            total_matched,
+            groups: self.roll_up_groups(&matched),
+            attribute_semantics: p
+                .attribute
+                .as_ref()
+                .map(|_| ATTRIBUTE_SEMANTICS.to_string()),
+            attribute_default,
+        })
+    }
+
+    /// Count the Groups across the **full** match set — every Type the predicates
+    /// admitted, not the page that survived `limit`. Deriving this from the
+    /// returned rows would describe 100 of category 91's 11,836 Types as if they
+    /// were the taxonomy, which is the whole reason the rollup exists.
+    ///
+    /// Costs one hash lookup per match plus one record read per *distinct* Group
+    /// (391 at worst in build 3444265, for category 11).
+    fn roll_up_groups(&self, matched: &Candidates) -> Vec<GroupRollup> {
+        let mut counts: HashMap<Option<u32>, u64> = HashMap::new();
+        for &(type_id, _) in matched {
+            let group_id = self.store.type_group.get(&type_id).copied();
+            *counts.entry(group_id).or_default() += 1;
+        }
+
+        let mut rollup: Vec<GroupRollup> = counts
+            .into_iter()
+            .map(|(group_id, count)| GroupRollup {
+                group_id: group_id.map(u64::from),
+                name: group_id.and_then(|g| {
+                    let record = query::fetch_by_id(&self.store.groups, u64::from(g)).ok()?;
+                    pick_name(record.get("name"), self.language.as_deref())
+                }),
+                count,
+            })
+            .collect();
+        // Biggest Group first — the shape of a Category is the question this
+        // answers — with the ID as a tiebreak so repeated calls agree.
+        rollup.sort_unstable_by_key(|g| (std::cmp::Reverse(g.count), g.group_id));
+        rollup
+    }
+
+    /// The Groups a call is restricted to, or `None` when it names no taxonomy
+    /// predicate. `group_ids` and `category_ids` AND like every other predicate, so
+    /// both collapse into one Group set: a Category contributes its Groups, and
+    /// naming both keeps only the Groups satisfying each. An undeclared ID is an
+    /// error rather than an empty answer — a confidently empty result for a typo'd
+    /// ID is the failure this tool exists to end.
+    fn resolve_group_filter(&self, p: &FindTypesParam) -> Result<Option<HashSet<u32>>, ErrorData> {
+        let named_groups = p.group_ids.as_deref().unwrap_or_default();
+        let named_categories = p.category_ids.as_deref().unwrap_or_default();
+        if named_groups.is_empty() && named_categories.is_empty() {
+            return Ok(None);
+        }
+
+        let mut groups = HashSet::new();
+        for &id in named_groups {
+            let group_id = u32::try_from(id)
+                .ok()
+                .filter(|_| self.store.groups.id_index.contains_key(&id))
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("group {id} not found in groups"), None)
+                })?;
+            groups.insert(group_id);
+        }
+
+        let mut from_categories = HashSet::new();
+        for &id in named_categories {
+            let category_id = u32::try_from(id)
+                .ok()
+                .filter(|_| self.store.categories.id_index.contains_key(&id))
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        format!("category {id} not found in categories"),
+                        None,
+                    )
+                })?;
+            // A declared Category with no Groups is not an error, just an empty
+            // answer — unlike an undeclared one, which is a caller mistake.
+            from_categories.extend(
+                self.store
+                    .category_groups
+                    .get(&category_id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+
+        if named_groups.is_empty() {
+            return Ok(Some(from_categories));
+        }
+        if !named_categories.is_empty() {
+            groups.retain(|g| from_categories.contains(g));
+        }
+        Ok(Some(groups))
+    }
+
+    /// The `(type_id, ExplicitValue)` rows an attribute predicate admits, plus the
+    /// DogmaAttribute's DefaultValue for the envelope to echo.
+    fn attribute_candidates(
+        &self,
+        pred: &AttributePredicate,
+    ) -> Result<(Candidates, Option<f64>), ErrorData> {
         let op = AttributeOp::parse(pred.op.as_deref())?;
         let want = op.operand(pred.value)?;
 
@@ -391,51 +586,15 @@ impl SdeMcpServer {
 
         // `attribute_types` is already sorted by type_id at scan time, so the
         // filtered run inherits that order and repeated calls agree.
-        let matched: Vec<(u32, f32)> = rows
+        let matched = rows
             .map(|v| v.as_slice())
             .unwrap_or_default()
             .iter()
             .copied()
             .filter(|&(_, value)| op.admits(value, want, default_value))
+            .map(|(type_id, value)| (type_id, Some(value)))
             .collect();
-
-        let limit = p
-            .limit
-            .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
-            .min(MAX_FIND_TYPES_LIMIT) as usize;
-        let total_matched = matched.len();
-        let types: Vec<FoundType> = matched
-            .into_iter()
-            .take(limit)
-            .map(|(type_id, value)| {
-                let record = query::fetch_by_id(&self.store.types, type_id as u64).ok();
-                FoundType {
-                    type_id: type_id as u64,
-                    // Deliberately a single-language string even when the server
-                    // runs in all-languages mode (`--language` unset), unlike every
-                    // other tool. A selector row exists to be scanned, and eight
-                    // language variants cost ~5× per row for zero selection value;
-                    // callers escalate to sde_get_types for the full record. Do not
-                    // "fix" this to match the other tools.
-                    name: record
-                        .as_ref()
-                        .and_then(|r| pick_name(r.get("name"), self.language.as_deref())),
-                    group_id: record
-                        .as_ref()
-                        .and_then(|r| r.get("groupID").and_then(|g| g.as_u64())),
-                    value: Some(value),
-                }
-            })
-            .collect();
-
-        Ok(FindTypesResult {
-            returned: types.len(),
-            truncated: total_matched > types.len(),
-            types,
-            total_matched,
-            attribute_semantics: Some(ATTRIBUTE_SEMANTICS.to_string()),
-            attribute_default: default_value,
-        })
+        Ok((matched, default_value))
     }
 
     /// Direction-a: a type's outgoing modifiers — for each effect it carries, the
@@ -814,7 +973,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value. This is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); published_only drops unpublished Types. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
     )]
     async fn sde_find_types(
         &self,
@@ -1398,6 +1557,11 @@ const MAX_SKILL_DEPTH: usize = 12;
 
 const DEFAULT_FIND_TYPES_LIMIT: u64 = 100;
 
+/// The working match set: a Type ID plus, when an attribute predicate supplied
+/// one, the ExplicitValue it matched on. Held as `f32` end to end so `1.92` stays
+/// `1.92` rather than becoming its f64 widening.
+type Candidates = Vec<(u32, Option<f32>)>;
+
 /// Hard ceiling on rows per call. A caller asking for more is clamped rather than
 /// refused: `total_matched` still reports the true size and `truncated` still says
 /// the page is partial, so the answer stays honest. Category 91 holds 11,836 Types
@@ -1422,14 +1586,27 @@ pub(crate) struct FoundType {
     value: Option<f32>,
 }
 
+/// One Group in a `sde_find_types` rollup. `group_id` and `name` are optional for
+/// the same reason `FoundType`'s are: a Type reachable through an index but absent
+/// from `types.jsonl` still has to be counted, or the rollup would stop summing to
+/// `total_matched`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct GroupRollup {
+    group_id: Option<u64>,
+    name: Option<String>,
+    count: u64,
+}
+
 /// The `sde_find_types` envelope. `total_matched` counts the whole match set, not
-/// the returned page, so a truncated answer still reports the true size.
+/// the returned page, so a truncated answer still reports the true size. `groups`
+/// counts that same full match set — see [`SdeMcpServer::roll_up_groups`].
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct FindTypesResult {
     types: Vec<FoundType>,
     total_matched: usize,
     returned: usize,
     truncated: bool,
+    groups: Vec<GroupRollup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attribute_semantics: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1955,6 +2132,10 @@ mod tests {
             attribute_modifiers: HashMap::new(),
             effect_to_types: HashMap::new(),
             attribute_types: HashMap::new(),
+            type_group: HashMap::new(),
+            group_types: HashMap::new(),
+            category_groups: HashMap::new(),
+            published_types: HashSet::new(),
         }
     }
 
@@ -3594,6 +3775,288 @@ mod tests {
             assert!(format!("{}", r.unwrap_err()).contains("not_default"));
             seam.shutdown().await
         }
+
+        #[tokio::test]
+        async fn find_types_lists_the_types_in_a_group() -> anyhow::Result<()> {
+            // "All Black Ops hulls" — group 898 holds three fixture Types. A Group
+            // record names none of its Types, so before this predicate the question
+            // had no answer at all.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"group_ids": [898]}))
+                .await?;
+            assert_eq!(ids_of(&r), vec![22428, 22430, 85236]);
+            assert_eq!(r["total_matched"], 3);
+            assert_eq!(r["truncated"], false);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_unions_several_groups_in_type_id_order() -> anyhow::Result<()> {
+            // Groups 898 and 28 are named highest-first and hold interleaving ID
+            // ranges, so a union that just concatenated the two scan-time runs
+            // would come back out of order — and truncation would then drop
+            // whichever rows the set happened to iterate last.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [898, 28]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![648, 651, 22428, 22430, 85236]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_lists_a_category_through_its_groups() -> anyhow::Result<()> {
+            // "All ships": category 6 owns no Types directly — it reaches them
+            // through groups 27, 28, 419, 463 and 898.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"category_ids": [6]}))
+                .await?;
+            assert_eq!(
+                ids_of(&r),
+                vec![638, 648, 651, 16227, 17476, 22428, 22430, 85236]
+            );
+            assert_eq!(r["total_matched"], 8);
+
+            // Several Categories at once, spanning three Groups across two of them.
+            let several = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [18, 25]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&several), vec![1202, 1230, 2456, 3218, 10248, 10252]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_ands_the_group_and_category_filters() -> anyhow::Result<()> {
+            // Group 27 Battleship is a Ship, group 101 Mining Drone is not. Naming
+            // both Groups and category 6 must keep only the Battleship — the
+            // predicates AND, they do not union into "ships or mining drones".
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [27, 101], "category_ids": [6]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![638]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_errors_on_an_undeclared_group_or_category() -> anyhow::Result<()> {
+            // Same contract as an undeclared attribute: a typo'd taxonomy ID must
+            // not come back as a confident empty answer.
+            let seam = Seam::boot().await?;
+            let group = seam
+                .try_call("sde_find_types", serde_json::json!({"group_ids": [999999]}))
+                .await;
+            assert!(group.is_err());
+            assert!(format!("{}", group.unwrap_err()).contains("999999"));
+
+            let category = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [999999]}),
+                )
+                .await;
+            assert!(category.is_err());
+            assert!(format!("{}", category.unwrap_err()).contains("999999"));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_published_only_applies_before_the_limit() -> anyhow::Result<()> {
+            // Groups 101 and 898 hold 1202, 3218, 10248, 10252, 22428, 22430, 85236
+            // in that order, and 10248/10252 are unpublished. Filtering after the
+            // limit would take the first four, discard two of them and answer a
+            // request for four published Types with two.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [101, 898], "published_only": true, "limit": 4
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218, 22428, 22430]);
+            assert_eq!(r["returned"], 4);
+            assert_eq!(r["total_matched"], 5);
+            assert_eq!(r["truncated"], true);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_composes_taxonomy_with_the_attribute_predicate() -> anyhow::Result<()> {
+            // "Ships with a non-default jump fatigue multiplier" — the query the
+            // ADR was written for — in one call rather than a client-side join.
+            // Attribute 1971 is also carried by nothing outside category 6 here, so
+            // group 898 is what proves the taxonomy half is doing work.
+            let seam = Seam::boot().await?;
+            let ships = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "attribute": {"id": 1971, "op": "not_default"}, "category_ids": [6]
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&ships), vec![648, 651, 22428, 22430, 85236]);
+
+            let black_ops = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "attribute": {"id": 1971, "op": "not_default"}, "group_ids": [898]
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&black_ops), vec![22428, 22430, 85236]);
+            // The ExplicitValue still rides along, and the envelope still states
+            // which semantics produced the rows.
+            assert_eq!(black_ops["types"][0]["value"], 0.25);
+            assert_eq!(black_ops["attribute_default"], 1.0);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_published_only_narrows_an_attribute_predicate() -> anyhow::Result<()> {
+            // Attribute 64 is stored by two unpublished mining drones. `published_only`
+            // has to reach the attribute candidate set too, not just the taxonomy one.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 64}, "published_only": true}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 2456, 3218]);
+            assert_eq!(r["total_matched"], 3);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_published_only_is_not_a_predicate_on_its_own() -> anyhow::Result<()> {
+            // It narrows a candidate set; it cannot produce one. Accepting it alone
+            // would dump every published Type under the guise of a filtered query.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"published_only": true}),
+                )
+                .await;
+            assert!(r.is_err(), "published_only alone must not dump every Type");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rolls_up_the_groups_it_matched() -> anyhow::Result<()> {
+            // Group 18 Mineral holds eight Types and nothing else does, so the
+            // rollup is one named row that accounts for every match.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"group_ids": [18]}))
+                .await?;
+            assert_eq!(
+                r["groups"],
+                serde_json::json!([{"group_id": 18, "name": "Mineral", "count": 8}])
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rollup_counts_the_full_match_set_not_the_page() -> anyhow::Result<()> {
+            // Two of category 6's eight Ships are returned, and they sit in groups
+            // 27 and 28. A rollup derived from the returned rows would report a
+            // two-Group Category; the real answer is five Groups totalling eight,
+            // and reporting the page as the taxonomy is the specific failure this
+            // rollup replaces `list_groups_in_category` to avoid.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [6], "limit": 2}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![638, 648]);
+            assert_eq!(r["truncated"], true);
+            assert_eq!(
+                r["groups"],
+                serde_json::json!([
+                    {"group_id": 898, "name": "Black Ops", "count": 3},
+                    {"group_id": 28, "name": "Hauler", "count": 2},
+                    {"group_id": 27, "name": "Battleship", "count": 1},
+                    {"group_id": 419, "name": "Combat Battlecruiser", "count": 1},
+                    {"group_id": 463, "name": "Mining Barge", "count": 1},
+                ])
+            );
+            let summed: u64 = r["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g["count"].as_u64().unwrap())
+                .sum();
+            assert_eq!(summed, r["total_matched"].as_u64().unwrap());
+            assert_ne!(summed, r["returned"].as_u64().unwrap());
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rolls_up_an_attribute_only_result() -> anyhow::Result<()> {
+            // "Which Groups carry an ExplicitValue for 1971" answered as a
+            // by-product, with no taxonomy predicate in the call at all.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}}),
+                )
+                .await?;
+            assert_eq!(
+                r["groups"],
+                serde_json::json!([
+                    {"group_id": 898, "name": "Black Ops", "count": 3},
+                    {"group_id": 28, "name": "Hauler", "count": 2},
+                ])
+            );
+            seam.shutdown().await
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_category_resolution() {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".local/share/eve-sde-mcp");
+        let store = crate::scan::scan_sde(&dir, 3444265, "x").unwrap();
+        eprintln!("groups declared: {}", store.groups.id_index.len());
+
+        // What the epic's "resolve through groups.jsonl" costs per query: there is
+        // no categoryID index, so finding a Category's Groups means reading and
+        // parsing every Group record.
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut hits = 0usize;
+            for &gid in store.groups.id_index.keys() {
+                if let Ok(v) = crate::tools::query::fetch_by_id(&store.groups, gid) {
+                    if v.get("categoryID").and_then(|c| c.as_u64()) == Some(6) {
+                        hits += 1;
+                    }
+                }
+            }
+            eprintln!("seek+parse every Group for category 6: {:?} ({hits} groups)", t.elapsed());
+        }
+        let t = std::time::Instant::now();
+        let n = store.category_groups.get(&6).map(|g| g.len()).unwrap_or(0);
+        eprintln!("category_groups lookup: {:?} ({n} groups)", t.elapsed());
     }
 
     #[test]

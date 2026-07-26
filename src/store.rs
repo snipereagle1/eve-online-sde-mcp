@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub(crate) struct SdeIndex {
@@ -88,4 +88,25 @@ pub(crate) struct SdeStore {
     /// ~5 MB. Type and attribute IDs are far inside `u32`, and dogma values are
     /// `f32` in EVE's own engine.
     pub(crate) attribute_types: HashMap<u32, Vec<(u32, f32)>>,
+    /// typeID -> its Group. Type↔Group is held in both directions because
+    /// `sde_find_types` needs each one for a different job: this way for filtering
+    /// and rolling up a candidate set that came from somewhere else, `group_types`
+    /// for producing one. Extracted in the existing `types.jsonl` memmem pass, so
+    /// a predicate over the full match set never costs a seek and parse per Type —
+    /// a single DogmaAttribute can match 5,921 Types and a Category 11,836.
+    pub(crate) type_group: HashMap<u32, u32>,
+    /// groupID -> the Types in it, ascending. The candidate set for a taxonomy-only
+    /// `sde_find_types` call, sorted once at scan time exactly like
+    /// `attribute_types`.
+    pub(crate) group_types: HashMap<u32, Vec<u32>>,
+    /// categoryID -> the Groups under it, ascending. A Category owns no Types
+    /// directly; it resolves downward through its Groups, read from the already
+    /// scanned `groups.jsonl`.
+    pub(crate) category_groups: HashMap<u32, Vec<u32>>,
+    /// The published Types, same pass. Membership rather than a per-Type flag, so
+    /// a Type missing from `types.jsonl` is simply absent — `published_only` must
+    /// admit only Types known to be published, never merely not-known-unpublished.
+    /// Near enough half the SDE either way (26,983 of 52,821 in build 3444265), so
+    /// there is no smaller side to store.
+    pub(crate) published_types: HashSet<u32>,
 }
