@@ -148,14 +148,35 @@ schedule working, not an omission to fix.
   `groupID` + `metaGroupID` extracted in the existing `types.jsonl` memmem pass
   (~0.9 MB, +40 ms), and a dogma text corpus for `sde_search_dogma` (<1 MB).
 
-  Measured after #41: the `types.jsonl` pass costs +23 ms against that +40 ms
-  budget, and the taxonomy indexes come to ~1.35 MB against the ~0.9 MB line
-  item. The gap is the published-Type set, which the line item never sited —
-  `published_only` has to apply before the limit, which means answering it over
-  the whole match set, which means membership in memory rather than a seek per
-  candidate. It is a budgeting omission, not index drift. The worst rollup in
-  the build is category 11 at 391 Groups: 5.9 ms and 32 KB, of which ~25 KB is
-  rollup, and #42 adds to that same envelope.
+  Measured after #41 (release builds, `/usr/bin/time -v`, three runs, against a
+  baseline worktree with #40 but not #41): peak RSS 29.0 → 30.2 MiB, **+1.1 MiB**,
+  with no measurable change in wall-clock startup. The `types.jsonl` pass costs
+  78 ms against 55 ms for a plain `scan_index` — **+23 ms** against the budgeted
+  +40. No drift signal. The worst rollup in the build is category 11 at 391
+  Groups: 5.9 ms and 32 KB, of which ~25 KB is rollup; #42 adds to that same
+  envelope.
+
+- The store gained two fields beyond the four enumerated above, both for the
+  same reason the taxonomy indexes exist — a predicate that applies to the
+  **full** match set must not cost a seek and parse per candidate:
+
+  `category_groups` (categoryID → its Groups, 47 entries). "Resolve through
+  `groups.jsonl`" works for a known Group, because `id_index` is `groupID →
+  offset`; a Category filter runs the other way and there is no `categoryID`
+  index, so answering it from the existing index means seek + parse of all 1,609
+  Group records. Measured: **26 ms per query versus 882 ns** for the map. That
+  is this ADR's own rejected-option argument one level down — the table scan was
+  rejected not on latency but because `src/http.rs` serves concurrent clients
+  and scans serialise on CPU where a map hit does not.
+
+  `published_types` (the 26,983 published Types, ~0.25 MiB). Membership rather
+  than a flag folded into `type_group`, which would have been free in that
+  value's padding: `type_group` should stay Type→Group so that #42's sparse
+  `type_meta_group` sits beside it rather than widening a tuple, and a set is
+  read as what its name says. Stored as the published side, not the smaller one
+  — the split is 51/49 so there is no smaller side, and storing the unpublished
+  side would make a Type absent from `types.jsonl` read as *published*, which is
+  the wrong direction for a filter whose job is excluding junk.
 - `manufacturing.rs::meta_group_of` stops doing a seek + read + full JSON parse
   per Type and becomes an O(1) map hit — a side win on deep production chains.
 - `query.rs::search_by_name` changes from *iterate `HashMap` → take(limit)* to
