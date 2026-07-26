@@ -51,6 +51,36 @@ pub(crate) struct ModifierRef {
     pub(crate) skill_type_id: Option<u64>,
 }
 
+/// One searchable DogmaAttribute or DogmaEffect: its ID and the English text
+/// `sde_search_dogma` matches a substring against.
+///
+/// Held as text rather than as a byte offset — the one index here that is not an
+/// offset — because the search spans three fields, and `SdeIndex::name_index` can
+/// only key one exact string per record. It is also the only way these two files
+/// are searchable at all: they store `name` as a bare string rather than the
+/// `{"en": …}` map `extract_name_en` needs, so their `name_index` is empty.
+///
+/// English only. A localized field contributes its `en`, and the corpus stays at
+/// the budgeted ~1 MB; carrying all eight SDE languages would multiply it by eight
+/// to serve a step whose output is an ID.
+#[derive(Debug)]
+pub(crate) struct DogmaText {
+    pub(crate) id: u32,
+    /// The camelCase identifier (`jumpFatigueMultiplier`), which is why matching
+    /// `name` alone is not enough: no spaced phrase occurs in one.
+    pub(crate) name: Option<String>,
+    /// The human label ("Jump Fatigue Multiplier"). Genuinely absent on some
+    /// records — attributes 277/278 and effects 16/132/391 carry none — so a hit
+    /// reports the fields it actually matched rather than assuming three exist.
+    pub(crate) display_name: Option<String>,
+    pub(crate) description: Option<String>,
+    /// The DogmaAttribute's DefaultValue, and always `None` across the effect
+    /// corpus: a DogmaEffect has no DefaultValue. It rides along here rather than
+    /// justifying a scanner of its own because this corpus already holds a record
+    /// per attribute — see ADR 0003's Consequences.
+    pub(crate) default_value: Option<f64>,
+}
+
 pub(crate) struct SdeStore {
     pub(crate) data_dir: PathBuf,
     pub(crate) build: u64,
@@ -117,4 +147,11 @@ pub(crate) struct SdeStore {
     /// Near enough half the SDE either way (26,983 of 52,821 in build 3444265), so
     /// there is no smaller side to store.
     pub(crate) published_types: HashSet<u32>,
+    /// The DogmaAttribute text corpus `sde_search_dogma` scans, ascending by ID so
+    /// a query's answer is ordered the same way in every process — `HashMap`
+    /// iteration order is not stable across runs, and this list is walked whole.
+    pub(crate) dogma_attribute_text: Vec<DogmaText>,
+    /// The DogmaEffect half of the same corpus, so one call can answer a term the
+    /// caller cannot yet classify as an attribute or an effect.
+    pub(crate) dogma_effect_text: Vec<DogmaText>,
 }

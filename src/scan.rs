@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::{Activity, BlueprintRef, ModifierRef, SdeIndex, SdeStore};
+use crate::store::{Activity, BlueprintRef, DogmaText, ModifierRef, SdeIndex, SdeStore};
 
 const SDE_FILE_COUNT: u64 = 17;
 
@@ -38,8 +38,9 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let stargate_graph = scan_stargates(&root.join("mapStargates.jsonl"), &pb)?;
     let npc_stations = scan_index(&root.join("npcStations.jsonl"), &pb)?;
     let market_groups = scan_index(&root.join("marketGroups.jsonl"), &pb)?;
-    let dogma_attributes = scan_index(&root.join("dogmaAttributes.jsonl"), &pb)?;
-    let (dogma_effects, attribute_modifiers) =
+    let (dogma_attributes, dogma_attribute_text) =
+        scan_dogma_attributes(&root.join("dogmaAttributes.jsonl"), &pb)?;
+    let (dogma_effects, attribute_modifiers, dogma_effect_text) =
         scan_dogma_effects(&root.join("dogmaEffects.jsonl"), &pb)?;
     let factions = scan_index(&root.join("factions.jsonl"), &pb)?;
     let npc_corporations = scan_index(&root.join("npcCorporations.jsonl"), &pb)?;
@@ -85,6 +86,8 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         type_meta_group: types.type_meta_group,
         category_groups,
         published_types: types.published_types,
+        dogma_attribute_text,
+        dogma_effect_text,
     }))
 }
 
@@ -276,6 +279,83 @@ fn scan_groups(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u32, 
     }
 
     Ok((index, category_groups))
+}
+
+/// Scan dogmaAttributes.jsonl into the usual id/name indexes plus the attribute
+/// half of the `sde_search_dogma` text corpus. Rides the existing memmem pass — no
+/// second read of the file, and no new file scanned — but each line is also fully
+/// parsed by the hook, which is affordable here and nowhere else: 2,141 records
+/// against `types.jsonl`'s 52,821.
+///
+/// `defaultValue` is carried along with the text rather than seeked per query, per
+/// ADR 0003: it costs nothing once a record per attribute is resident anyway.
+fn scan_dogma_attributes(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, Vec<DogmaText>)> {
+    /// The dogmaAttributes text fields. `name` and `description` are bare strings
+    /// here while `displayName` is a localized map — the asymmetry
+    /// [`en_text`] exists to absorb — so all three are read as untyped values.
+    #[derive(serde::Deserialize)]
+    struct AttributeText {
+        name: Option<serde_json::Value>,
+        #[serde(rename = "displayName")]
+        display_name: Option<serde_json::Value>,
+        description: Option<serde_json::Value>,
+        #[serde(rename = "defaultValue")]
+        default_value: Option<f64>,
+    }
+
+    let mut corpus: Vec<DogmaText> = Vec::new();
+    let mut parse_failures = 0u64;
+    let index = scan_index_with(path, pb, |key, line| {
+        let parsed = match serde_json::from_slice::<AttributeText>(line) {
+            Ok(parsed) => parsed,
+            // Counted rather than swallowed, like the other custom scanners: a
+            // schema drift here would empty the corpus and make `sde_search_dogma`
+            // answer "no such attribute" for every query — the failure this whole
+            // tool exists to end, arriving silently.
+            Err(_) => {
+                parse_failures += 1;
+                return;
+            }
+        };
+        let Ok(id) = u32::try_from(key) else { return };
+        corpus.push(DogmaText {
+            id,
+            name: en_text(parsed.name.as_ref()),
+            display_name: en_text(parsed.display_name.as_ref()),
+            description: en_text(parsed.description.as_ref()),
+            default_value: parsed.default_value,
+        });
+    })?;
+
+    if parse_failures > 0 {
+        tracing::warn!(
+            "{}: {parse_failures} dogmaAttributes line(s) failed to parse; \
+             sde_search_dogma cannot see them (possible SDE schema change)",
+            path.display()
+        );
+    }
+
+    corpus.sort_unstable_by_key(|record| record.id);
+    Ok((index, corpus))
+}
+
+/// The English text of a dogma name, label or description, whichever of the two
+/// shapes the SDE writes it in: a bare string (`dogmaAttributes.name` and
+/// `.description`) or a localized map (`dogmaAttributes.displayName`,
+/// `dogmaEffects.displayName` and `.description`). Taking either per field means
+/// the corpus does not encode which file a record came from, and neither file's
+/// shape is assumed — the assumption the empty `name_index` on these two files came
+/// from in the first place.
+///
+/// An empty string is dropped rather than stored: it is not searchable text, and a
+/// hit reporting it as the field that matched would be a lie.
+fn en_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = match value? {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(map) => map.get("en")?.as_str()?,
+        _ => return None,
+    };
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn scan_blueprints(
@@ -525,15 +605,18 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<TypeDogmaScan> {
     ))
 }
 
-/// Scan dogmaEffects.jsonl into both the id→offset index (like every other file)
-/// and a reverse modifier map keyed by `modifiedAttributeID`. Mirrors
-/// `scan_blueprints`'s tuple-returning, typed-inner-struct pattern. `modifierInfo`
-/// ships as a real JSON array (verified against build 3396210), so it deserializes
-/// straight into `Vec<RawMod>` with no inner-string parsing.
-fn scan_dogma_effects(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, Vec<ModifierRef>>)> {
+/// Scan dogmaEffects.jsonl into the id→offset index (like every other file), a
+/// reverse modifier map keyed by `modifiedAttributeID`, and the effect half of the
+/// `sde_search_dogma` text corpus. Mirrors `scan_blueprints`'s tuple-returning,
+/// typed-inner-struct pattern. `modifierInfo` ships as a real JSON array (verified
+/// against build 3396210), so it deserializes straight into `Vec<RawMod>` with no
+/// inner-string parsing.
+///
+/// The corpus rides this pass because it already full-parses every line: the text
+/// costs three more fields on `Line`, not another read of the file.
+type DogmaEffectsScan = (SdeIndex, HashMap<u64, Vec<ModifierRef>>, Vec<DogmaText>);
+
+fn scan_dogma_effects(path: &Path, pb: &ProgressBar) -> Result<DogmaEffectsScan> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -547,6 +630,14 @@ fn scan_dogma_effects(
         key: u64,
         #[serde(rename = "modifierInfo")]
         modifier_info: Option<Vec<RawMod>>,
+        // Untyped for the same reason as in `scan_dogma_attributes`, and it is not
+        // the same asymmetry: an effect's `name` is a bare string like an
+        // attribute's, but its `description` is a localized map where the
+        // attribute's is a bare string.
+        name: Option<serde_json::Value>,
+        #[serde(rename = "displayName")]
+        display_name: Option<serde_json::Value>,
+        description: Option<serde_json::Value>,
     }
     #[derive(serde::Deserialize)]
     struct RawMod {
@@ -565,6 +656,7 @@ fn scan_dogma_effects(
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut attribute_modifiers: HashMap<u64, Vec<ModifierRef>> = HashMap::new();
+    let mut corpus: Vec<DogmaText> = Vec::new();
     let mut buf = String::new();
     let mut offset = 0u64;
     let mut parse_failures = 0u64;
@@ -595,6 +687,17 @@ fn scan_dogma_effects(
             }
         };
         id_index.insert(parsed.key, line_start);
+        if let Ok(id) = u32::try_from(parsed.key) {
+            corpus.push(DogmaText {
+                id,
+                name: en_text(parsed.name.as_ref()),
+                display_name: en_text(parsed.display_name.as_ref()),
+                description: en_text(parsed.description.as_ref()),
+                // A DogmaEffect has no DefaultValue; only the attribute half of the
+                // corpus ever carries one.
+                default_value: None,
+            });
+        }
         for m in parsed.modifier_info.into_iter().flatten() {
             // A modifier with no target attribute can't be reverse-indexed; skip it.
             let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
@@ -623,6 +726,8 @@ fn scan_dogma_effects(
         );
     }
 
+    corpus.sort_unstable_by_key(|record| record.id);
+
     pb.inc(1);
     Ok((
         SdeIndex {
@@ -631,6 +736,7 @@ fn scan_dogma_effects(
             name_index: HashMap::new(),
         },
         attribute_modifiers,
+        corpus,
     ))
 }
 
@@ -1018,7 +1124,7 @@ mod tests {
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
-        let (idx, mods) = scan_dogma_effects(&path, &pb).unwrap();
+        let (idx, mods, _) = scan_dogma_effects(&path, &pb).unwrap();
 
         assert!(idx.id_index.contains_key(&391));
         assert!(

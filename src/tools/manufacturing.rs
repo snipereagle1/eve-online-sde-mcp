@@ -892,6 +892,8 @@ mod tests {
             type_meta_group: types.type_meta_group,
             category_groups: HashMap::new(),
             published_types: types.published_types,
+            dogma_attribute_text: Vec::new(),
+            dogma_effect_text: Vec::new(),
         };
         Fixtures {
             _keep: vec![f1, f2, f3],

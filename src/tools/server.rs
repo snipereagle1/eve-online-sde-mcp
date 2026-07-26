@@ -251,6 +251,19 @@ pub struct FindTypesParam {
     pub limit: Option<u64>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchDogmaParam {
+    /// Substring to look for, matched case-insensitively against the name, display
+    /// name and description of every DogmaAttribute and DogmaEffect. Spaced
+    /// phrases work: "jump fatigue" finds jumpFatigueMultiplier through its display
+    /// name even though the camelCase identifier holds no space.
+    pub query: String,
+    /// Maximum hits per list (default: 25, capped at 200). Attributes and effects
+    /// are limited separately, so a term matching many attributes still shows its
+    /// effects — the point of searching both in one call.
+    pub limit: Option<u64>,
+}
+
 // ── Server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -625,6 +638,74 @@ impl SdeMcpServer {
             .map(|(type_id, value)| (type_id, Some(value)))
             .collect();
         Ok((matched, default_value))
+    }
+
+    /// `sde_search_dogma`: substring-match the scan-time text corpus, ordered and
+    /// truncated per list. No file is read here — the corpus is resident, which is
+    /// what lets all three fields of all ~6,300 records be searched per call.
+    fn search_dogma(&self, p: &SearchDogmaParam) -> Result<SearchDogmaResult, ErrorData> {
+        // An empty needle is inside every string, so it would answer with a capped
+        // page of the whole corpus and no way to tell that from a real result.
+        let query = p.query.trim();
+        if query.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "sde_search_dogma needs a non-empty query; an empty substring matches \
+                 every DogmaAttribute and DogmaEffect",
+                None,
+            ));
+        }
+        let limit = p
+            .limit
+            .unwrap_or(DEFAULT_SEARCH_DOGMA_LIMIT)
+            .min(MAX_SEARCH_DOGMA_LIMIT) as usize;
+
+        let mut attributes: Vec<DogmaAttributeHit> = matching_records(
+            &self.store.dogma_attribute_text,
+            query,
+            |record, matched_fields| DogmaAttributeHit {
+                attribute_id: u64::from(record.id),
+                name: record.name.clone(),
+                display_name: record.display_name.clone(),
+                description: record.description.clone(),
+                matched_fields,
+                default_value: record.default_value,
+                // Always present, including as a zero: "nothing records this
+                // attribute" is the answer that saves the caller a reverse lookup,
+                // and it is the same index `sde_find_types` selects from, so the
+                // two cannot disagree.
+                explicit_type_count: self
+                    .store
+                    .attribute_types
+                    .get(&record.id)
+                    .map_or(0, |rows| rows.len() as u64),
+            },
+        );
+        let mut effects: Vec<DogmaEffectHit> = matching_records(
+            &self.store.dogma_effect_text,
+            query,
+            |record, matched_fields| DogmaEffectHit {
+                effect_id: u64::from(record.id),
+                name: record.name.clone(),
+                display_name: record.display_name.clone(),
+                description: record.description.clone(),
+                matched_fields,
+            },
+        );
+
+        let attributes_matched = attributes.len();
+        let effects_matched = effects.len();
+        attributes.truncate(limit);
+        effects.truncate(limit);
+
+        Ok(SearchDogmaResult {
+            attributes_returned: attributes.len(),
+            effects_returned: effects.len(),
+            truncated: attributes_matched > attributes.len() || effects_matched > effects.len(),
+            attributes,
+            effects,
+            attributes_matched,
+            effects_matched,
+        })
     }
 
     /// Direction-a: a type's outgoing modifiers — for each effect it carries, the
@@ -1478,6 +1559,17 @@ impl SdeMcpServer {
         )
     }
 
+    #[tool(
+        description = "Find DogmaAttributes and DogmaEffects by name — the first step of any dogma question, since every other dogma tool wants an ID. One call searches both, returned as separate `attributes` and `effects` lists, so you do not have to know in advance which one a term names. The query is a case-insensitive substring matched against each record's name, display name and description, and each hit reports which of those matched: attribute names are camelCase identifiers, so \"jump fatigue\" finds jumpFatigueMultiplier only through its display name \"Jump Fatigue Multiplier\" — searching the name alone would find nothing. Each attribute hit also carries default_value, the DefaultValue every Type without an ExplicitValue for it holds, and explicit_type_count, how many Types record an ExplicitValue for it — feed the attribute ID to sde_find_types to list them, or skip that call when the count is 0. Both lists are capped independently; attributes_matched / effects_matched report the true totals."
+    )]
+    async fn sde_search_dogma(
+        &self,
+        Parameters(p): Parameters<SearchDogmaParam>,
+    ) -> Result<String, ErrorData> {
+        let result = self.search_dogma(&p)?;
+        Ok(serde_json::to_string(&result).unwrap())
+    }
+
     #[tool(description = "Get a dogma effect by its effect ID")]
     async fn sde_get_dogma_effect(
         &self,
@@ -1663,6 +1755,148 @@ pub(crate) struct FindTypesResult {
     attribute_semantics: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attribute_default: Option<f64>,
+}
+
+// ── sde_search_dogma ─────────────────────────────────────────────────────────
+
+/// Per list, not per call: a term matching 40 attributes must not crowd its
+/// effects out of the answer, or searching both in one call buys nothing.
+const DEFAULT_SEARCH_DOGMA_LIMIT: u64 = 25;
+
+/// Hard ceiling per list. Hits carry three text fields, so a page is ~10× the size
+/// of a `sde_find_types` row; a caller asking for more is clamped rather than
+/// refused, and `attributes_matched` / `effects_matched` still report the true
+/// count so a narrower query is the obvious next move.
+const MAX_SEARCH_DOGMA_LIMIT: u64 = 200;
+
+/// The fields a `sde_search_dogma` hit can match on, in the order they are
+/// reported. A record carrying none of the query's fields never becomes a hit; a
+/// record missing a field simply cannot list it, which is how a hit on attribute
+/// 277 (no `displayName` at all) reports `["description"]` and nothing else.
+const DOGMA_TEXT_FIELDS: [&str; 3] = ["name", "display_name", "description"];
+
+/// Every corpus record the query matches, built into `T` by `into_hit` and ordered
+/// name-matches-first, then ascending by ID.
+///
+/// The tiers matter under truncation: a name hit is the identifier the caller is
+/// looking for, while a description hit is often incidental, and burying the former
+/// behind a lower-numbered instance of the latter is how a search gets read as
+/// "not in the SDE". Within a tier the corpus's scan-time ID order survives,
+/// because [`slice::sort_by_key`] is stable — so repeated calls, and calls in
+/// different processes, agree.
+fn matching_records<T>(
+    corpus: &[crate::store::DogmaText],
+    query: &str,
+    mut into_hit: impl FnMut(&crate::store::DogmaText, Vec<&'static str>) -> T,
+) -> Vec<T>
+where
+    T: HasMatchedFields,
+{
+    let mut hits: Vec<T> = corpus
+        .iter()
+        .filter_map(|record| {
+            let fields = [
+                record.name.as_deref(),
+                record.display_name.as_deref(),
+                record.description.as_deref(),
+            ];
+            let matched: Vec<&'static str> = DOGMA_TEXT_FIELDS
+                .iter()
+                .zip(fields)
+                .filter(|(_, text)| text.is_some_and(|t| contains_ignore_case(t, query)))
+                .map(|(field, _)| *field)
+                .collect();
+            (!matched.is_empty()).then(|| into_hit(record, matched))
+        })
+        .collect();
+
+    hits.sort_by_key(|hit| u8::from(hit.matched_fields().first() != Some(&"name")));
+    hits
+}
+
+/// Lets [`matching_records`] rank the two hit shapes without either of them
+/// growing a sort key field that would then be serialized onto the wire.
+trait HasMatchedFields {
+    fn matched_fields(&self) -> &[&'static str];
+}
+
+/// ASCII case-insensitive substring test, allocating nothing. The corpus is
+/// English, so ASCII folding is the whole job; lowercasing every field of every
+/// record per query would allocate ~800 KB to answer one substring question.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// One matched DogmaAttribute. `default_value` and `explicit_type_count` are what
+/// make search → find a two-step: the first says how to read a Type's stored value,
+/// the second whether a reverse lookup is worth making at all.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DogmaAttributeHit {
+    attribute_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    /// Which of `name`, `display_name` and `description` contained the query — the
+    /// caller's own relevance signal, since a term found in a description alone is
+    /// often incidental.
+    matched_fields: Vec<&'static str>,
+    /// The DogmaAttribute's DefaultValue: what every Type without an ExplicitValue
+    /// for it holds. Omitted when the record declares none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_value: Option<f64>,
+    /// How many Types record an ExplicitValue for this attribute — the size of the
+    /// set `sde_find_types` would return for it. Zero is an answer, not an absence.
+    explicit_type_count: u64,
+}
+
+/// One matched DogmaEffect. No DefaultValue and no ExplicitValue count: those are
+/// properties of a DogmaAttribute, and a Type either carries an effect or does not.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DogmaEffectHit {
+    effect_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    matched_fields: Vec<&'static str>,
+}
+
+impl HasMatchedFields for DogmaAttributeHit {
+    fn matched_fields(&self) -> &[&'static str] {
+        &self.matched_fields
+    }
+}
+
+impl HasMatchedFields for DogmaEffectHit {
+    fn matched_fields(&self) -> &[&'static str] {
+        &self.matched_fields
+    }
+}
+
+/// The `sde_search_dogma` envelope. The two lists are counted and capped
+/// separately, so `attributes_matched` against `attributes_returned` says whether
+/// the attribute half of the answer is complete regardless of what the effect half
+/// did.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SearchDogmaResult {
+    attributes: Vec<DogmaAttributeHit>,
+    effects: Vec<DogmaEffectHit>,
+    attributes_matched: usize,
+    attributes_returned: usize,
+    effects_matched: usize,
+    effects_returned: usize,
+    /// True when either list was cut. Explicit rather than left to be derived, so a
+    /// capped page is never summarised as the complete set of matches.
+    truncated: bool,
 }
 
 /// How an [`AttributePredicate`] narrows the Types holding an ExplicitValue.
@@ -2189,6 +2423,8 @@ mod tests {
             type_meta_group: HashMap::new(),
             category_groups: HashMap::new(),
             published_types: HashSet::new(),
+            dogma_attribute_text: Vec::new(),
+            dogma_effect_text: Vec::new(),
         }
     }
 
@@ -4242,6 +4478,292 @@ mod tests {
                     {"group_id": 898, "name": "Black Ops", "count": 3},
                     {"group_id": 28, "name": "Hauler", "count": 2},
                 ])
+            );
+            seam.shutdown().await
+        }
+
+        /// The `attribute_id`s of a `sde_search_dogma` answer, in the order returned.
+        fn attribute_ids(response: &serde_json::Value) -> Vec<u64> {
+            response["attributes"]
+                .as_array()
+                .expect("attributes array")
+                .iter()
+                .map(|a| a["attribute_id"].as_u64().expect("attribute_id"))
+                .collect()
+        }
+
+        /// The one hit for `attribute_id`, or a panic naming what came back instead.
+        fn attribute_hit(response: &serde_json::Value, attribute_id: u64) -> &serde_json::Value {
+            response["attributes"]
+                .as_array()
+                .expect("attributes array")
+                .iter()
+                .find(|a| a["attribute_id"] == attribute_id)
+                .unwrap_or_else(|| panic!("attribute {attribute_id} missing from {response}"))
+        }
+
+        #[tokio::test]
+        async fn search_dogma_finds_an_attribute_by_a_phrase_only_its_display_name_carries()
+        -> anyhow::Result<()> {
+            // Attribute 9 is named `hp` and described as "The maximum hitpoints of
+            // an object." — "structure hitpoints" is in neither. It reaches the
+            // caller only through the display name, which is the case that makes
+            // searching one field a broken search rather than a narrow one.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "structure hitpoints"}),
+                )
+                .await?;
+            assert_eq!(attribute_ids(&r), vec![9]);
+            let hit = attribute_hit(&r, 9);
+            assert_eq!(hit["name"], "hp");
+            assert_eq!(hit["display_name"], "Structure Hitpoints");
+            assert_eq!(hit["matched_fields"], serde_json::json!(["display_name"]));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_reports_every_field_a_hit_matched_on() -> anyhow::Result<()> {
+            // "jump fatigue" is in 1971's display name AND its description, and in
+            // neither case in the camelCase `jumpFatigueMultiplier` — the phrasing
+            // the motivating session reached for first.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "jump fatigue"}),
+                )
+                .await?;
+            let hit = attribute_hit(&r, 1971);
+            assert_eq!(hit["name"], "jumpFatigueMultiplier");
+            assert_eq!(
+                hit["matched_fields"],
+                serde_json::json!(["display_name", "description"]),
+                "the identifier holds no space, so `name` cannot be among them"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_returns_attributes_and_effects_as_distinct_lists()
+        -> anyhow::Result<()> {
+            // "power" names both: attributes 11 powerOutput and 30 power, effects
+            // 11/12/13 loPower/hiPower/medPower. A caller who cannot tell which
+            // kind of thing a term names gets both without asking twice.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_search_dogma", serde_json::json!({"query": "power"}))
+                .await?;
+            assert_eq!(attribute_ids(&r), vec![11, 30]);
+            let effect_ids: Vec<u64> = r["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["effect_id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(effect_ids, vec![11, 12, 13]);
+            assert_eq!(r["attributes_matched"], 2);
+            assert_eq!(r["effects_matched"], 3);
+            assert_eq!(r["truncated"], false);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_matches_case_insensitively() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let shouted = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "JUMP FATIGUE"}),
+                )
+                .await?;
+            let quiet = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "jump fatigue"}),
+                )
+                .await?;
+            assert_eq!(attribute_ids(&shouted), vec![1971]);
+            assert_eq!(shouted, quiet);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_attribute_hits_carry_the_default_value() -> anyhow::Result<()> {
+            // The DefaultValue is what a Type absent from the reverse lookup holds,
+            // so it is the difference between reading 1971's absence as "no jump
+            // fatigue" and as "the 1.0 everything else sits at".
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "jumpFatigueMultiplier"}),
+                )
+                .await?;
+            assert_eq!(attribute_hit(&r, 1971)["default_value"], 1.0);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_explicit_type_count_agrees_with_find_types() -> anyhow::Result<()> {
+            // The count is only useful if it predicts the reverse lookup exactly:
+            // it exists so a caller can skip a call, or size one before making it.
+            // "multiplier" is deliberately a three-attribute answer, so this is not
+            // one lucky number.
+            let seam = Seam::boot().await?;
+            let searched = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "multiplier"}),
+                )
+                .await?;
+            let hits = searched["attributes"].as_array().unwrap();
+            assert_eq!(hits.len(), 3, "expected 64, 1971 and 275");
+            for hit in hits {
+                let attribute_id = hit["attribute_id"].as_u64().unwrap();
+                let found = seam
+                    .call(
+                        "sde_find_types",
+                        serde_json::json!({"attribute": {"id": attribute_id}, "limit": 1}),
+                    )
+                    .await?;
+                assert_eq!(
+                    hit["explicit_type_count"], found["total_matched"],
+                    "attribute {attribute_id}: search and find disagree on how many \
+                     Types hold an ExplicitValue"
+                );
+                assert_eq!(
+                    hit["default_value"], found["attribute_default"],
+                    "attribute {attribute_id}: search and find disagree on the DefaultValue"
+                );
+            }
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_omits_text_fields_a_record_does_not_have() -> anyhow::Result<()> {
+            // Attributes 277/278 have no `displayName` in the real SDE and effects
+            // 16/132 have neither that nor a `description`. A hit says which fields
+            // it matched, so it must not claim fields the record never had.
+            let seam = Seam::boot().await?;
+            let attrs = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "required skill level"}),
+                )
+                .await?;
+            assert_eq!(attribute_ids(&attrs), vec![277, 278]);
+            let hit = attribute_hit(&attrs, 277);
+            assert_eq!(hit["name"], "requiredSkill1Level");
+            assert!(hit.get("display_name").is_none(), "277 has no displayName");
+            assert_eq!(hit["matched_fields"], serde_json::json!(["description"]));
+
+            let effects = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "skillEffect"}),
+                )
+                .await?;
+            let effect = &effects["effects"].as_array().unwrap()[0];
+            assert_eq!(effect["effect_id"], 132);
+            assert!(effect.get("display_name").is_none());
+            assert!(effect.get("description").is_none());
+            assert_eq!(effect["matched_fields"], serde_json::json!(["name"]));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_puts_name_matches_ahead_of_text_only_matches() -> anyhow::Result<()> {
+            // 275 skillTimeConstant matches "multiplier" only in its display name
+            // and description, so it sorts behind 1971 despite the lower ID. Under
+            // a cap that ordering is what keeps the identifier hit on the page.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "multiplier"}),
+                )
+                .await?;
+            assert_eq!(attribute_ids(&r), vec![64, 1971, 275]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_orders_hits_identically_across_scans() -> anyhow::Result<()> {
+            // Two independent scans in one process still share no HashMap iteration
+            // order, which is the ordering hazard: the corpus is a Vec sorted by ID
+            // and the rank sort above it is stable.
+            let first = Seam::boot().await?;
+            let a = first
+                .call("sde_search_dogma", serde_json::json!({"query": "skill"}))
+                .await?;
+            first.shutdown().await?;
+            let second = Seam::boot().await?;
+            let b = second
+                .call("sde_search_dogma", serde_json::json!({"query": "skill"}))
+                .await?;
+            assert!(
+                a["attributes"].as_array().unwrap().len() > 1,
+                "an ordering assertion needs something to order"
+            );
+            assert_eq!(a, b);
+            second.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_caps_each_list_separately_and_reports_the_totals()
+        -> anyhow::Result<()> {
+            // A shared cap would let two attribute hits hide all three effect hits,
+            // which is exactly the guess this tool exists to remove.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "power", "limit": 1}),
+                )
+                .await?;
+            assert_eq!(r["attributes_returned"], 1);
+            assert_eq!(r["attributes_matched"], 2);
+            assert_eq!(r["effects_returned"], 1);
+            assert_eq!(r["effects_matched"], 3);
+            assert_eq!(r["truncated"], true);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_returns_english_text_in_all_languages_mode() -> anyhow::Result<()> {
+            // Every other tool answers with all eight languages when `--language` is
+            // unset. The corpus holds one, so a hit's display name is a plain string
+            // here too — the same deliberate divergence sde_find_types makes for its
+            // row names, and for the same reason.
+            let seam = Seam::boot_with_language(None).await?;
+            let r = seam
+                .call(
+                    "sde_search_dogma",
+                    serde_json::json!({"query": "jump fatigue"}),
+                )
+                .await?;
+            assert_eq!(
+                attribute_hit(&r, 1971)["display_name"],
+                "Jump Fatigue Multiplier"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_dogma_rejects_an_empty_query() -> anyhow::Result<()> {
+            // An empty substring is inside every record, so the honest answer is a
+            // correction rather than a capped page of the entire corpus.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call("sde_search_dogma", serde_json::json!({"query": "   "}))
+                .await;
+            let message = r.unwrap_err().to_string();
+            assert!(
+                message.contains("non-empty query"),
+                "expected a corrective error, got: {message}"
             );
             seam.shutdown().await
         }
