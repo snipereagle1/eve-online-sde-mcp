@@ -64,7 +64,7 @@ fn router(path: &str, store: Arc<SdeStore>, language: Option<String>) -> Router 
         // guard for locally-run servers). A hosted server is reached via its
         // ingress hostname, so that guard would reject all real traffic.
         // Host/Origin validation is the reverse proxy's responsibility here
-        // (see docs/adr/0001-hosted-http-transport.md: no built-in auth).
+        // (see docs/adr/0002-hosted-http-transport.md: no built-in auth).
         .disable_allowed_hosts();
 
     let mcp = StreamableHttpService::new(factory, Arc::new(NeverSessionManager::default()), config);

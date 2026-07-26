@@ -18,6 +18,10 @@ _Avoid_: subcategory, class
 The parent classification above Groups (e.g. "Ship" contains Frigate, Cruiser, Battleship groups). The broadest domain organizer.
 _Avoid_: domain, type-class
 
+**MetaGroup**:
+The tier and provenance band of a Type — Tech I, Tech II, Tech III, Faction, Storyline, Officer, Deadspace, Abyssal, Limited Time, Premium, and the Structure equivalents. Optional: most Types carry no MetaGroup at all, and its absence must never be read as Tech I. MeMode is derived from it.
+_Avoid_: tech level, tier, meta level, quality
+
 **Blueprint**:
 A Type that defines one or more manufacturing or reaction activities. A Blueprint produces a specific output Type; the reverse lookup from output Type to Blueprint is the product-to-blueprint map.
 _Avoid_: recipe, schematic
@@ -47,8 +51,16 @@ The full bottom-up decomposition of a target Type into the quantities a player m
 _Avoid_: build tree, recipe tree, BOM
 
 **DogmaAttribute**:
-A named numeric or categorical property on a Type (e.g. shield capacity, CPU usage). Defines the mechanical stats of ships and modules.
+A named numeric or categorical property on a Type (e.g. shield capacity, CPU usage). Defines the mechanical stats of ships and modules. Carries a DefaultValue that applies to every Type lacking an ExplicitValue for it.
 _Avoid_: stat, property, attribute (unqualified)
+
+**ExplicitValue**:
+A DogmaAttribute value actually recorded against a Type. A Type with no ExplicitValue for a DogmaAttribute still *has* that attribute — at the attribute's DefaultValue. The two are not interchangeable: an ExplicitValue may coincidentally equal the DefaultValue, and a Type at the DefaultValue is invisible to any attribute-to-Type reverse lookup. Every such reverse lookup is therefore an ExplicitValue query, and must say so.
+_Avoid_: value (unqualified), set attribute, override
+
+**DefaultValue**:
+The value a DogmaAttribute takes on a Type that has no ExplicitValue for it. A property of the DogmaAttribute, not of any Type.
+_Avoid_: fallback, base value, unset
 
 **DogmaEffect**:
 A gameplay rule or behavior that activates on a Type (e.g. "turret hardpoint"). Complements DogmaAttributes to fully specify mechanics.
@@ -108,6 +120,8 @@ _Avoid_: station (unqualified), outpost
 - An **NpcStation** belongs to one **SolarSystem** and one **NpcCorporation**
 - A **MarketGroup** may have a parent **MarketGroup** (tree hierarchy)
 - **DogmaAttributes** and **DogmaEffects** are applied to **Types**
+- A **Type** has an **ExplicitValue** for *some* **DogmaAttributes**; for all the rest the attribute's **DefaultValue** applies
+- A **Type** *may* belong to a **MetaGroup**; most do not, and **MeMode** reads the **MetaGroup** of a manufactured Type
 
 ## Example dialogue
 
@@ -116,6 +130,9 @@ _Avoid_: station (unqualified), outpost
 
 > **Dev:** "Is MarketGroup related to Group?"
 > **Domain expert:** "No. Group is a mechanical classification (what a Type *is*). MarketGroup is a market taxonomy (where you find it in the trade interface). They're completely independent hierarchies."
+
+> **Dev:** "Which Types have jump fatigue multiplier?"
+> **Domain expert:** "Every Type has it — the DogmaAttribute has a DefaultValue. You mean which Types carry an ExplicitValue for it. That's a different, much smaller set, and it's the only one the data can answer."
 
 > **Dev:** "What's a Route?"
 > **Domain expert:** "A jump path between two SolarSystems through the stargate graph — expressed as the sequence of system IDs and the total jump count."
