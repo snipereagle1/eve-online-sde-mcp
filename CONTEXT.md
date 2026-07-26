@@ -26,6 +26,26 @@ _Avoid_: recipe, schematic
 The raw material composition of a Type — which materials and quantities are yielded when that Type is reprocessed.
 _Avoid_: material list, ingredients
 
+**Origin**:
+*How* a Type is produced — an intrinsic property derived from SDE data alone. Fixed for a given Type regardless of any build. Exactly one of six values, resolved blueprint-first (a Type's Blueprint activity is authoritative over its Group): `reaction-output`, `manufactured`, `pi-output`, `mineral`, `moon-material`, `raw-other` (terminal catch-all). Group/Category are a fallback only for Types with no Blueprint. Distinct from Disposition.
+_Avoid_: source, kind, type (unqualified)
+
+**Disposition**:
+*Whether the player builds or buys* a Type on a specific build — `build` vs `buy`. Contextual: determined by the player's chosen Raw Boundary, not by the Type itself. The same Type (e.g. Reinforced Carbon Fiber) can be `build` on one plan and `buy` on another. Only the production-chain computation knows Disposition; the build router reports Origin only.
+_Avoid_: source, build-vs-buy (informal)
+
+**MeMode**:
+The ME-research eligibility of a `manufactured` Type, derived from its product metaGroupID (NOT from blueprint activity presence — faction Blueprints carry research activities yet are unresearchable). One of: `researchable` (Tech I — player chooses ME 0–10), `fixed-zero` (Faction/Storyline/Officer/Deadspace — BPC-only, ME locked 0), `invented` (Tech II/III — ME set at invention; out of scope, treated as a leaf/buy and flagged). Absent for non-manufactured Origins (reactions ignore ME; raw/PI have none).
+_Avoid_: researchable (as a bool), ME flag
+
+**RawBoundary**:
+The set of decomposable Origins a player chooses to *buy* rather than build on a given plan. Only `manufactured` and `reaction-output` are decomposable; `pi-output`, `mineral`, `moon-material`, `raw-other` are always terminal leaves (PI-build and invention are out of scope). The boundary is a player decision surfaced as buy-vs-build options, never silently defaulted. A per-Type override list can force individual Types to `buy` regardless of their Origin (e.g. a skill-gated component). Disposition is the per-Type result of applying the Raw Boundary plus overrides.
+_Avoid_: stop-set, raw materials (informal), cutoff
+
+**ProductionChain**:
+The full bottom-up decomposition of a target Type into the quantities a player must acquire — recursing through every Type above the Raw Boundary, summing inputs across the tree with per-Blueprint ME and whole-batch run rounding, and emitting consolidated leaf totals plus a run plan. Computed by the chain tool; distinct from the build router, which only classifies one level and surfaces decisions.
+_Avoid_: build tree, recipe tree, BOM
+
 **DogmaAttribute**:
 A named numeric or categorical property on a Type (e.g. shield capacity, CPU usage). Defines the mechanical stats of ships and modules.
 _Avoid_: stat, property, attribute (unqualified)
