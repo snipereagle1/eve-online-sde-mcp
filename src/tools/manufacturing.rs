@@ -876,6 +876,7 @@ mod tests {
             stargate_graph: HashMap::new(),
             attribute_modifiers: HashMap::new(),
             effect_to_types: HashMap::new(),
+            attribute_types: HashMap::new(),
         };
         Fixtures {
             _keep: vec![f1, f2, f3],

@@ -210,6 +210,33 @@ pub struct ProductionChainParam {
     pub me_overrides: Option<HashMap<u64, i64>>,
 }
 
+/// The ExplicitValue predicate on `sde_find_types`. Every operator is already
+/// restricted to Types holding an ExplicitValue for `id`; the operator only
+/// narrows further. See [`AttributeOp`].
+#[derive(Deserialize, JsonSchema)]
+pub struct AttributePredicate {
+    /// DogmaAttribute ID to select on (e.g. 1971 jumpFatigueMultiplier)
+    pub id: u64,
+    /// One of "exists" (default), "eq", "ne", "gt", "gte", "lt", "lte",
+    /// "not_default". The comparison operators require `value`.
+    pub op: Option<String>,
+    /// The value to compare each Type's ExplicitValue against. Required by every
+    /// operator except "exists" and "not_default", which ignore it.
+    pub value: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FindTypesParam {
+    /// Select Types by the DogmaAttribute values they record. Types sitting at the
+    /// attribute's DefaultValue are never returned — see the response's
+    /// `attribute_semantics`.
+    pub attribute: Option<AttributePredicate>,
+    /// Maximum rows to return (default: 100). Predicates apply to the whole
+    /// candidate set first, so `total_matched` is the real count even when
+    /// `truncated` is true.
+    pub limit: Option<u64>,
+}
+
 // ── Server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -328,6 +355,84 @@ impl SdeMcpServer {
                 });
             }
         }
+    }
+
+    /// `sde_find_types`: apply the predicates, sort, truncate, then hydrate only
+    /// the surviving page. Kept off the `#[tool]` method so the growing predicate
+    /// set stays testable as a plain function.
+    fn find_types(&self, p: &FindTypesParam) -> Result<FindTypesResult, ErrorData> {
+        let Some(pred) = p.attribute.as_ref() else {
+            return Err(ErrorData::invalid_params(
+                "sde_find_types needs at least one predicate; available: attribute {id, op?, value?}",
+                None,
+            ));
+        };
+        let op = AttributeOp::parse(pred.op.as_deref())?;
+        let want = op.operand(pred.value)?;
+
+        let attribute_id = u32::try_from(pred.id).map_err(|_| {
+            ErrorData::invalid_params(
+                format!("attribute {} not found in dogmaAttributes", pred.id),
+                None,
+            )
+        })?;
+        // `defaultValue` is read straight off the DogmaAttribute record by O(1)
+        // offset — the candidate set itself never touches a file.
+        let default_value = query::fetch_by_id(&self.store.dogma_attributes, pred.id)
+            .ok()
+            .and_then(|v| v.get("defaultValue").and_then(|d| d.as_f64()));
+        let rows = self.store.attribute_types.get(&attribute_id);
+        if default_value.is_none() && rows.is_none() {
+            return Err(ErrorData::invalid_params(
+                format!("attribute {} not found in dogmaAttributes", pred.id),
+                None,
+            ));
+        }
+
+        // `attribute_types` is already sorted by type_id at scan time, so the
+        // filtered run inherits that order and repeated calls agree.
+        let matched: Vec<(u32, f32)> = rows
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|&(_, value)| op.admits(value, want, default_value))
+            .collect();
+
+        let limit = p.limit.unwrap_or(DEFAULT_FIND_TYPES_LIMIT) as usize;
+        let total_matched = matched.len();
+        let types: Vec<FoundType> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(type_id, value)| {
+                let record = query::fetch_by_id(&self.store.types, type_id as u64).ok();
+                FoundType {
+                    type_id: type_id as u64,
+                    // Deliberately a single-language string even when the server
+                    // runs in all-languages mode (`--language` unset), unlike every
+                    // other tool. A selector row exists to be scanned, and eight
+                    // language variants cost ~5× per row for zero selection value;
+                    // callers escalate to sde_get_types for the full record. Do not
+                    // "fix" this to match the other tools.
+                    name: record
+                        .as_ref()
+                        .and_then(|r| pick_name(r.get("name"), self.language.as_deref())),
+                    group_id: record
+                        .as_ref()
+                        .and_then(|r| r.get("groupID").and_then(|g| g.as_u64())),
+                    value: Some(value),
+                }
+            })
+            .collect();
+
+        Ok(FindTypesResult {
+            returned: types.len(),
+            truncated: total_matched > types.len(),
+            types,
+            total_matched,
+            attribute_semantics: Some(ATTRIBUTE_SEMANTICS.to_string()),
+            attribute_default: default_value,
+        })
     }
 
     /// Direction-a: a type's outgoing modifiers — for each effect it carries, the
@@ -703,6 +808,17 @@ impl SdeMcpServer {
             });
         }
         Ok(serde_json::to_string(&results).unwrap())
+    }
+
+    #[tool(
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value. This is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+    )]
+    async fn sde_find_types(
+        &self,
+        Parameters(p): Parameters<FindTypesParam>,
+    ) -> Result<String, ErrorData> {
+        let result = self.find_types(&p)?;
+        Ok(serde_json::to_string(&result).unwrap())
     }
 
     #[tool(description = "Get a type group by its group ID")]
@@ -1275,6 +1391,127 @@ const ATTR_RANK: u64 = 275; // skillTimeConstant
 const PREREQ_SLOTS: [(u64, u64); 3] = [(182, 277), (183, 278), (184, 279)]; // (skillID, levelID)
 const MAX_SKILL_DEPTH: usize = 12;
 
+// ── sde_find_types ───────────────────────────────────────────────────────────
+
+const DEFAULT_FIND_TYPES_LIMIT: u64 = 100;
+
+/// Stated on every attribute-predicate response. The whole point of the tool is
+/// that "no row" and "no value" are different, so the caller is told which one a
+/// short result means rather than being left to guess.
+const ATTRIBUTE_SEMANTICS: &str = "ExplicitValue only: rows are Types that record a value for this \
+     DogmaAttribute in typeDogma. Every other Type still HAS the attribute, at \
+     attribute_default, and is deliberately not listed.";
+
+/// One row of a `sde_find_types` answer. `value` is `f32` so it serializes as the
+/// value the SDE stores (`1.92`), not the f64 widening of it (`1.9199999570846558`).
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct FoundType {
+    type_id: u64,
+    name: Option<String>,
+    group_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f32>,
+}
+
+/// The `sde_find_types` envelope. `total_matched` counts the whole match set, not
+/// the returned page, so a truncated answer still reports the true size.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct FindTypesResult {
+    types: Vec<FoundType>,
+    total_matched: usize,
+    returned: usize,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribute_semantics: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribute_default: Option<f64>,
+}
+
+/// How an [`AttributePredicate`] narrows the Types holding an ExplicitValue.
+/// Every variant is already restricted to those Types — `Exists` is that
+/// restriction alone. `Ne` compares against a caller-supplied value; `NotDefault`
+/// compares against the DogmaAttribute's own DefaultValue. They answer different
+/// questions and both exist on purpose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttributeOp {
+    Exists,
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    NotDefault,
+}
+
+impl AttributeOp {
+    fn parse(op: Option<&str>) -> Result<Self, ErrorData> {
+        Ok(match op {
+            None | Some("exists") => AttributeOp::Exists,
+            Some("eq") => AttributeOp::Eq,
+            Some("ne") => AttributeOp::Ne,
+            Some("gt") => AttributeOp::Gt,
+            Some("gte") => AttributeOp::Gte,
+            Some("lt") => AttributeOp::Lt,
+            Some("lte") => AttributeOp::Lte,
+            Some("not_default") => AttributeOp::NotDefault,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "unknown attribute op '{other}' (expected exists, eq, ne, gt, gte, lt, lte or not_default)"
+                    ),
+                    None,
+                ));
+            }
+        })
+    }
+
+    /// The comparison operand, narrowed to the `f32` the SDE actually stores.
+    /// Omitting `value` on a comparison operator is an error rather than a silent
+    /// fallback to `exists`, which would answer a much broader question than asked.
+    fn operand(self, value: Option<f64>) -> Result<Option<f32>, ErrorData> {
+        match self {
+            AttributeOp::Exists | AttributeOp::NotDefault => Ok(None),
+            _ => value.map(|v| Some(v as f32)).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("attribute op '{}' requires a value", self.as_str()),
+                    None,
+                )
+            }),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            AttributeOp::Exists => "exists",
+            AttributeOp::Eq => "eq",
+            AttributeOp::Ne => "ne",
+            AttributeOp::Gt => "gt",
+            AttributeOp::Gte => "gte",
+            AttributeOp::Lt => "lt",
+            AttributeOp::Lte => "lte",
+            AttributeOp::NotDefault => "not_default",
+        }
+    }
+
+    /// Does a stored ExplicitValue survive this operator? `default` is the
+    /// DogmaAttribute's DefaultValue, needed only by `not_default`; an attribute
+    /// with no declared default admits everything rather than dropping every row.
+    fn admits(self, stored: f32, want: Option<f32>, default: Option<f64>) -> bool {
+        let want = want.unwrap_or_default();
+        match self {
+            AttributeOp::Exists => true,
+            AttributeOp::Eq => stored == want,
+            AttributeOp::Ne => stored != want,
+            AttributeOp::Gt => stored > want,
+            AttributeOp::Gte => stored >= want,
+            AttributeOp::Lt => stored < want,
+            AttributeOp::Lte => stored <= want,
+            AttributeOp::NotDefault => default.is_none_or(|d| stored != d as f32),
+        }
+    }
+}
+
 /// Pick the English (or requested-language) string from a localized name field,
 /// tolerating both `{"en": "X"}` objects and already-filtered plain strings.
 fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
@@ -1708,6 +1945,7 @@ mod tests {
             stargate_graph: HashMap::new(),
             attribute_modifiers: HashMap::new(),
             effect_to_types: HashMap::new(),
+            attribute_types: HashMap::new(),
         }
     }
 
@@ -2490,13 +2728,20 @@ mod tests {
         impl Seam {
             /// Scan the JSONL fixtures and serve them to a live client.
             async fn boot() -> anyhow::Result<Self> {
+                Self::boot_with_language(Some("en".to_string())).await
+            }
+
+            /// As [`Seam::boot`], but with an explicit server language — `None` is
+            /// the default all-languages mode, where localized fields come back as
+            /// full eight-language maps.
+            async fn boot_with_language(language: Option<String>) -> anyhow::Result<Self> {
                 let fixture_dir =
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
                 let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
 
                 let (server_transport, client_transport) = tokio::io::duplex(65536);
                 let server = tokio::spawn(async move {
-                    SdeMcpServer::new(store, Some("en".to_string()))
+                    SdeMcpServer::new(store, language)
                         .serve(server_transport)
                         .await?
                         .waiting()
@@ -2542,6 +2787,16 @@ mod tests {
                 let _ = self.server.await;
                 Ok(())
             }
+        }
+
+        /// The `type_id`s of a `sde_find_types` answer, in the order returned.
+        fn ids_of(response: &serde_json::Value) -> Vec<u64> {
+            response["types"]
+                .as_array()
+                .expect("types array")
+                .iter()
+                .map(|t| t["type_id"].as_u64().expect("type_id"))
+                .collect()
         }
 
         #[tokio::test]
@@ -3004,6 +3259,330 @@ mod tests {
             assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
             assert_eq!(lvls[4]["sp_to_reach"], 768000); // rank3 L5 = 3 × 256000
             assert_eq!(lvls[4]["increment"], 768000 - 3 * 45255);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_returns_every_type_holding_an_explicit_value() -> anyhow::Result<()> {
+            // Attribute 1971 jumpFatigueMultiplier: exactly five fixture Types store
+            // one (Badger, Hoarder, Redeemer, Sin, Python), at 0.1 or 0.25.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}}),
+                )
+                .await?;
+            let rows = r["types"].as_array().unwrap();
+            let ids: Vec<u64> = rows
+                .iter()
+                .map(|t| t["type_id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(ids, vec![648, 651, 22428, 22430, 85236]);
+            assert_eq!(rows[0]["value"], 0.1);
+            assert_eq!(rows[4]["value"], 0.25);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_omits_types_with_no_explicit_value_for_the_attribute()
+        -> anyhow::Result<()> {
+            // The Ferox has a typeDogma row and stores attribute 9, so its absence
+            // from the 1971 answer is sparseness of ExplicitValues, not of dogma.
+            let seam = Seam::boot().await?;
+            let carries_hp = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}}),
+                )
+                .await?;
+            assert!(
+                ids_of(&carries_hp).contains(&16227),
+                "Ferox stores attribute 9"
+            );
+
+            let carries_fatigue = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}}),
+                )
+                .await?;
+            assert!(
+                !ids_of(&carries_fatigue).contains(&16227),
+                "Ferox stores no ExplicitValue for 1971 and must not be listed"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_comparison_operators_filter_on_the_stored_value() -> anyhow::Result<()>
+        {
+            // Attribute 1971 splits 0.1 (Badger, Hoarder) from 0.25 (Redeemer, Sin,
+            // Python), so each operator has a distinct expected answer.
+            let seam = Seam::boot().await?;
+            let cases = [
+                (
+                    serde_json::json!({"id": 1971, "op": "gt", "value": 0.2}),
+                    vec![22428, 22430, 85236],
+                ),
+                (
+                    serde_json::json!({"id": 1971, "op": "gte", "value": 0.25}),
+                    vec![22428, 22430, 85236],
+                ),
+                (
+                    serde_json::json!({"id": 1971, "op": "lt", "value": 0.25}),
+                    vec![648, 651],
+                ),
+                (
+                    serde_json::json!({"id": 1971, "op": "lte", "value": 0.1}),
+                    vec![648, 651],
+                ),
+                (
+                    serde_json::json!({"id": 1971, "op": "eq", "value": 0.1}),
+                    vec![648, 651],
+                ),
+                (
+                    serde_json::json!({"id": 1971, "op": "ne", "value": 0.1}),
+                    vec![22428, 22430, 85236],
+                ),
+            ];
+            for (predicate, expected) in cases {
+                let r = seam
+                    .call(
+                        "sde_find_types",
+                        serde_json::json!({"attribute": predicate.clone()}),
+                    )
+                    .await?;
+                assert_eq!(ids_of(&r), expected, "predicate {predicate}");
+            }
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_eq_matches_a_value_the_sde_stores_at_full_precision()
+        -> anyhow::Result<()> {
+            // The Hobgoblin II's damageMultiplier is 1.92. Widening the stored value
+            // to f64 would make it 1.9199999570846558 and this eq would find nothing.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 64, "op": "eq", "value": 1.92}}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![2456]);
+            assert_eq!(r["types"][0]["value"], 1.92);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rejects_a_comparison_operator_with_no_value() -> anyhow::Result<()> {
+            // Silently degrading to `exists` would answer a far broader question
+            // than the caller asked.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971, "op": "gt"}}),
+                )
+                .await;
+            assert!(r.is_err(), "gt with no value must be rejected");
+            assert!(format!("{}", r.unwrap_err()).contains("value"));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_not_default_drops_values_that_restate_the_default() -> anyhow::Result<()>
+        {
+            // damageMultiplier defaults to 1.0 and five fixture Types store it: four
+            // mining drones at exactly 1.0, the Hobgoblin II at 1.92. `exists` keeps
+            // all five, `not_default` keeps only the one that says something.
+            let seam = Seam::boot().await?;
+            let exists = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 64}}),
+                )
+                .await?;
+            assert_eq!(ids_of(&exists), vec![1202, 2456, 3218, 10248, 10252]);
+
+            let not_default = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 64, "op": "not_default"}}),
+                )
+                .await?;
+            assert_eq!(ids_of(&not_default), vec![2456]);
+            assert_eq!(not_default["attribute_default"], 1.0);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_states_explicit_value_semantics_and_echoes_the_default()
+        -> anyhow::Result<()> {
+            // Attribute 1971 defaults to 1.0 and no fixture Type sits there, so a
+            // caller reading the five rows as "everything else has no fatigue
+            // multiplier" would be wrong — the envelope has to say which it is.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}}),
+                )
+                .await?;
+            let semantics = r["attribute_semantics"].as_str().expect("semantics stated");
+            assert!(semantics.contains("ExplicitValue"), "{semantics}");
+            assert!(semantics.contains("attribute_default"), "{semantics}");
+            assert_eq!(r["attribute_default"], 1.0);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rows_carry_id_name_and_group() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971, "op": "gt", "value": 0.2}}),
+                )
+                .await?;
+            let redeemer = &r["types"][0];
+            assert_eq!(redeemer["type_id"], 22428);
+            assert_eq!(redeemer["name"], "Redeemer");
+            assert_eq!(redeemer["group_id"], 898);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_names_stay_single_language_with_no_server_language()
+        -> anyhow::Result<()> {
+            // With `--language` unset every other tool returns the full localized
+            // map. A selector row must not: 66 Types × eight languages is the 454 KB
+            // answer this tool exists to avoid. `sde_get_type` is asserted alongside
+            // to show the divergence is this tool's, not the fixture's.
+            let seam = Seam::boot_with_language(None).await?;
+            let full = seam
+                .call("sde_get_type", serde_json::json!({"type_id": 22428}))
+                .await?;
+            assert!(
+                full["name"].is_object(),
+                "all-languages mode still returns a map elsewhere"
+            );
+
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971, "op": "gt", "value": 0.2}}),
+                )
+                .await?;
+            assert_eq!(r["types"][0]["name"], "Redeemer");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_reports_matched_returned_and_truncated() -> anyhow::Result<()> {
+            // Eleven fixture Types store attribute 9. Under a limit of 3 the caller
+            // must still be told there are eleven, or a capped page reads as the
+            // whole answer.
+            let seam = Seam::boot().await?;
+            let capped = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}, "limit": 3}),
+                )
+                .await?;
+            assert_eq!(capped["types"].as_array().unwrap().len(), 3);
+            assert_eq!(capped["returned"], 3);
+            assert_eq!(capped["total_matched"], 11);
+            assert_eq!(capped["truncated"], true);
+
+            let complete = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}}),
+                )
+                .await?;
+            assert_eq!(complete["returned"], 11);
+            assert_eq!(complete["total_matched"], 11);
+            assert_eq!(complete["truncated"], false);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_orders_results_identically_across_scans() -> anyhow::Result<()> {
+            // Two independent scans, because the ordering hazard is HashMap
+            // iteration order, which is stable within a process and varies between
+            // them. Truncation makes an unstable order silently drop different rows.
+            let first = Seam::boot().await?;
+            let a = first
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}, "limit": 4}),
+                )
+                .await?;
+            first.shutdown().await?;
+
+            let second = Seam::boot().await?;
+            let b = second
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}, "limit": 4}),
+                )
+                .await?;
+            let c = second
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 9}, "limit": 4}),
+                )
+                .await?;
+            assert_eq!(ids_of(&a), ids_of(&b));
+            assert_eq!(ids_of(&b), ids_of(&c));
+            assert_eq!(ids_of(&a), vec![648, 651, 1202, 2456]);
+            second.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_with_no_predicate_errors_instead_of_dumping() -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam.try_call("sde_find_types", serde_json::json!({})).await;
+            assert!(r.is_err(), "an unfiltered call must not return every Type");
+            let message = format!("{}", r.unwrap_err());
+            assert!(
+                message.contains("attribute"),
+                "names the predicates: {message}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_errors_on_an_undeclared_attribute() -> anyhow::Result<()> {
+            // A confident empty answer for a typo'd attribute ID is the exact
+            // failure mode this tool was built to end.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 999999}}),
+                )
+                .await;
+            assert!(r.is_err());
+            assert!(format!("{}", r.unwrap_err()).contains("999999"));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rejects_an_unknown_operator() -> anyhow::Result<()> {
+            // Falling back to `exists` on a misspelled op would answer a different
+            // question under the caller's own words.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 64, "op": "neq", "value": 1.0}}),
+                )
+                .await;
+            assert!(r.is_err());
+            assert!(format!("{}", r.unwrap_err()).contains("not_default"));
             seam.shutdown().await
         }
     }

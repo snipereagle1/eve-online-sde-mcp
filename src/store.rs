@@ -79,4 +79,13 @@ pub(crate) struct SdeStore {
     pub(crate) attribute_modifiers: HashMap<u64, Vec<ModifierRef>>,
     /// effectID -> type IDs whose dogmaEffects own this effect (reverse of typeDogma.dogmaEffects)
     pub(crate) effect_to_types: HashMap<u64, Vec<u64>>,
+    /// attributeID -> the `(type_id, ExplicitValue)` pairs recorded against it
+    /// (reverse of `typeDogma.dogmaAttributes`). Only ExplicitValues live here: a
+    /// Type sitting at the DogmaAttribute's DefaultValue has no row in `typeDogma`
+    /// and is therefore absent, which is the semantics `sde_find_types` reports.
+    /// `u32`/`f32` rather than the `u64`/`f64` used elsewhere because this is the
+    /// one index with ~646k entries in production — the narrow pair halves it to
+    /// ~5 MB. Type and attribute IDs are far inside `u32`, and dogma values are
+    /// `f32` in EVE's own engine.
+    pub(crate) attribute_types: HashMap<u32, Vec<(u32, f32)>>,
 }

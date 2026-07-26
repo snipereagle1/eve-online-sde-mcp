@@ -30,7 +30,8 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
     let categories = scan_index(&root.join("categories.jsonl"), &pb)?;
     let (blueprints, product_to_blueprint) = scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
-    let (type_dogma, effect_to_types) = scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
+    let (type_dogma, effect_to_types, attribute_types) =
+        scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
     let map_constellations = scan_index(&root.join("mapConstellations.jsonl"), &pb)?;
     let map_regions = scan_index(&root.join("mapRegions.jsonl"), &pb)?;
@@ -78,6 +79,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         stargate_graph,
         attribute_modifiers,
         effect_to_types,
+        attribute_types,
     }))
 }
 
@@ -269,15 +271,28 @@ fn scan_blueprints(
     ))
 }
 
-/// Scan typeDogma.jsonl into the id→offset index (like every other file) and a
-/// reverse `effect_to_types` map keyed by `effectID`. A dogma effect's
+/// Scan typeDogma.jsonl into the id→offset index (like every other file) and two
+/// reverse maps.
+///
+/// `effect_to_types` is keyed by `effectID`. A dogma effect's
 /// `modifierInfo.skillTypeID` is only a required-skill *filter* on the boosted
 /// modules, not the effect's source — the real source is the type whose
 /// `dogmaEffects` array owns the effect. This reverse map records that ownership
 /// so `sde_get_modifiers` direction-b can name the actual bonus source (e.g.
-/// Astrogeology, not just Mining). Mirrors `scan_blueprints`'s tuple-returning,
+/// Astrogeology, not just Mining).
+///
+/// `attribute_types` is keyed by `attributeID` and holds every Type that records
+/// an ExplicitValue for it. It rides along in this pass — which already
+/// full-parses every line for `effect_to_types` — so `sde_find_types` never
+/// touches the file at query time. Mirrors `scan_blueprints`'s tuple-returning,
 /// typed-inner-struct pattern.
-fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
+type TypeDogmaScan = (
+    SdeIndex,
+    HashMap<u64, Vec<u64>>,
+    HashMap<u32, Vec<(u32, f32)>>,
+);
+
+fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<TypeDogmaScan> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -291,17 +306,26 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
         key: u64,
         #[serde(rename = "dogmaEffects")]
         dogma_effects: Option<Vec<EffectRef>>,
+        #[serde(rename = "dogmaAttributes")]
+        dogma_attributes: Option<Vec<AttributeRef>>,
     }
     #[derive(serde::Deserialize)]
     struct EffectRef {
         #[serde(rename = "effectID")]
         effect_id: u64,
     }
+    #[derive(serde::Deserialize)]
+    struct AttributeRef {
+        #[serde(rename = "attributeID")]
+        attribute_id: u32,
+        value: Option<f32>,
+    }
 
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut effect_to_types: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut attribute_types: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
     let mut buf = String::new();
     let mut offset = 0u64;
     let mut parse_failures = 0u64;
@@ -337,6 +361,19 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
                 .or_default()
                 .push(parsed.key);
         }
+        // Types are keyed `u32` here; a `_key` beyond that range would be a schema
+        // change, and dropping it is better than truncating it onto another Type.
+        if let Ok(type_id) = u32::try_from(parsed.key) {
+            for a in parsed.dogma_attributes.into_iter().flatten() {
+                // A row with no `value` records no ExplicitValue, so it must not
+                // become a phantom 0.0 that a `lt` predicate would match.
+                let Some(value) = a.value else { continue };
+                attribute_types
+                    .entry(a.attribute_id)
+                    .or_default()
+                    .push((type_id, value));
+            }
+        }
     }
 
     if parse_failures > 0 {
@@ -347,6 +384,12 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
         );
     }
 
+    // Sorted once here so `sde_find_types` inherits a stable, ascending type_id
+    // order for free on every query rather than re-sorting per call.
+    for types in attribute_types.values_mut() {
+        types.sort_unstable_by_key(|&(type_id, _)| type_id);
+    }
+
     pb.inc(1);
     Ok((
         SdeIndex {
@@ -355,6 +398,7 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
             name_index: HashMap::new(),
         },
         effect_to_types,
+        attribute_types,
     ))
 }
 
@@ -859,7 +903,7 @@ mod tests {
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
-        let (idx, eff_to_types) = scan_type_dogma(&path, &pb).unwrap();
+        let (idx, eff_to_types, _) = scan_type_dogma(&path, &pb).unwrap();
 
         assert!(idx.id_index.contains_key(&3386));
         assert!(idx.id_index.contains_key(&3410));
@@ -872,6 +916,42 @@ mod tests {
         assert_eq!(owners.len(), 2);
         assert!(owners.contains(&3386), "Mining owns effect 391");
         assert!(owners.contains(&3410), "Astrogeology owns effect 391");
+    }
+
+    #[test]
+    fn scan_type_dogma_builds_the_attribute_to_types_index_in_the_same_pass() {
+        // The same pass that builds effect_to_types also inverts dogmaAttributes, so
+        // sde_find_types answers from memory and never re-reads typeDogma.jsonl.
+        let fixture = r#"{"_key":2456,"dogmaAttributes":[{"attributeID":64,"value":1.92},{"attributeID":9,"value":240.0}],"dogmaEffects":[]}
+{"_key":1202,"dogmaAttributes":[{"attributeID":64,"value":1.0}],"dogmaEffects":[]}
+{"_key":34,"dogmaAttributes":[],"dogmaEffects":[]}
+"#;
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (_idx, _eff, attribute_types) = scan_type_dogma(&path, &pb).unwrap();
+
+        // Ascending type_id, so every query inherits a deterministic order.
+        assert_eq!(
+            attribute_types.get(&64).unwrap(),
+            &[(1202, 1.0), (2456, 1.92)]
+        );
+        assert_eq!(attribute_types.get(&9).unwrap(), &[(2456, 240.0)]);
+        assert!(
+            !attribute_types.values().flatten().any(|&(t, _)| t == 34),
+            "a type with no dogmaAttributes contributes no rows"
+        );
+    }
+
+    #[test]
+    fn scan_type_dogma_skips_attribute_rows_with_no_value() {
+        // A row with no `value` records no ExplicitValue. Defaulting it to 0.0 would
+        // invent a Type that a `lt` predicate then matches.
+        let fixture =
+            "{\"_key\":2456,\"dogmaAttributes\":[{\"attributeID\":64}],\"dogmaEffects\":[]}\n";
+        let (_f, path) = write_fixture(fixture);
+        let pb = hidden_pb();
+        let (_idx, _eff, attribute_types) = scan_type_dogma(&path, &pb).unwrap();
+        assert!(!attribute_types.contains_key(&64));
     }
 
     #[test]
