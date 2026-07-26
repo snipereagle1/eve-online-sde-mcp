@@ -4032,34 +4032,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn measure_category_resolution() {
-        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".local/share/eve-sde-mcp");
-        let store = crate::scan::scan_sde(&dir, 3444265, "x").unwrap();
-        eprintln!("groups declared: {}", store.groups.id_index.len());
-
-        // What the epic's "resolve through groups.jsonl" costs per query: there is
-        // no categoryID index, so finding a Category's Groups means reading and
-        // parsing every Group record.
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let mut hits = 0usize;
-            for &gid in store.groups.id_index.keys() {
-                if let Ok(v) = crate::tools::query::fetch_by_id(&store.groups, gid) {
-                    if v.get("categoryID").and_then(|c| c.as_u64()) == Some(6) {
-                        hits += 1;
-                    }
-                }
-            }
-            eprintln!("seek+parse every Group for category 6: {:?} ({hits} groups)", t.elapsed());
-        }
-        let t = std::time::Instant::now();
-        let n = store.category_groups.get(&6).map(|g| g.len()).unwrap_or(0);
-        eprintln!("category_groups lookup: {:?} ({n} groups)", t.elapsed());
-    }
-
-    #[test]
     fn skill_sp_matches_canonical_rank1_points() {
         assert_eq!(skill_sp(1, 1), 250);
         assert_eq!(skill_sp(1, 2), 1414);
