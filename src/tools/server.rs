@@ -173,8 +173,9 @@ pub struct TypesDogmaParam {
     pub type_ids: Vec<u64>,
     /// Return only these DogmaAttributes for each Type instead of all of them — a
     /// field selector. A Type recording no ExplicitValue for one of them simply has
-    /// no entry for it; that is absence, not a zero and not the DefaultValue.
-    /// Effects are unaffected.
+    /// no entry for it; that is absence, not a zero and not the DefaultValue. An
+    /// attribute ID the SDE declares nowhere is a typo and is rejected. Effects are
+    /// unaffected.
     pub attribute_ids: Option<Vec<u64>>,
     /// Join attributeID→name and decode skill-prerequisite attrs (182/183/184 +
     /// levels) into a `requiredSkill` object, exactly as sde_get_type_dogma does.
@@ -272,7 +273,8 @@ pub struct FindTypesParam {
     /// Also return each row's ExplicitValue for these DogmaAttributes, in an
     /// `attributes` map. A projection, not a predicate: it never adds, drops or
     /// reorders a row. An attribute a Type records no ExplicitValue for is absent
-    /// from its map — not a zero and not the attribute's DefaultValue.
+    /// from its map — not a zero and not the attribute's DefaultValue. An attribute
+    /// ID the SDE declares nowhere is a typo and is rejected.
     pub project_attributes: Option<Vec<u64>>,
     /// Maximum rows to return (default: 100, capped at 1000). Predicates apply to
     /// the whole candidate set first, so `total_matched` is the real count even
@@ -443,6 +445,9 @@ impl SdeMcpServer {
     fn find_types(&self, p: &FindTypesParam) -> Result<FindTypesResult, ErrorData> {
         let group_filter = self.resolve_group_filter(p)?;
         let type_id_filter = resolve_type_id_filter(p);
+        // Validated up front, so a typo'd attribute is rejected whether or not the
+        // predicates happen to match anything.
+        let projected = self.resolve_attribute_projection(p.project_attributes.as_deref())?;
         let mut attribute_default = None;
 
         // The candidate set comes from the narrowest index that any predicate
@@ -563,17 +568,9 @@ impl SdeMcpServer {
             .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
             .min(MAX_FIND_TYPES_LIMIT) as usize;
         let total_matched = matched.len();
-        // Resolved once, and applied inside `take(limit)` below so a truncated page
-        // never pays projection for rows it is not returning.
-        let projected: Option<Vec<u32>> = p
-            .project_attributes
-            .as_deref()
-            .filter(|ids| !ids.is_empty())
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|&id| u32::try_from(id).ok())
-                    .collect()
-            });
+        // `projected` was resolved and validated before any predicate ran, and is
+        // applied inside `take(limit)` below so a truncated page never pays
+        // projection for rows it is not returning.
         let types: Vec<FoundType> = matched
             .iter()
             .take(limit)
@@ -672,6 +669,43 @@ impl SdeMcpServer {
                 Some((u64::from(attribute_id), rows[at].1))
             })
             .collect()
+    }
+
+    /// The DogmaAttribute IDs a caller named for projection, or `None` when it named
+    /// none — an empty list is read as no projection, like every other empty list
+    /// here. Shared by `sde_find_types`' `project_attributes` and
+    /// `sde_get_types_dogma`' `attribute_ids` so the two cannot disagree about what
+    /// a caller may ask for.
+    ///
+    /// Two different absences are deliberately not the same thing. An attribute the
+    /// SDE declares but *this* Type records no ExplicitValue for is legitimate
+    /// absence, and still yields no entry rather than a zero or the DefaultValue. An
+    /// attribute the SDE declares **nowhere** is a typo, and answering a typo with a
+    /// confidently empty projection is the failure this whole feature exists to end
+    /// — so it is an error, naming the offending ID exactly as
+    /// [`Self::resolve_group_filter`] does for an undeclared Group.
+    fn resolve_attribute_projection(
+        &self,
+        ids: Option<&[u64]>,
+    ) -> Result<Option<Vec<u32>>, ErrorData> {
+        let Some(named) = ids.filter(|ids| !ids.is_empty()) else {
+            return Ok(None);
+        };
+        named
+            .iter()
+            .map(|&id| {
+                u32::try_from(id)
+                    .ok()
+                    .filter(|_| self.store.dogma_attributes.id_index.contains_key(&id))
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            format!("attribute {id} not found in dogmaAttributes"),
+                            None,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<u32>, _>>()
+            .map(Some)
     }
 
     /// The byte offsets in `types.jsonl` of every Type whose name contains `query`,
@@ -1246,7 +1280,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids evaluates only the Types you name, which is how you ask 'of these 60 I already hold, which are published / carry attribute X'. meta_group_ids, published_only and query narrow a candidate set and cannot be the only predicate; type_ids can, because you supplied the set. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids evaluates only the Types you name, which is how you ask 'of these 60 I already hold, which are published / carry attribute X'. meta_group_ids, published_only and query narrow a candidate set and cannot be the only predicate; type_ids can, because you supplied the set. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue, while an attribute ID the SDE declares nowhere is rejected as a typo. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
     )]
     async fn sde_find_types(
         &self,
@@ -1444,17 +1478,18 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false. Pass attribute_ids to project each Type's dogma down to just those DogmaAttributes — ships carry over a hundred, so reading two fields across 60 of them costs kilobytes instead of hundreds. An attribute a Type records no ExplicitValue for is absent from its entry rather than an error, and effects are returned either way. resolve_names annotates each returned attribute with its name and decodes skill prerequisites, exactly as sde_get_type_dogma does. Omitting both returns today's full record unchanged."
+        description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false. Pass attribute_ids to project each Type's dogma down to just those DogmaAttributes — ships carry over a hundred, so reading two fields across 60 of them costs kilobytes instead of hundreds. An attribute a Type records no ExplicitValue for is absent from its entry rather than an error, while an attribute ID the SDE declares nowhere is rejected as a typo; effects are returned either way. resolve_names annotates each returned attribute with its name and decodes skill prerequisites, exactly as sde_get_type_dogma does. Omitting both returns today's full record unchanged."
     )]
     async fn sde_get_types_dogma(
         &self,
         Parameters(p): Parameters<TypesDogmaParam>,
     ) -> Result<String, ErrorData> {
-        // Built once for the batch rather than per Type.
-        let wanted: Option<HashSet<u64>> = p
-            .attribute_ids
-            .as_ref()
-            .map(|ids| ids.iter().copied().collect());
+        // Validated and built once for the batch rather than per Type. An attribute
+        // the SDE declares nowhere is rejected here; one a given Type simply does
+        // not record still yields no entry, which is a different thing.
+        let wanted: Option<HashSet<u64>> = self
+            .resolve_attribute_projection(p.attribute_ids.as_deref())?
+            .map(|ids| ids.into_iter().map(u64::from).collect());
         let resolve_names = p.resolve_names.unwrap_or(false);
         let out: Vec<_> = p
             .type_ids
@@ -3641,6 +3676,49 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn get_types_dogma_rejects_an_attribute_the_sde_does_not_declare()
+        -> anyhow::Result<()> {
+            // The other half of the pair above. An attribute a Type does not carry
+            // is legitimate absence; an attribute that exists nowhere is a typo, and
+            // answering a typo with a confidently empty projection is exactly the
+            // failure this feature exists to end.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [2456], "attribute_ids": [64, 999999]}),
+                )
+                .await;
+            assert!(r.is_err(), "an undeclared attribute must be rejected");
+            assert!(format!("{}", r.unwrap_err()).contains("999999"));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_reads_an_empty_attribute_list_as_no_projection()
+        -> anyhow::Result<()> {
+            // Naming nothing is not the same as projecting everything away — it is
+            // the same as not asking, which keeps the record byte-identical and
+            // matches how sde_find_types reads an empty project_attributes.
+            let seam = Seam::boot().await?;
+            let empty = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [17940], "attribute_ids": []}),
+                )
+                .await?;
+            let omitted = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [17940]}),
+                )
+                .await?;
+            assert_eq!(empty, omitted);
+            assert_eq!(attribute_ids_of(&empty[0]).len(), 5);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
         async fn get_types_dogma_resolve_names_annotates_the_batch() -> anyhow::Result<()> {
             // The parameter the single-Type call already takes; passing it here used
             // to be a schema error.
@@ -5074,6 +5152,46 @@ mod tests {
             assert_eq!(
                 nothing_recorded["types"][0]["attributes"],
                 serde_json::json!({})
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_rejects_a_projected_attribute_the_sde_does_not_declare()
+        -> anyhow::Result<()> {
+            // A projection is not a predicate, but a typo'd ID in one still produces
+            // a confidently empty answer, so it is rejected the way an undeclared
+            // Group is — and by the same helper sde_get_types_dogma uses, so the two
+            // tools cannot drift.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [101], "project_attributes": [64, 999999]}),
+                )
+                .await;
+            assert!(r.is_err(), "an undeclared attribute must be rejected");
+            assert!(format!("{}", r.unwrap_err()).contains("999999"));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_reads_an_empty_projection_list_as_no_projection() -> anyhow::Result<()>
+        {
+            // Naming nothing is not the same as projecting nothing: the `attributes`
+            // key is omitted rather than emitted empty, so an empty map keeps its
+            // one meaning — this Type records none of the attributes you named.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"group_ids": [101], "project_attributes": []}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218, 10248, 10252]);
+            assert!(
+                r["types"][0].get("attributes").is_none(),
+                "an empty list names no projection: {r}"
             );
             seam.shutdown().await
         }
