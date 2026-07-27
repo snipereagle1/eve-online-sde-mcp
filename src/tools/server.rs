@@ -588,6 +588,17 @@ impl SdeMcpServer {
             .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
             .min(MAX_FIND_TYPES_LIMIT) as usize;
         let total_matched = matched.len();
+        // How many Types record the attribute at all, before the operator and the
+        // narrowing predicates cut the set. `total_matched` cannot answer that —
+        // reading a post-filter zero as "nothing records this attribute" is what
+        // told a caller asking for jumpFatigueMultiplier > 999 that the SDE has no
+        // such attribute while 66 Types carry it.
+        let attribute_recorded = p
+            .attribute
+            .as_ref()
+            .and_then(|a| u32::try_from(a.id).ok())
+            .and_then(|id| self.store.attribute_types.get(&id))
+            .map_or(0, Vec::len);
         // `projected` was resolved and validated before any predicate ran, and is
         // applied inside `take(limit)` below so a truncated page never pays
         // projection for rows it is not returning.
@@ -644,6 +655,11 @@ impl SdeMcpServer {
             // ambiguity to resolve.
             guidance: guidance_for(
                 p.attribute.as_ref().map(|a| a.id),
+                // Counted off the inverted index, not off `matched`: the message
+                // turns on whether the SDE records the attribute at all, which is
+                // true or false before this call's operator and narrowing
+                // predicates ever run.
+                attribute_recorded,
                 total_matched,
                 total_matched > types_len,
                 |attr| self.store.attribute_modifiers.contains_key(&attr),
@@ -761,6 +777,9 @@ impl SdeMcpServer {
                 .name_index
                 .ids_containing(needle)
                 .into_iter()
+                // A predicate, not a ranking: `sde_find_types` orders by ID, so
+                // the exact-name flag `search_by_name` sorts on is dropped here.
+                .map(|hit| hit.id)
                 .collect(),
         )
     }
@@ -1590,7 +1609,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records."
+        description = "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records. A name several Types share resolves to one of them: the lowest published ID, or the lowest of all when none is published."
     )]
     async fn sde_resolve_types(
         &self,
@@ -1616,13 +1635,26 @@ impl SdeMcpServer {
             .unwrap_or_default()
             .iter()
             .map(|name| {
-                // The lowest ID when a name is shared — 1,016 names in build
-                // 3444265 are, up to 229 Types deep. One ID per name is this
-                // tool's contract and stays that way; the lowest is at least the
-                // same one on every call, where the overwritten offset this
-                // replaced was whichever record the scan reached last. Callers
-                // needing the whole group use sde_search_types, which returns it.
-                match self.store.types.name_index.lowest_id(&name.to_lowercase()) {
+                // One ID per name is this tool's contract and stays that way —
+                // 1,016 names in build 3444265 are shared, up to 229 Types deep,
+                // and callers needing the whole group use sde_search_types.
+                //
+                // The lowest *published* ID, falling back to the lowest of all.
+                // Ranking by ID alone answered "Angel Control Tower" with the
+                // unpublished 3591 rather than the published 27539 — a legacy
+                // record every follow-up call then reports as having no data.
+                // Publication is the SDE's own statement of which duplicate is
+                // the live one, so it outranks age; the ID tiebreak still makes
+                // the answer identical on every call.
+                let ids = self.store.types.name_index.ids_for(&name.to_lowercase());
+                let chosen = ids
+                    .iter()
+                    .copied()
+                    .find(|&id| {
+                        u32::try_from(id).is_ok_and(|id| self.store.published_types.contains(&id))
+                    })
+                    .or_else(|| ids.first().copied());
+                match chosen {
                     Some(id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
                     None => serde_json::json!({"name": name, "found": false}),
                 }
@@ -1900,7 +1932,7 @@ Pick the most direct tool — most questions are ONE call, not a fan-out:
 - \"Which skills/ships boost ATTRIBUTE X (e.g. mining yield, attr 77)\" → sde_get_modifiers with attribute_id — one call returns every modifier, one row per owning type. Read source_type_id/source_type_name as the bonus SOURCE (e.g. Astrogeology); required_skill_id/required_skill_name is only a target-module filter, NOT the source. Use type_id for the inverse, effect_id for a single effect's modifierInfo.
 - HAS vs MODIFIES — the two questions sound alike and use disjoint data. \"Which Types HAVE attribute X\" (carry a stored ExplicitValue for it) → sde_find_types with attribute {id: X}. \"Which Types MODIFY attribute X\" (boost/penalise it) → sde_get_modifiers with attribute_id X. An empty answer from either is NOT evidence the other is empty: nothing modifies attr 1971, yet 66 Types carry it. Both tools say so on an empty result and name the other — read that before concluding the SDE lacks the data.
 - Finding the attribute or effect ID in the first place → sde_search_dogma by name. Needs a contiguous substring: it matches text, so a spaced phrase will not reach a camelCase-only identifier.
-- Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery. Note sde_resolve_types answers one ID per exact name, so a name shared by several Types resolves to the lowest ID only.
+- Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery. Note sde_resolve_types answers one ID per exact name, so a name shared by several Types resolves to one of them only — the lowest published ID, or the lowest of all when none is published. Use sde_search_types when you need the whole group.
 - Several types or dogma records at once → sde_get_types / sde_get_types_dogma (batched), not many single calls.
 - Decoding skill prereqs from raw dogma → pass resolve_names:true to sde_get_type_dogma instead of memorizing attribute IDs 182/277 etc.
 - \"How do I build / manufacture / produce X\" or \"bill of materials / production chain\" → sde_build_type FIRST (classifies the whole build tree + buy-vs-build gates), then sde_get_production_chain for quantities. Do NOT give fitting advice (modules/tank/DPS) for a build request unless the user explicitly asks about fitting.
@@ -2089,19 +2121,53 @@ const STANDALONE_PREDICATES: &str =
     "attribute {id, op?, value?}, group_ids, category_ids, type_ids";
 const NARROW_ONLY_PREDICATES: &str = "meta_group_ids, published_only and query";
 
-/// The two narrow cases where a `sde_find_types` response invites a wrong
-/// conclusion. Kept a free function so the branch is testable without a store, and
-/// so the empty case and the truncated case cannot both fire — an empty result is
-/// never truncated, so their conditions are disjoint by construction.
+/// The narrow cases where a `sde_find_types` response invites a wrong conclusion.
+/// Kept a free function so the branches are testable without a store, and so the
+/// empty case and the truncated case cannot both fire — an empty result is never
+/// truncated, so their conditions are disjoint by construction.
+///
+/// `recorded` is how many Types record an ExplicitValue for the attribute at all,
+/// counted before this call's operator and narrowing predicates. An empty answer
+/// means two different things either side of it, and only one of them is about the
+/// attribute: `recorded == 0` says the SDE stores nothing for it, while
+/// `recorded > 0` says the caller's own predicates excluded every carrier. Reading
+/// the second as the first is the mis-signal this whole tool exists to end, and
+/// `total_matched` alone cannot tell them apart.
 ///
 /// `anything_modifies` is a closure rather than a bool because it is only worth a
 /// map lookup in the empty-attribute case.
 fn guidance_for(
     attribute_id: Option<u64>,
+    recorded: usize,
     total_matched: usize,
     truncated: bool,
     anything_modifies: impl Fn(u64) -> bool,
 ) -> Option<String> {
+    if let Some(attr) = attribute_id
+        && total_matched == 0
+        && recorded > 0
+    {
+        // The count is the correction: it contradicts the "no data" reading on the
+        // spot, and names the predicates as the thing to relax rather than the
+        // attribute as the thing to doubt.
+        let mut msg = format!(
+            "{recorded} Types record an ExplicitValue for attribute {attr}, but none \
+             of them satisfied the rest of this call — the attribute ID is not the \
+             problem. Relax the predicates before concluding the SDE has no answer: \
+             the op/value comparison first, then {NARROW_ONLY_PREDICATES}, then any \
+             {STANDALONE_PREDICATES} you combined with it. Types with no ExplicitValue \
+             are absent by design; they still HAVE the attribute at its DefaultValue, \
+             which this tool never matches on."
+        );
+        if anything_modifies(attr) {
+            msg.push_str(&format!(
+                " Something in the SDE also MODIFIES this attribute, so if you meant \
+                 'what boosts {attr}' rather than 'what carries {attr}', call \
+                 sde_get_modifiers with attribute_id {attr}."
+            ));
+        }
+        return Some(msg);
+    }
     if let Some(attr) = attribute_id
         && total_matched == 0
     {
@@ -3151,6 +3217,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sde_get_solar_system_by_name_prefers_the_system_actually_named_that() {
+        // Both real records: Mohas (30000031) sorts ahead of Moh (30000042) by ID and
+        // contains its name, so the single row this tool takes used to be the wrong
+        // system — silently, and then fed onward into sde_find_route as a `_key`.
+        let (_f, map_solar_systems) = make_index(
+            "{\"_key\":30000031,\"name\":{\"en\":\"Mohas\"}}\n{\"_key\":30000042,\"name\":{\"en\":\"Moh\"}}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                map_solar_systems,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_solar_system(Parameters(SolarSystemParam {
+                system_id: None,
+                name: Some("Moh".to_string()),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 30000042);
+        assert_eq!(v["name"]["en"], "Moh");
+    }
+
+    #[tokio::test]
+    async fn sde_get_region_by_name_prefers_the_region_actually_named_that() {
+        let (_f, map_regions) = make_index(
+            "{\"_key\":10000001,\"name\":{\"en\":\"Derelik North\"}}\n{\"_key\":10000002,\"name\":{\"en\":\"Derelik\"}}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                map_regions,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_get_region(Parameters(RegionParam {
+                region_id: None,
+                name: Some("Derelik".to_string()),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["_key"], 10000002);
+    }
+
+    #[tokio::test]
+    async fn sde_resolve_types_prefers_the_published_record_of_a_shared_name() {
+        // Both real: 3591 and 27539 are both "Angel Control Tower", and the lower ID
+        // is the unpublished legacy record. Answering with it sends every follow-up
+        // call — get_type, get_type_dogma, get_blueprint_for_product — at a placeholder.
+        let (_f, types) = make_index(
+            "{\"_key\":3591,\"name\":{\"en\":\"Angel Control Tower\"},\"published\":false}\n\
+             {\"_key\":27539,\"name\":{\"en\":\"Angel Control Tower\"},\"published\":true}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                types,
+                published_types: HashSet::from([27539]),
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_resolve_types(Parameters(ResolveTypesParam {
+                type_ids: None,
+                names: Some(vec!["angel control tower".to_string()]),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["by_name"][0]["type_id"], 27539);
+        assert_eq!(v["by_name"][0]["found"], true);
+    }
+
+    #[tokio::test]
+    async fn sde_resolve_types_falls_back_to_the_lowest_id_when_none_is_published() {
+        // Publication only breaks the tie when the SDE states it. With no published
+        // carrier the answer is still the lowest ID, and still the same on every call.
+        let (_f, types) = make_index(
+            "{\"_key\":10248,\"name\":{\"en\":\"Ghost\"},\"published\":false}\n\
+             {\"_key\":10252,\"name\":{\"en\":\"Ghost\"},\"published\":false}\n",
+        );
+        let server = SdeMcpServer::new(
+            Arc::new(SdeStore {
+                types,
+                ..default_store()
+            }),
+            None,
+        );
+        let result = server
+            .sde_resolve_types(Parameters(ResolveTypesParam {
+                type_ids: None,
+                names: Some(vec!["Ghost".to_string()]),
+            }))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["by_name"][0]["type_id"], 10248);
+    }
+
+    #[tokio::test]
     async fn sde_find_route_returns_path_with_correct_jump_count() {
         // A → B → C → D: 3 jumps, 4 systems
         let mut graph = HashMap::new();
@@ -3721,6 +3892,10 @@ mod tests {
             // iteration order is fixed for the life of a process and reseeded
             // between them, so a loop against a single `Seam` would pass on the
             // nondeterministic ordering this replaced.
+            //
+            // The Types named exactly "mining" lead — only the skill 3386 is — and
+            // the rest follow by ID. Both halves are ordered by the record, never by
+            // arrival, so the two boots agree.
             let first = Seam::boot().await?;
             let a = first
                 .call("sde_search_types", serde_json::json!({"query": "mining"}))
@@ -3733,7 +3908,7 @@ mod tests {
                 .await?;
             second.shutdown().await?;
 
-            assert_eq!(keys_of(&a), vec![1202, 3218, 3386, 10248, 10252, 17940]);
+            assert_eq!(keys_of(&a), vec![3386, 1202, 3218, 10248, 10252, 17940]);
             assert_eq!(keys_of(&a), keys_of(&b));
             Ok(())
         }
@@ -3889,7 +4064,8 @@ mod tests {
                     serde_json::json!({"query": "mining", "limit": 4, "published_only": true}),
                 )
                 .await?;
-            assert_eq!(keys_of(&r), vec![1202, 3218, 3386, 17940]);
+            // Exactly-named first (the Mining skill), then the rest by ID.
+            assert_eq!(keys_of(&r), vec![3386, 1202, 3218, 17940]);
             seam.shutdown().await
         }
 
@@ -5689,7 +5865,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn find_types_points_at_modifiers_when_nothing_carries() -> anyhow::Result<()> {
+        async fn find_types_points_at_modifiers_when_an_empty_answer_may_be_the_wrong_question()
+        -> anyhow::Result<()> {
             // The reciprocal direction: a predicate that matched nothing, on an
             // attribute something does modify — so MODIFIES may be what was wanted.
             let seam = Seam::boot().await?;
@@ -5706,6 +5883,45 @@ mod tests {
                 g.contains("DefaultValue"),
                 "restates ExplicitValue-only: {g}"
             );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_blames_the_predicates_not_the_attribute_when_carriers_exist()
+        -> anyhow::Result<()> {
+            // Five fixture Types record attribute 1971 and none is above 999. The
+            // count comes off the inverted index, before the operator ran, so the
+            // response cannot claim the attribute is unrecorded when it is recorded
+            // and merely filtered out — the mis-signal #37 was opened for.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971, "op": "gt", "value": 999.0}}),
+                )
+                .await?;
+            assert_eq!(r["total_matched"], 0);
+            let g = r["guidance"].as_str().expect("guidance on an empty match");
+            assert!(
+                !g.contains("No Type records"),
+                "must not deny the five stored rows: {g}"
+            );
+            assert!(g.contains("5 Types record"), "quotes the true count: {g}");
+
+            // Same correction when it is a narrowing predicate, not the operator,
+            // that empties the set: group 18 Mineral carries no 1971 at all.
+            let narrowed = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 1971}, "group_ids": [18]}),
+                )
+                .await?;
+            assert_eq!(narrowed["total_matched"], 0);
+            let g = narrowed["guidance"]
+                .as_str()
+                .expect("guidance on an empty match");
+            assert!(g.contains("5 Types record"), "quotes the true count: {g}");
+            assert!(g.contains("group_ids"), "names the predicate to relax: {g}");
             seam.shutdown().await
         }
 
@@ -6073,6 +6289,61 @@ mod tests {
         assert_eq!(skill_sp(1, 5), 256000);
         assert_eq!(skill_sp(3, 3), 24000); // rank scales linearly
         assert_eq!(skill_sp(1, 0), 0);
+    }
+
+    #[test]
+    fn guidance_separates_an_unrecorded_attribute_from_an_over_narrowed_call() {
+        // The regression this pins: attribute 1971 is recorded by 66 Types, none of
+        // them above 999. A post-filter zero told the caller "No Type records an
+        // ExplicitValue for attribute 1971" — the SDE-has-no-data reading that
+        // sde_find_types exists to end, produced by the tool itself.
+        let g = guidance_for(Some(1971), 66, 0, false, |_| false).expect("empty answer");
+        assert!(
+            !g.contains("No Type records"),
+            "must not deny the 66 stored rows: {g}"
+        );
+        assert!(g.contains("66 Types record"), "quotes the true count: {g}");
+        assert!(
+            g.contains("not the problem"),
+            "acquits the attribute ID so the caller stops doubting it: {g}"
+        );
+
+        // With nothing recorded, the same zero means what the old text said.
+        let g = guidance_for(Some(30), 0, 0, false, |_| false).expect("empty answer");
+        assert!(g.contains("No Type records an ExplicitValue"), "{g}");
+        assert!(
+            g.contains("sde_search_dogma"),
+            "routes to verification: {g}"
+        );
+    }
+
+    #[test]
+    fn guidance_keeps_the_modifiers_pointer_on_both_empty_shapes() {
+        // HAS vs MODIFIES is live whichever way the answer emptied: a caller who
+        // wanted "what boosts this" gets nothing from either count.
+        let over_narrowed = guidance_for(Some(77), 5, 0, false, |_| true).expect("empty answer");
+        assert!(
+            over_narrowed.contains("sde_get_modifiers"),
+            "{over_narrowed}"
+        );
+        let unrecorded = guidance_for(Some(77), 0, 0, false, |_| true).expect("empty answer");
+        assert!(unrecorded.contains("sde_get_modifiers"), "{unrecorded}");
+
+        // And stays silent about it when there is nothing on that side either.
+        let neither = guidance_for(Some(77), 5, 0, false, |_| false).expect("empty answer");
+        assert!(
+            !neither.contains("sde_get_modifiers"),
+            "must not route to a tool that is also empty: {neither}"
+        );
+    }
+
+    #[test]
+    fn guidance_is_absent_when_the_answer_is_neither_empty_nor_truncated() {
+        assert!(guidance_for(Some(1971), 66, 66, false, |_| true).is_none());
+        // A non-empty page is not the empty case, whatever the recorded count says.
+        assert!(guidance_for(Some(1971), 66, 3, false, |_| true).is_none());
+        // No attribute predicate, no attribute guidance.
+        assert!(guidance_for(None, 0, 0, false, |_| true).is_none());
     }
 
     fn fixture_store() -> Arc<SdeStore> {

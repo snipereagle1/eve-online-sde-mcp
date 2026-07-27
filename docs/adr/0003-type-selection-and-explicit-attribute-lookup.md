@@ -124,6 +124,17 @@ self-description — empty-result pointers, truncation guidance — follows the 
 rule, and any count it quotes reads `total_matched`, never `returned`, for the
 same reason the `groups` rollup does.
 
+**A count describing what the SDE holds is measured before the call's predicates
+ran.** `total_matched` answers "how many rows survived what you asked", which is
+the right count for truncation guidance and the wrong one for any claim about the
+data: an empty answer means "the SDE records nothing here" or "your own predicates
+excluded every carrier", and `total_matched` is `0` either way. The empty-result
+pointer therefore counts the attribute's rows in the inverted index — before the
+operator and before the narrowing predicates — and says which of the two happened.
+Conflating them made the tool emit "No Type records an ExplicitValue for attribute
+1971" in answer to `1971 > 999`, while 66 Types record it: the exact SDE-has-no-data
+misreading this ADR exists to end, this time produced by the fix for it.
+
 The contract above is the finished shape, not the shape after any one ticket. It
 is delivered by #40 (`attribute`, `limit`, and the `total_matched` / `returned` /
 `truncated` / `attribute_semantics` / `attribute_default` envelope), #41
@@ -206,10 +217,25 @@ schedule working, not an omission to fix.
   predicate is handed that ID, so `published_only` reads `published_types`
   rather than seeking and parsing a record per candidate to read the same field.
 
+  Sorting by ID **alone** was wrong, though, and had to be corrected before this
+  branch landed: the exact-name lookups `sde_get_solar_system` and
+  `sde_get_region` ask for one row and take it, so ranking a longer containing
+  name ahead of the query's own name answered "Moh" with Mohas — deterministically,
+  for 75 solar systems. The order is exact-name matches first, then containing
+  ones, each half ascending by ID. Ranking is by name and never by ID magnitude,
+  so no record wins the row for being older.
+
   A name also turned out to key more than one record: 2,228 Types and 1,105
   marketGroups were unreachable by name because one offset per name overwrote
   the rest, silently. `NameIndex` therefore keys every name to its lowest ID and
-  keeps a second, small map of only the 1,413 shared names. Measured (release
+  keeps a second, small map of only the 1,413 shared names. Where a caller owes
+  exactly one answer for a shared name, the lowest ID is not by itself the right
+  one: `sde_resolve_types` takes the lowest **published** ID, falling back to the
+  lowest of all. 12 names in build 3444265 — "Angel Control Tower" among them —
+  put an unpublished legacy record at the low end, and answering with it sends
+  every follow-up call at a placeholder. Publication is the SDE's own statement
+  of which duplicate is live; the ID tiebreak still makes the answer identical
+  on every call. Measured (release
   builds, `/usr/bin/time -v`, five runs each): peak RSS 31.9 → 32.4 MB,
   **+0.5 MB**, with startup inside run-to-run variance (0.48 → 0.53 s). The
   obvious `HashMap<String, Vec<u64>>` costs **+4.2 MiB** instead — 63,343 `Vec`

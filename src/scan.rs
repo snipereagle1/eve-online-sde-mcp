@@ -904,7 +904,7 @@ mod tests {
 
         assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
         assert!(
-            store.types.name_index.lowest_id("tritanium").is_some(),
+            !store.types.name_index.ids_for("tritanium").is_empty(),
             "Tritanium name index missing"
         );
         assert!(store.types.id_index.contains_key(&16227), "Ferox missing");
@@ -918,11 +918,11 @@ mod tests {
             "Perimeter missing"
         );
         assert!(
-            store
+            !store
                 .map_solar_systems
                 .name_index
-                .lowest_id("jita")
-                .is_some(),
+                .ids_for("jita")
+                .is_empty(),
             "Jita name index missing"
         );
 
@@ -1061,8 +1061,8 @@ mod tests {
         assert_eq!(idx.id_index.len(), 2);
         assert!(idx.id_index.contains_key(&34));
         assert!(idx.id_index.contains_key(&35));
-        assert!(idx.name_index.lowest_id("tritanium").is_some());
-        assert!(idx.name_index.lowest_id("pyerite").is_some());
+        assert!(!idx.name_index.ids_for("tritanium").is_empty());
+        assert!(!idx.name_index.ids_for("pyerite").is_empty());
     }
 
     #[test]

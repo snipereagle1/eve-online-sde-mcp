@@ -76,28 +76,56 @@ impl NameIndex {
         }
     }
 
-    /// The lowest `_key` under `name`, for callers whose contract is one answer.
-    pub(crate) fn lowest_id(&self, name: &str) -> Option<u64> {
-        self.first.get(name).copied()
+    /// Every `_key` under `name`, ascending — the whole collision group, for a
+    /// caller that owes one answer but gets to choose which. Which one is the
+    /// caller's call and not this index's: `sde_resolve_types` prefers the lowest
+    /// *published* record, because the lowest ID of all is sometimes an unpublished
+    /// legacy duplicate. The unshared case
+    /// borrows the value in `first` rather than allocating a one-element `Vec`,
+    /// which is 62,000 of the 63,343 names.
+    pub(crate) fn ids_for(&self, name: &str) -> &[u64] {
+        match self.shared.get(name) {
+            Some(ids) => ids,
+            None => self
+                .first
+                .get(name)
+                .map(std::slice::from_ref)
+                .unwrap_or_default(),
+        }
     }
 
-    /// The `_key`s of every record whose name contains `needle`, in no particular
-    /// order — callers sort. Answered entirely from resident strings, so narrowing
-    /// a match set costs no seek.
-    pub(crate) fn ids_containing(&self, needle: &str) -> Vec<u64> {
+    /// Every record whose name contains `needle`, in no particular order —
+    /// callers sort. Answered entirely from resident strings, so narrowing a
+    /// match set costs no seek.
+    pub(crate) fn ids_containing(&self, needle: &str) -> Vec<NameHit> {
         let needle = needle.to_lowercase();
         let mut out = Vec::new();
         for (name, &id) in &self.first {
             if !name.contains(&needle) {
                 continue;
             }
+            let exact = *name == needle;
             match self.shared.get(name) {
-                Some(ids) => out.extend_from_slice(ids),
-                None => out.push(id),
+                Some(ids) => out.extend(ids.iter().map(|&id| NameHit { id, exact })),
+                None => out.push(NameHit { id, exact }),
             }
         }
         out
     }
+}
+
+/// One name-search hit: the record's `_key`, and whether the name it matched **is**
+/// the query rather than merely containing it.
+///
+/// The flag exists because a substring search ordered by ID alone answers an
+/// exact-name question with the wrong record: 75 solar system names in build
+/// 3444265 are proper substrings of a lower-ID system's name, so "Moh" sorted
+/// behind Mohas and `sde_get_solar_system`, which takes the first row, returned
+/// Mohas. See [`crate::tools::query::search_by_name`] for the ordering it drives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NameHit {
+    pub(crate) id: u64,
+    pub(crate) exact: bool,
 }
 
 /// Which blueprint activity yields a product. Manufacturing and reaction are the

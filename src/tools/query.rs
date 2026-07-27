@@ -16,8 +16,9 @@ pub fn fetch_by_id(index: &SdeIndex, id: u64) -> anyhow::Result<Value> {
     fetch_at_offset(&index.path, offset)
 }
 
-/// The records whose English name contains `query`, ascending by `_key` and
-/// capped at `limit`.
+/// The records whose English name contains `query`: the ones named exactly that
+/// first, then the rest, each half ascending by `_key` and the whole capped at
+/// `limit`.
 ///
 /// Collect → filter → sort → truncate, in that order, and each step is
 /// load-bearing:
@@ -28,20 +29,26 @@ pub fn fetch_by_id(index: &SdeIndex, id: u64) -> anyhow::Result<Value> {
 /// - `keep` is handed a `_key`, not a record, so a predicate answered from an
 ///   in-memory index costs no seek. A predicate that needs the record itself does
 ///   not belong here.
-/// - The sort is by ID rather than by `HashMap` iteration order, which is stable
-///   within one process and varies between them: the same question used to get a
-///   differently ordered answer after a restart.
+/// - Exact names sort ahead of merely-containing ones because the callers that
+///   pass `limit: 1` — `sde_get_solar_system` and `sde_get_region` by name — take
+///   the first row as *the* answer. Ordering by ID alone made that row Mohas for
+///   the query "Moh", and 74 other solar systems the same way: their names are
+///   proper substrings of a lower-ID system's. Ranking is by name, never by ID
+///   magnitude, so a longer name never wins by being older.
+/// - The tiebreak is by ID rather than by `HashMap` iteration order, which is
+///   stable within one process and varies between them: the same question used to
+///   get a differently ordered answer after a restart.
 pub fn search_by_name(
     index: &SdeIndex,
     query: &str,
     limit: usize,
     mut keep: impl FnMut(u64) -> bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut ids = index.name_index.ids_containing(query);
-    ids.retain(|&id| keep(id));
-    ids.sort_unstable();
-    ids.truncate(limit);
-    ids.iter().map(|&id| fetch_by_id(index, id)).collect()
+    let mut hits = index.name_index.ids_containing(query);
+    hits.retain(|hit| keep(hit.id));
+    hits.sort_unstable_by_key(|hit| (!hit.exact, hit.id));
+    hits.truncate(limit);
+    hits.iter().map(|hit| fetch_by_id(index, hit.id)).collect()
 }
 
 pub fn fetch_at_offset(path: &Path, offset: u64) -> anyhow::Result<Value> {
@@ -146,6 +153,55 @@ mod tests {
 
         let results = search_by_name(&idx, "alpha", 2, |_| true).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_by_name_prefers_the_exact_name_over_a_lower_id_containing_one() {
+        // The real shape: solar system Mohas (30000031) has a lower `_key` than Moh
+        // (30000042) and contains its name. `sde_get_solar_system` asks for one row
+        // and takes it, so ordering by ID alone answered "Moh" with Mohas — and with
+        // 74 other systems the same way.
+        let fixture = "{\"_key\":30000031,\"name\":{\"en\":\"Mohas\"}}\n{\"_key\":30000042,\"name\":{\"en\":\"Moh\"}}\n";
+        let (_f, path) = write_fixture(fixture);
+        let pb = indicatif::ProgressBar::hidden();
+        let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
+
+        let one = search_by_name(&idx, "Moh", 1, |_| true).unwrap();
+        assert_eq!(one[0]["_key"], 30000042, "the system actually named Moh");
+
+        // The containing matches are not dropped, only outranked — and they keep
+        // their ID order behind the exact one.
+        let all = search_by_name(&idx, "moh", 10, |_| true).unwrap();
+        let keys: Vec<_> = all.iter().map(|v| v["_key"].as_u64().unwrap()).collect();
+        assert_eq!(keys, vec![30000042, 30000031]);
+    }
+
+    #[test]
+    fn search_by_name_ranks_by_name_not_by_id_magnitude() {
+        // The exact match wins from the *back* of the ID order too: the rank is the
+        // name, so an older containing record cannot take the row either way.
+        let fixture =
+            "{\"_key\":1,\"name\":{\"en\":\"Jan\"}}\n{\"_key\":2,\"name\":{\"en\":\"Janus\"}}\n";
+        let (_f, path) = write_fixture(fixture);
+        let pb = indicatif::ProgressBar::hidden();
+        let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
+
+        let one = search_by_name(&idx, "Jan", 1, |_| true).unwrap();
+        assert_eq!(one[0]["_key"], 1);
+    }
+
+    #[test]
+    fn search_by_name_keeps_every_record_sharing_the_exact_name() {
+        // A name is not unique. Both carriers of an exact name outrank the merely
+        // containing record, ascending by ID between themselves.
+        let fixture = "{\"_key\":5,\"name\":{\"en\":\"Alpha Two\"}}\n{\"_key\":7,\"name\":{\"en\":\"Alpha\"}}\n{\"_key\":9,\"name\":{\"en\":\"Alpha\"}}\n";
+        let (_f, path) = write_fixture(fixture);
+        let pb = indicatif::ProgressBar::hidden();
+        let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
+
+        let all = search_by_name(&idx, "alpha", 10, |_| true).unwrap();
+        let keys: Vec<_> = all.iter().map(|v| v["_key"].as_u64().unwrap()).collect();
+        assert_eq!(keys, vec![7, 9, 5]);
     }
 
     #[test]
