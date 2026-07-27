@@ -250,9 +250,10 @@ pub struct FindTypesParam {
     /// Narrows a candidate set; it cannot be the only predicate — use
     /// sde_search_types for a bare name search.
     pub query: Option<String>,
-    /// Restrict to these Types — "of the 60 I already hold, which carry an
-    /// ExplicitValue for X". IDs the SDE does not declare simply match nothing.
-    /// Narrows a candidate set; it cannot be the only predicate.
+    /// Evaluate only these Types — "of the 60 I already hold, which carry an
+    /// ExplicitValue for X", or "which are published". Unlike the other narrowing
+    /// predicates this one can stand alone, because the set is yours and needs no
+    /// scan to produce. IDs the SDE does not declare simply match nothing.
     pub type_ids: Option<Vec<u64>>,
     /// Restrict to Types belonging to any of these Groups (e.g. 898 Black Ops).
     pub group_ids: Option<Vec<u64>>,
@@ -441,6 +442,7 @@ impl SdeMcpServer {
     /// set stays testable as a plain function.
     fn find_types(&self, p: &FindTypesParam) -> Result<FindTypesResult, ErrorData> {
         let group_filter = self.resolve_group_filter(p)?;
+        let type_id_filter = resolve_type_id_filter(p);
         let mut attribute_default = None;
 
         // The candidate set comes from the narrowest index that any predicate
@@ -448,13 +450,30 @@ impl SdeMcpServer {
         // predicate, the Group index when the call is taxonomy-only. Each index is
         // stored ascending at scan time, so filtering preserves the order that
         // truncation then cuts.
-        let mut matched: Candidates = match (p.attribute.as_ref(), &group_filter) {
-            (Some(pred), _) => {
+        let mut matched: Candidates = match (p.attribute.as_ref(), &type_id_filter, &group_filter) {
+            (Some(pred), _, _) => {
                 let (rows, default_value) = self.attribute_candidates(pred)?;
                 attribute_default = default_value;
                 rows
             }
-            (None, Some(groups)) => {
+            // The caller handed the set over, so this is the narrowest posting list
+            // there is and it costs no scan at all — which is why `type_ids`
+            // produces where the other narrowing predicates cannot. An ID the SDE
+            // does not declare is dropped rather than returned as a nameless,
+            // groupless row; `total_matched` is what reports the shortfall.
+            (None, Some(ids), _) => {
+                let mut candidates: Candidates = ids
+                    .iter()
+                    .filter(|&&id| self.store.types.id_index.contains_key(&u64::from(id)))
+                    .map(|&type_id| (type_id, None))
+                    .collect();
+                // Unlike every other candidate source this one is not an index run,
+                // so it arrives in `HashSet` order and has to be sorted here or
+                // `truncated` would cut a different page in every process.
+                candidates.sort_unstable_by_key(|&(type_id, _)| type_id);
+                candidates
+            }
+            (None, None, Some(groups)) => {
                 let mut candidates: Candidates = groups
                     .iter()
                     .flat_map(|g| self.store.group_types.get(g).into_iter().flatten())
@@ -469,12 +488,12 @@ impl SdeMcpServer {
                 }
                 candidates
             }
-            (None, None) => {
+            (None, None, None) => {
                 return Err(ErrorData::invalid_params(
                     "sde_find_types needs at least one predicate; available: attribute \
-                     {id, op?, value?}, group_ids, category_ids. meta_group_ids, \
-                     published_only, query and type_ids narrow a candidate set but \
-                     cannot produce one",
+                     {id, op?, value?}, group_ids, category_ids, type_ids. \
+                     meta_group_ids, published_only and query narrow a candidate set \
+                     but cannot produce one",
                     None,
                 ));
             }
@@ -487,7 +506,6 @@ impl SdeMcpServer {
         // the rollup below count matches instead of returned rows.
         let published_only = p.published_only.unwrap_or(false);
         let meta_group_filter = resolve_meta_group_filter(p);
-        let type_id_filter = resolve_type_id_filter(p);
         let query_filter = self.resolve_query_filter(p.query.as_deref());
         let mut excluded_no_meta_group = 0u64;
         if group_filter.is_some()
@@ -1228,7 +1246,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids narrows to a set you already hold. meta_group_ids, published_only, query and type_ids narrow a candidate set and cannot be the only predicate. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids evaluates only the Types you name, which is how you ask 'of these 60 I already hold, which are published / carry attribute X'. meta_group_ids, published_only and query narrow a candidate set and cannot be the only predicate; type_ids can, because you supplied the set. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
     )]
     async fn sde_find_types(
         &self,
@@ -1862,12 +1880,15 @@ const ATTRIBUTE_SEMANTICS: &str = "ExplicitValue only: rows are Types that recor
 /// to check an ID against and cannot tell a typo from a MetaGroup no Type uses. An
 /// ID too large to be one is dropped rather than errored for the same reason — it
 /// simply matches nothing, which is what the response then reports.
-/// The Types a call is restricted to, or `None` when it names none. Validates
-/// nothing, for the same reason [`resolve_meta_group_filter`] does not: a caller
-/// handing over a set it already holds is asking which of *those* match, and an
-/// ID the SDE never declared simply matches nothing — which is what the response
-/// then reports. Errors are reserved for the predicates that produce a candidate
-/// set, where a typo would otherwise read as a confident empty answer.
+/// The Types a call is restricted to, or `None` when it names none. Doubles as a
+/// candidate source: it is the one narrowing predicate that can stand alone,
+/// because producing from it is bounded by what the caller typed rather than by a
+/// scan — see ADR 0003's amendment.
+///
+/// Validates nothing, unlike the taxonomy predicates. A caller handing over a set
+/// it already holds is asking which of *those* match, and it is holding IDs it got
+/// from this server; an ID the SDE never declared matches nothing and the shortfall
+/// shows up in `total_matched` against the length of the list the caller sent.
 fn resolve_type_id_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
     let named = p.type_ids.as_deref().filter(|ids| !ids.is_empty())?;
     Some(
@@ -4892,7 +4913,10 @@ mod tests {
                 message.contains("query"),
                 "names query as narrowing: {message}"
             );
-            assert!(message.contains("type_ids"), "and type_ids too: {message}");
+            assert!(
+                message.contains("group_ids, category_ids, type_ids"),
+                "and lists type_ids among the predicates that do produce one: {message}"
+            );
             seam.shutdown().await
         }
 
@@ -4932,20 +4956,56 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn find_types_type_ids_is_not_a_predicate_on_its_own() -> anyhow::Result<()> {
-            // Like meta_group_ids and published_only: it narrows a candidate set
-            // another predicate produced. sde_get_types answers a bare ID list.
+        async fn find_types_type_ids_produces_a_candidate_set_on_its_own() -> anyhow::Result<()> {
+            // The one narrowing predicate that can stand alone: producing from it is
+            // bounded by what the caller typed, not by a scan. Rows come back in
+            // type ID order like every other answer rather than in the order the IDs
+            // arrived, and a repeated ID is one row.
             let seam = Seam::boot().await?;
             let r = seam
-                .try_call(
+                .call(
                     "sde_find_types",
-                    serde_json::json!({"type_ids": [648, 651]}),
+                    serde_json::json!({"type_ids": [651, 648, 651]}),
                 )
-                .await;
-            assert!(
-                r.is_err(),
-                "type_ids alone must not produce a candidate set"
-            );
+                .await?;
+            assert_eq!(ids_of(&r), vec![648, 651]);
+            assert_eq!(r["total_matched"], 2);
+            assert_eq!(r["types"][0]["name"], "Badger");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_type_ids_alone_narrows_by_published_only() -> anyhow::Result<()> {
+            // "Which of the ones I hold are published" — cheap, bounded, and an
+            // error until type_ids could produce a candidate set.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "type_ids": [1202, 3218, 10248, 10252], "published_only": true
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218]);
+            assert_eq!(r["total_matched"], 2);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_type_ids_drops_an_id_the_sde_does_not_declare() -> anyhow::Result<()> {
+            // Producing from the caller's list must not invent a row: an undeclared
+            // ID has no name and no Group, and emitting it as nulls would read as a
+            // Type that exists and could not be described.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"type_ids": [648, 999999]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![648]);
+            assert_eq!(r["total_matched"], 1);
             seam.shutdown().await
         }
 

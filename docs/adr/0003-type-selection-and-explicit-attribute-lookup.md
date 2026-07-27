@@ -108,10 +108,11 @@ Calling with no predicate at all is an error naming the available predicates,
 never a full dump — naming only the ones that already work, so the message stays
 truthful as later passes extend it. That message is also the one place stating
 which predicates **produce** a candidate set (`attribute`, `group_ids`,
-`category_ids`) and which only **narrow** one (`meta_group_ids`,
-`published_only`, and later `query` / `type_ids`). Any other text needing that
-distinction — over-broad-query guidance, tool descriptions — should derive from
-it rather than restate it, or the two drift the next time a predicate is added.
+`category_ids`, and later `type_ids` — see Amendment 1) and which only **narrow**
+one (`meta_group_ids`, `published_only`, and later `query`). Any other text
+needing that distinction — over-broad-query guidance, tool descriptions — should
+derive from it rather than restate it, or the two drift the next time a predicate
+is added.
 
 **Self-description keys are present exactly when the thing they describe ran,
 and omitted otherwise — never null, never empty.** `attribute_semantics` appears
@@ -221,3 +222,38 @@ schedule working, not an omission to fix.
   scales with predicate count.
 - Deferred, not rejected: multiple simultaneous attribute predicates, offset
   pagination, and `effect_ids` projection.
+
+## Amendments
+
+### 1. `type_ids` produces a candidate set (#48)
+
+**This decision replaces the original classification above**, which grouped
+`type_ids` with `meta_group_ids`, `published_only` and `query` as narrowing-only.
+`type_ids` now stands alone as a predicate; the other three still cannot.
+
+The original split conflated two different properties: *narrows* and *cannot
+produce cheaply*. `query`, `meta_group_ids` and `published_only` cannot produce
+because producing from them means an unbounded scan — the server holds no
+name → Type, MetaGroup → Type or published → Type posting list, and building one
+per query is the table scan this ADR rejected. `type_ids` has no such problem:
+**it is self-bounding.** The caller handed the set over, so producing from it
+costs one `id_index` membership test per ID the caller typed, which is cheaper
+than any other candidate source in the tool.
+
+Reading the split as a rule about narrowing rather than about cost cost us user
+story 22 ("pass explicit type IDs as a predicate, so that I can project
+attributes over a set I already hold"), and made `{type_ids, published_only}` —
+"which of my 60 are published" — an error despite being bounded and obviously
+sensible.
+
+Consequences:
+
+- An ID the SDE does not declare is dropped rather than returned as a nameless,
+  groupless row. `total_matched` against the length of the caller's list is what
+  reports the shortfall. `type_ids` still validates nothing and still errors on
+  nothing, unlike `group_ids` / `category_ids`.
+- The candidate set is deduplicated and **sorted here**, unlike every other
+  source: it is the only one that is not an index run already ascending from scan
+  time, so without the sort `truncated` would cut a different page per process.
+- The no-predicate error string moves `type_ids` to the producing list. Anything
+  deriving from that string — tool descriptions, empty-result guidance — follows.
