@@ -16,18 +16,45 @@ pub fn fetch_by_id(index: &SdeIndex, id: u64) -> anyhow::Result<Value> {
     fetch_at_offset(&index.path, offset)
 }
 
-pub fn search_by_name(index: &SdeIndex, query: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
+/// The `_key`s of every record whose lowercased English name contains `query`,
+/// in no particular order — callers sort. Answered entirely from resident
+/// strings, so narrowing a match set costs no seek.
+pub fn ids_matching_name(index: &SdeIndex, query: &str) -> Vec<u64> {
     let q = query.to_lowercase();
-    let mut results = Vec::new();
-    for (name, &offset) in &index.name_index {
-        if name.contains(&q) {
-            results.push(fetch_at_offset(&index.path, offset)?);
-            if results.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(results)
+    index
+        .name_index
+        .iter()
+        .filter(|(name, _)| name.contains(&q))
+        .map(|(_, &id)| id)
+        .collect()
+}
+
+/// The records whose English name contains `query`, ascending by `_key` and
+/// capped at `limit`.
+///
+/// Collect → filter → sort → truncate, in that order, and each step is
+/// load-bearing:
+///
+/// - `keep` sees the **whole** match set, before the cap. Filtering the returned
+///   page instead under-fills it — a request for 10 published Types used to come
+///   back with 3 while thousands matched, and nothing in the response said which.
+/// - `keep` is handed a `_key`, not a record, so a predicate answered from an
+///   in-memory index costs no seek. A predicate that needs the record itself does
+///   not belong here.
+/// - The sort is by ID rather than by `HashMap` iteration order, which is stable
+///   within one process and varies between them: the same question used to get a
+///   differently ordered answer after a restart.
+pub fn search_by_name(
+    index: &SdeIndex,
+    query: &str,
+    limit: usize,
+    mut keep: impl FnMut(u64) -> bool,
+) -> anyhow::Result<Vec<Value>> {
+    let mut ids = ids_matching_name(index, query);
+    ids.retain(|&id| keep(id));
+    ids.sort_unstable();
+    ids.truncate(limit);
+    ids.iter().map(|&id| fetch_by_id(index, id)).collect()
 }
 
 pub fn fetch_at_offset(path: &Path, offset: u64) -> anyhow::Result<Value> {
@@ -118,7 +145,7 @@ mod tests {
         let pb = indicatif::ProgressBar::hidden();
         let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
 
-        let results = search_by_name(&idx, "trit", 10).unwrap();
+        let results = search_by_name(&idx, "trit", 10, |_| true).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_key"], 34);
     }
@@ -130,7 +157,7 @@ mod tests {
         let pb = indicatif::ProgressBar::hidden();
         let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
 
-        let results = search_by_name(&idx, "alpha", 2).unwrap();
+        let results = search_by_name(&idx, "alpha", 2, |_| true).unwrap();
         assert_eq!(results.len(), 2);
     }
 

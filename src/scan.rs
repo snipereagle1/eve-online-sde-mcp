@@ -170,9 +170,11 @@ fn scan_index_with(
         if let Some(key) = extract_key(trimmed) {
             id_index.insert(key, line_start);
             on_line(key, trimmed);
-        }
-        if let Some(name) = extract_name_en(trimmed) {
-            name_index.insert(name.to_lowercase(), line_start);
+            // Nested inside the key branch because `name_index` stores the `_key`,
+            // not the offset — see `SdeIndex::name_index` for why.
+            if let Some(name) = extract_name_en(trimmed) {
+                name_index.insert(name.to_lowercase(), key);
+            }
         }
     }
 
@@ -968,7 +970,7 @@ mod tests {
         assert_eq!(tritanium["_key"], 34);
         assert_eq!(tritanium["groupID"], 18);
 
-        let results = query::search_by_name(&store.types, "ferox", 10).unwrap();
+        let results = query::search_by_name(&store.types, "ferox", 10, |_| true).unwrap();
         let keys: Vec<_> = results.iter().filter_map(|v| v["_key"].as_u64()).collect();
         assert!(
             keys.contains(&16227),

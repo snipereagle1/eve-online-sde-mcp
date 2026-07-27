@@ -3,7 +3,20 @@ use std::path::PathBuf;
 
 pub(crate) struct SdeIndex {
     pub(crate) path: PathBuf,
+    /// `_key` -> the byte offset of its line. The only map that addresses the file.
     pub(crate) id_index: HashMap<u64, u64>,
+    /// Lowercased English name -> the `_key` of the record carrying it.
+    ///
+    /// A `_key` rather than a byte offset, even though a name search ends in a
+    /// seek: an ID is what callers order by (ascending, so a query's answer is the
+    /// same in every process, unlike `HashMap` iteration) and what every other
+    /// index is keyed by, so a predicate like `published_only` or a Group scope
+    /// filters the whole match set from memory instead of seeking and parsing a
+    /// record per candidate. The offset is one `id_index` hit away.
+    ///
+    /// Only keyed lines are indexed here: a record with a name but no `_key` would
+    /// be unreachable by name. No such record exists in build 3444265 — all 17
+    /// scanned files key every line.
     pub(crate) name_index: HashMap<String, u64>,
 }
 

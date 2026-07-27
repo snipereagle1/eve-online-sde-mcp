@@ -333,7 +333,21 @@ impl SdeMcpServer {
         q: &str,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, ErrorData> {
-        let mut results = query::search_by_name(index, q, limit)
+        self.search_filtered_where(index, q, limit, |_| true)
+    }
+
+    /// As [`Self::search_filtered`], but keeping only the records whose `_key`
+    /// satisfies `keep`. The predicate runs over the whole match set before the
+    /// limit — see [`query::search_by_name`] — so a narrowed search still returns a
+    /// full page when one exists.
+    fn search_filtered_where(
+        &self,
+        index: &crate::store::SdeIndex,
+        q: &str,
+        limit: usize,
+        keep: impl FnMut(u64) -> bool,
+    ) -> Result<Vec<serde_json::Value>, ErrorData> {
+        let mut results = query::search_by_name(index, q, limit, keep)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         for v in &mut results {
             self.filter(v);
@@ -529,16 +543,12 @@ impl SdeMcpServer {
                 let named = type_id_filter
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&type_id));
-                // `id_index` and `name_index` address the same `types.jsonl`, so a
-                // name substring is answered by comparing byte offsets — the whole
-                // candidate set is filtered without one seek.
-                let name_matches = query_filter.as_ref().is_none_or(|offsets| {
-                    self.store
-                        .types
-                        .id_index
-                        .get(&u64::from(type_id))
-                        .is_some_and(|offset| offsets.contains(offset))
-                });
+                // `name_index` is keyed by name and valued by type ID, so a name
+                // substring resolves to IDs and the whole candidate set is filtered
+                // without one seek.
+                let name_matches = query_filter
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&u64::from(type_id)));
                 if !in_group
                     || !named
                     || !name_matches
@@ -708,33 +718,25 @@ impl SdeMcpServer {
             .map(Some)
     }
 
-    /// The byte offsets in `types.jsonl` of every Type whose name contains `query`,
-    /// or `None` when the call names none. Offsets rather than IDs because
-    /// `SdeIndex` keys both of its maps by them: the caller then tests membership
-    /// with the offset `id_index` already holds, so matching a substring against
-    /// 52,821 names costs one pass over resident strings and no seek at all.
+    /// The IDs of every Type whose name contains `query`, or `None` when the call
+    /// names none. Matching a substring against 52,821 names is one pass over
+    /// resident strings, and the caller then tests membership against the type ID
+    /// it already holds — no seek at any point.
     ///
     /// An empty or whitespace-only query is read as no query rather than as a
     /// substring every name contains — the two narrow the same set, except that
     /// treating it as a real filter would additionally drop Types missing from
     /// `name_index`.
     ///
-    /// Inherits `name_index`'s one-offset-per-distinct-name shape, so a Type
-    /// sharing its name with another is not reachable through `query`. That is the
-    /// index's existing behaviour (`sde_search_types` has it too), not something
-    /// this predicate introduces.
+    /// Inherits `name_index`'s one-ID-per-distinct-name shape, so a Type sharing
+    /// its name with another is not reachable through `query`. That is the index's
+    /// existing behaviour (`sde_search_types` has it too), not something this
+    /// predicate introduces.
     fn resolve_query_filter(&self, query: Option<&str>) -> Option<HashSet<u64>> {
-        let needle = query
-            .map(str::trim)
-            .filter(|q| !q.is_empty())?
-            .to_lowercase();
+        let needle = query.map(str::trim).filter(|q| !q.is_empty())?;
         Some(
-            self.store
-                .types
-                .name_index
-                .iter()
-                .filter(|(name, _)| name.contains(&needle))
-                .map(|(_, &offset)| offset)
+            query::ids_matching_name(&self.store.types, needle)
+                .into_iter()
                 .collect(),
         )
     }
@@ -1268,14 +1270,14 @@ impl SdeMcpServer {
     ) -> Result<String, ErrorData> {
         let limit = p.limit.unwrap_or(10) as usize;
         let published_only = p.published_only.unwrap_or(false);
-        let mut results = self.search_filtered(&self.store.types, &p.query, limit)?;
-        if published_only {
-            results.retain(|v| {
-                v.get("published")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false)
-            });
-        }
+        // Read from `published_types` rather than from each candidate's `published`
+        // field, which is the same answer from the same scan: the filter has to run
+        // over the whole match set before the limit, and a field read would mean a
+        // seek and parse per candidate to do it.
+        let results = self.search_filtered_where(&self.store.types, &p.query, limit, |id| {
+            !published_only
+                || u32::try_from(id).is_ok_and(|t| self.store.published_types.contains(&t))
+        })?;
         Ok(serde_json::to_string(&results).unwrap())
     }
 
@@ -1542,17 +1544,7 @@ impl SdeMcpServer {
             .iter()
             .map(
                 |name| match self.store.types.name_index.get(&name.to_lowercase()) {
-                    Some(&offset) => {
-                        let id = query::fetch_at_offset(&self.store.types.path, offset)
-                            .ok()
-                            .and_then(|v| v.get("_key").and_then(|k| k.as_u64()));
-                        match id {
-                            Some(id) => {
-                                serde_json::json!({"name": name, "type_id": id, "found": true})
-                            }
-                            None => serde_json::json!({"name": name, "found": false}),
-                        }
-                    }
+                    Some(&id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
                     None => serde_json::json!({"name": name, "found": false}),
                 },
             )
@@ -2755,13 +2747,19 @@ mod tests {
 
     #[tokio::test]
     async fn sde_search_types_published_only_filters_unpublished() {
-        let (_f, types) = make_index(
-            "{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n\
-             {\"_key\":35,\"name\":{\"en\":\"Tritan Scrap\"},\"published\":false}\n",
+        // Scanned rather than hand-built: `published_only` now reads
+        // `published_types`, which the same pass over types.jsonl fills, so the two
+        // cannot drift apart in the fixture the way a hand-written store could.
+        let (_f, path) = write_fixture(
+            "{\"_key\":34,\"groupID\":18,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n\
+             {\"_key\":35,\"groupID\":18,\"name\":{\"en\":\"Tritan Scrap\"},\"published\":false}\n",
         );
+        let scanned =
+            crate::scan::scan_types_pub(&path, &indicatif::ProgressBar::hidden()).unwrap();
         let server = SdeMcpServer::new(
             Arc::new(SdeStore {
-                types,
+                types: scanned.index,
+                published_types: scanned.published_types,
                 ..default_store()
             }),
             None,
@@ -3516,6 +3514,17 @@ mod tests {
                 .collect()
         }
 
+        /// The `_key`s of a name-search answer — a bare array of whole records —
+        /// in the order returned.
+        fn keys_of(response: &serde_json::Value) -> Vec<u64> {
+            response
+                .as_array()
+                .expect("array of records")
+                .iter()
+                .map(|t| t["_key"].as_u64().expect("_key"))
+                .collect()
+        }
+
         #[tokio::test]
         async fn status_reports_the_scanned_build() -> anyhow::Result<()> {
             let seam = Seam::boot().await?;
@@ -3544,6 +3553,45 @@ mod tests {
                 .call("sde_search_types", serde_json::json!({"query": "trit"}))
                 .await?;
             assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 34));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_types_orders_by_id_across_separate_processes() -> anyhow::Result<()> {
+            // Two independent boots, not two calls to one server: `HashMap`
+            // iteration order is fixed for the life of a process and reseeded
+            // between them, so a loop against a single `Seam` would pass on the
+            // nondeterministic ordering this replaced.
+            let first = Seam::boot().await?;
+            let a = first
+                .call("sde_search_types", serde_json::json!({"query": "mining"}))
+                .await?;
+            first.shutdown().await?;
+
+            let second = Seam::boot().await?;
+            let b = second
+                .call("sde_search_types", serde_json::json!({"query": "mining"}))
+                .await?;
+            second.shutdown().await?;
+
+            assert_eq!(keys_of(&a), vec![1202, 3218, 3386, 10248, 10252, 17940]);
+            assert_eq!(keys_of(&a), keys_of(&b));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn search_types_published_only_fills_the_page() -> anyhow::Result<()> {
+            // Six Types match "mining" and four of them are published, so a page of
+            // four is available. Filtering after the cap would take some four of the
+            // six and then drop the unpublished ones, returning two or three.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "mining", "limit": 4, "published_only": true}),
+                )
+                .await?;
+            assert_eq!(keys_of(&r), vec![1202, 3218, 3386, 17940]);
             seam.shutdown().await
         }
 
@@ -3866,6 +3914,38 @@ mod tests {
                 .await?;
             assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
             seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_solar_systems_orders_by_id_across_separate_processes() -> anyhow::Result<()>
+        {
+            // The SolarSystem search shares the Type search's helper and inherits
+            // the same correction. The fixture's records are deliberately not in ID
+            // order in the file, so scan order and ID order disagree.
+            let first = Seam::boot().await?;
+            let a = first
+                .call(
+                    "sde_search_solar_systems",
+                    serde_json::json!({"query": "i"}),
+                )
+                .await?;
+            first.shutdown().await?;
+
+            let second = Seam::boot().await?;
+            let b = second
+                .call(
+                    "sde_search_solar_systems",
+                    serde_json::json!({"query": "i"}),
+                )
+                .await?;
+            second.shutdown().await?;
+
+            assert_eq!(
+                keys_of(&a),
+                vec![30000138, 30000140, 30000142, 30000144, 30000145, 30000149]
+            );
+            assert_eq!(keys_of(&a), keys_of(&b));
+            Ok(())
         }
 
         #[tokio::test]
