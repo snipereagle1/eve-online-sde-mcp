@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -246,6 +246,14 @@ pub struct FindTypesParam {
     /// attribute's DefaultValue are never returned — see the response's
     /// `attribute_semantics`.
     pub attribute: Option<AttributePredicate>,
+    /// Restrict to Types whose name contains this substring (case-insensitive).
+    /// Narrows a candidate set; it cannot be the only predicate — use
+    /// sde_search_types for a bare name search.
+    pub query: Option<String>,
+    /// Restrict to these Types — "of the 60 I already hold, which carry an
+    /// ExplicitValue for X". IDs the SDE does not declare simply match nothing.
+    /// Narrows a candidate set; it cannot be the only predicate.
+    pub type_ids: Option<Vec<u64>>,
     /// Restrict to Types belonging to any of these Groups (e.g. 898 Black Ops).
     pub group_ids: Option<Vec<u64>>,
     /// Restrict to Types whose Group belongs to any of these Categories (e.g. 6
@@ -260,6 +268,11 @@ pub struct FindTypesParam {
     /// Types returns N when N exist. Narrows a candidate set; it cannot be the
     /// only predicate.
     pub published_only: Option<bool>,
+    /// Also return each row's ExplicitValue for these DogmaAttributes, in an
+    /// `attributes` map. A projection, not a predicate: it never adds, drops or
+    /// reorders a row. An attribute a Type records no ExplicitValue for is absent
+    /// from its map — not a zero and not the attribute's DefaultValue.
+    pub project_attributes: Option<Vec<u64>>,
     /// Maximum rows to return (default: 100, capped at 1000). Predicates apply to
     /// the whole candidate set first, so `total_matched` is the real count even
     /// when `truncated` is true.
@@ -459,8 +472,9 @@ impl SdeMcpServer {
             (None, None) => {
                 return Err(ErrorData::invalid_params(
                     "sde_find_types needs at least one predicate; available: attribute \
-                     {id, op?, value?}, group_ids, category_ids. meta_group_ids and \
-                     published_only narrow a candidate set but cannot produce one",
+                     {id, op?, value?}, group_ids, category_ids. meta_group_ids, \
+                     published_only, query and type_ids narrow a candidate set but \
+                     cannot produce one",
                     None,
                 ));
             }
@@ -473,8 +487,15 @@ impl SdeMcpServer {
         // the rollup below count matches instead of returned rows.
         let published_only = p.published_only.unwrap_or(false);
         let meta_group_filter = resolve_meta_group_filter(p);
+        let type_id_filter = resolve_type_id_filter(p);
+        let query_filter = self.resolve_query_filter(p.query.as_deref());
         let mut excluded_no_meta_group = 0u64;
-        if group_filter.is_some() || published_only || meta_group_filter.is_some() {
+        if group_filter.is_some()
+            || published_only
+            || meta_group_filter.is_some()
+            || type_id_filter.is_some()
+            || query_filter.is_some()
+        {
             matched.retain(|&(type_id, _)| {
                 let in_group = group_filter.as_ref().is_none_or(|groups| {
                     self.store
@@ -482,7 +503,24 @@ impl SdeMcpServer {
                         .get(&type_id)
                         .is_some_and(|g| groups.contains(g))
                 });
-                if !in_group || (published_only && !self.store.published_types.contains(&type_id)) {
+                let named = type_id_filter
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&type_id));
+                // `id_index` and `name_index` address the same `types.jsonl`, so a
+                // name substring is answered by comparing byte offsets — the whole
+                // candidate set is filtered without one seek.
+                let name_matches = query_filter.as_ref().is_none_or(|offsets| {
+                    self.store
+                        .types
+                        .id_index
+                        .get(&u64::from(type_id))
+                        .is_some_and(|offset| offsets.contains(offset))
+                });
+                if !in_group
+                    || !named
+                    || !name_matches
+                    || (published_only && !self.store.published_types.contains(&type_id))
+                {
                     return false;
                 }
                 let Some(wanted) = meta_group_filter.as_ref() else {
@@ -507,6 +545,17 @@ impl SdeMcpServer {
             .unwrap_or(DEFAULT_FIND_TYPES_LIMIT)
             .min(MAX_FIND_TYPES_LIMIT) as usize;
         let total_matched = matched.len();
+        // Resolved once, and applied inside `take(limit)` below so a truncated page
+        // never pays projection for rows it is not returning.
+        let projected: Option<Vec<u32>> = p
+            .project_attributes
+            .as_deref()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|&id| u32::try_from(id).ok())
+                    .collect()
+            });
         let types: Vec<FoundType> = matched
             .iter()
             .take(limit)
@@ -527,6 +576,9 @@ impl SdeMcpServer {
                         .as_ref()
                         .and_then(|r| r.get("groupID").and_then(|g| g.as_u64())),
                     value,
+                    attributes: projected
+                        .as_deref()
+                        .map(|wanted| self.project_explicit_values(type_id, wanted)),
                 }
             })
             .collect();
@@ -580,6 +632,59 @@ impl SdeMcpServer {
         // answers — with the ID as a tiebreak so repeated calls agree.
         rollup.sort_unstable_by_key(|g| (std::cmp::Reverse(g.count), g.group_id));
         rollup
+    }
+
+    /// The ExplicitValues `project_attributes` asked for, read off the same inverted
+    /// index the attribute predicate selects from — so a projection costs no file
+    /// read and cannot disagree with the predicate that chose the row. An attribute
+    /// the Type records no ExplicitValue for is absent from the map: never a zero,
+    /// never the DogmaAttribute's DefaultValue.
+    ///
+    /// `BTreeMap` so a row's keys come out in the same order in every process, and
+    /// `f32` for the same reason [`FoundType::value`] is — `1.92` must stay `1.92`.
+    fn project_explicit_values(&self, type_id: u32, wanted: &[u32]) -> BTreeMap<u64, f32> {
+        wanted
+            .iter()
+            .filter_map(|&attribute_id| {
+                // `attribute_types` runs are sorted by type_id at scan time, which
+                // is what makes the (type, attribute) random access a binary search
+                // rather than a walk of an attribute's 5,921 rows.
+                let rows = self.store.attribute_types.get(&attribute_id)?;
+                let at = rows.binary_search_by_key(&type_id, |&(t, _)| t).ok()?;
+                Some((u64::from(attribute_id), rows[at].1))
+            })
+            .collect()
+    }
+
+    /// The byte offsets in `types.jsonl` of every Type whose name contains `query`,
+    /// or `None` when the call names none. Offsets rather than IDs because
+    /// `SdeIndex` keys both of its maps by them: the caller then tests membership
+    /// with the offset `id_index` already holds, so matching a substring against
+    /// 52,821 names costs one pass over resident strings and no seek at all.
+    ///
+    /// An empty or whitespace-only query is read as no query rather than as a
+    /// substring every name contains — the two narrow the same set, except that
+    /// treating it as a real filter would additionally drop Types missing from
+    /// `name_index`.
+    ///
+    /// Inherits `name_index`'s one-offset-per-distinct-name shape, so a Type
+    /// sharing its name with another is not reachable through `query`. That is the
+    /// index's existing behaviour (`sde_search_types` has it too), not something
+    /// this predicate introduces.
+    fn resolve_query_filter(&self, query: Option<&str>) -> Option<HashSet<u64>> {
+        let needle = query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())?
+            .to_lowercase();
+        Some(
+            self.store
+                .types
+                .name_index
+                .iter()
+                .filter(|(name, _)| name.contains(&needle))
+                .map(|(_, &offset)| offset)
+                .collect(),
+        )
     }
 
     /// The Groups a call is restricted to, or `None` when it names no taxonomy
@@ -1123,7 +1228,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types. meta_group_ids and published_only narrow a candidate set and cannot be the only predicate. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
+        description = "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids narrows to a set you already hold. meta_group_ids, published_only, query and type_ids narrow a candidate set and cannot be the only predicate. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute."
     )]
     async fn sde_find_types(
         &self,
@@ -1757,6 +1862,22 @@ const ATTRIBUTE_SEMANTICS: &str = "ExplicitValue only: rows are Types that recor
 /// to check an ID against and cannot tell a typo from a MetaGroup no Type uses. An
 /// ID too large to be one is dropped rather than errored for the same reason — it
 /// simply matches nothing, which is what the response then reports.
+/// The Types a call is restricted to, or `None` when it names none. Validates
+/// nothing, for the same reason [`resolve_meta_group_filter`] does not: a caller
+/// handing over a set it already holds is asking which of *those* match, and an
+/// ID the SDE never declared simply matches nothing — which is what the response
+/// then reports. Errors are reserved for the predicates that produce a candidate
+/// set, where a typo would otherwise read as a confident empty answer.
+fn resolve_type_id_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
+    let named = p.type_ids.as_deref().filter(|ids| !ids.is_empty())?;
+    Some(
+        named
+            .iter()
+            .filter_map(|&id| u32::try_from(id).ok())
+            .collect(),
+    )
+}
+
 fn resolve_meta_group_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
     let named = p.meta_group_ids.as_deref().filter(|ids| !ids.is_empty())?;
     Some(
@@ -1776,6 +1897,13 @@ pub(crate) struct FoundType {
     group_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<f32>,
+    /// The ExplicitValues `project_attributes` asked for, present exactly when it
+    /// was given — including as an empty map, which says this Type records none of
+    /// them rather than that no projection ran. A requested attribute missing from
+    /// the map is one the Type has no ExplicitValue for; it still HAS the attribute,
+    /// at its DefaultValue, exactly as `attribute_semantics` describes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attributes: Option<BTreeMap<u64, f32>>,
 }
 
 /// One Group in a `sde_find_types` rollup. `group_id` and `name` are optional for
@@ -4687,6 +4815,258 @@ mod tests {
                     {"group_id": 898, "name": "Black Ops", "count": 3},
                     {"group_id": 28, "name": "Hauler", "count": 2},
                 ])
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_query_narrows_by_name_substring() -> anyhow::Result<()> {
+            // Category 18 Drone holds five Types; only four are named for mining, so
+            // the Hobgoblin II is what the substring has to remove.
+            let seam = Seam::boot().await?;
+            let all_drones = seam
+                .call("sde_find_types", serde_json::json!({"category_ids": [18]}))
+                .await?;
+            assert_eq!(ids_of(&all_drones), vec![1202, 2456, 3218, 10248, 10252]);
+
+            let mining = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [18], "query": "mining"}),
+                )
+                .await?;
+            assert_eq!(ids_of(&mining), vec![1202, 3218, 10248, 10252]);
+            assert_eq!(mining["total_matched"], 4);
+
+            // The names are "Mining Drone", not "mining drone".
+            let shouted = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [18], "query": "MINING"}),
+                )
+                .await?;
+            assert_eq!(ids_of(&shouted), ids_of(&mining));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_query_composes_with_every_other_predicate() -> anyhow::Result<()> {
+            // "Which published drones named for mining record a damageMultiplier" —
+            // an attribute predicate, a Category, a name substring and published_only
+            // in one call. The two unpublished mining drones are the ones only
+            // published_only removes; the Hobgoblin II is the one only `query` does.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "attribute": {"id": 64},
+                        "category_ids": [18],
+                        "query": "mining",
+                        "published_only": true
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218]);
+            assert_eq!(r["total_matched"], 2);
+            // The rollup still counts the full match set, and `query` is part of it.
+            assert_eq!(
+                r["groups"],
+                serde_json::json!([
+                    {"group_id": 101, "name": "Mining Drone", "count": 2},
+                ])
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_query_is_not_a_predicate_on_its_own() -> anyhow::Result<()> {
+            // It narrows a candidate set; sde_search_types is the bare name search.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call("sde_find_types", serde_json::json!({"query": "mining"}))
+                .await;
+            assert!(r.is_err(), "query alone must not produce a candidate set");
+            let message = format!("{}", r.unwrap_err());
+            assert!(
+                message.contains("query"),
+                "names query as narrowing: {message}"
+            );
+            assert!(message.contains("type_ids"), "and type_ids too: {message}");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_type_ids_restricts_evaluation_to_the_given_set() -> anyhow::Result<()> {
+            // "Of these Types I already hold, which record jump fatigue?" Five
+            // fixture Types do; naming three of them plus one that records none plus
+            // one the SDE never declared must answer with the two that qualify, and
+            // must not fail on the undeclared ID.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "attribute": {"id": 1971},
+                        "type_ids": [651, 16227, 22428, 999999]
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![651, 22428]);
+            assert_eq!(r["total_matched"], 2);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_type_ids_composes_with_taxonomy() -> anyhow::Result<()> {
+            // The set spans a ship and a drone; scoping to Category 6 keeps the ship.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [6], "type_ids": [648, 1202]}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![648]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_type_ids_is_not_a_predicate_on_its_own() -> anyhow::Result<()> {
+            // Like meta_group_ids and published_only: it narrows a candidate set
+            // another predicate produced. sde_get_types answers a bare ID list.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .try_call(
+                    "sde_find_types",
+                    serde_json::json!({"type_ids": [648, 651]}),
+                )
+                .await;
+            assert!(
+                r.is_err(),
+                "type_ids alone must not produce a candidate set"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_projects_the_attributes_it_was_asked_for() -> anyhow::Result<()> {
+            // The motivating call, in miniature: select a set, read two fields off
+            // every row, no follow-up batch dogma call.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [101], "project_attributes": [64, 77]
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![1202, 3218, 10248, 10252]);
+            assert_eq!(
+                r["types"][0]["attributes"],
+                serde_json::json!({"64": 1.0, "77": 13.0})
+            );
+            assert_eq!(
+                r["types"][1]["attributes"],
+                serde_json::json!({"64": 1.0, "77": 42.0})
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_projection_reports_an_absent_explicit_value_as_absent()
+        -> anyhow::Result<()> {
+            // The Hobgoblin II records damageMultiplier and no miningAmount. Its map
+            // must carry the one and simply not mention the other — reporting 77 as
+            // 0, or as its DefaultValue, is the confusion this whole tool exists to
+            // end. A Type recording none of them gets an empty map, not a missing
+            // key: the projection ran, and that is its answer.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [100, 101], "project_attributes": [64, 77]
+                    }),
+                )
+                .await?;
+            let hobgoblin = r["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["type_id"] == 2456)
+                .expect("Hobgoblin II");
+            assert_eq!(hobgoblin["attributes"], serde_json::json!({"64": 1.92}));
+            assert!(
+                hobgoblin["attributes"].get("77").is_none(),
+                "no ExplicitValue for 77 means no key: {hobgoblin}"
+            );
+
+            let nothing_recorded = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "group_ids": [101], "project_attributes": [1971]
+                    }),
+                )
+                .await?;
+            assert_eq!(
+                nothing_recorded["types"][0]["attributes"],
+                serde_json::json!({})
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_omits_the_attributes_map_when_no_projection_ran() -> anyhow::Result<()>
+        {
+            // Absent rather than empty, so an empty map keeps meaning "this Type
+            // records none of the attributes you named".
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"group_ids": [101]}))
+                .await?;
+            assert!(
+                r["types"][0].get("attributes").is_none(),
+                "no projection was asked for: {r}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_projection_changes_no_row_and_no_count() -> anyhow::Result<()> {
+            // A projection widens rows; it is not a predicate. Same rows, same order,
+            // same total_matched, same rollup — including under truncation, where the
+            // projected page must still describe the full match set.
+            let seam = Seam::boot().await?;
+            let plain = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [18], "limit": 2}),
+                )
+                .await?;
+            let projected = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({
+                        "category_ids": [18], "limit": 2, "project_attributes": [64, 77]
+                    }),
+                )
+                .await?;
+            assert_eq!(ids_of(&projected), ids_of(&plain));
+            assert_eq!(projected["total_matched"], plain["total_matched"]);
+            assert_eq!(projected["returned"], plain["returned"]);
+            assert_eq!(projected["truncated"], plain["truncated"]);
+            assert_eq!(projected["groups"], plain["groups"]);
+
+            // Only the returned rows are projected — the two the page cut carry no
+            // map because they were never built.
+            assert_eq!(projected["total_matched"], 5);
+            assert_eq!(projected["types"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                projected["types"][0]["attributes"],
+                serde_json::json!({"64": 1.0, "77": 13.0})
             );
             seam.shutdown().await
         }
