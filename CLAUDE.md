@@ -55,7 +55,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 | Flag / Env | Default | Purpose |
 |---|---|---|
 | `--data-dir` / `SDE_DATA_DIR` | `~/.local/share/eve-sde-mcp` | SDE cache directory |
-| `--language` / `SDE_LANGUAGE` | (all langs returned) | Filter localized name fields |
+| `--language` / `SDE_LANGUAGE` | `en` | Language localized name fields are filtered down to; an empty or unknown code falls back to `en` |
 | `--log-level` | `warn` | Tracing level; use `RUST_LOG` to override |
 | `--redownload` | false | Force re-download even if build is current |
 
