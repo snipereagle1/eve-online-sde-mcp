@@ -32,6 +32,12 @@ pub struct SearchTypesParam {
     pub limit: Option<u64>,
     /// Only return published types
     pub published_only: Option<bool>,
+    /// Restrict the search to these Groups. Applied before the limit, so a scoped
+    /// search still returns a full page.
+    pub group_ids: Option<Vec<u64>>,
+    /// Restrict the search to these Categories, each resolving down through its
+    /// Groups. ANDs with group_ids and with published_only.
+    pub category_ids: Option<Vec<u64>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -457,7 +463,10 @@ impl SdeMcpServer {
     /// the surviving page. Kept off the `#[tool]` method so the growing predicate
     /// set stays testable as a plain function.
     fn find_types(&self, p: &FindTypesParam) -> Result<FindTypesResult, ErrorData> {
-        let group_filter = self.resolve_group_filter(p)?;
+        let group_filter = self.resolve_group_filter(
+            p.group_ids.as_deref().unwrap_or_default(),
+            p.category_ids.as_deref().unwrap_or_default(),
+        )?;
         let type_id_filter = resolve_type_id_filter(p);
         // Validated up front, so a typo'd attribute is rejected whether or not the
         // predicates happen to match anything.
@@ -748,9 +757,16 @@ impl SdeMcpServer {
     /// naming both keeps only the Groups satisfying each. An undeclared ID is an
     /// error rather than an empty answer — a confidently empty result for a typo'd
     /// ID is the failure this tool exists to end.
-    fn resolve_group_filter(&self, p: &FindTypesParam) -> Result<Option<HashSet<u32>>, ErrorData> {
-        let named_groups = p.group_ids.as_deref().unwrap_or_default();
-        let named_categories = p.category_ids.as_deref().unwrap_or_default();
+    ///
+    /// Shared by `sde_find_types`, where taxonomy *produces* the candidate set, and
+    /// `sde_search_types`, where it only scopes one a name substring produced. Both
+    /// read the same `group_ids`/`category_ids` the same way, so the resolution
+    /// lives here rather than once per tool.
+    fn resolve_group_filter(
+        &self,
+        named_groups: &[u64],
+        named_categories: &[u64],
+    ) -> Result<Option<HashSet<u32>>, ErrorData> {
         if named_groups.is_empty() && named_categories.is_empty() {
             return Ok(None);
         }
@@ -1264,20 +1280,40 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.types, p.type_id, "types")
     }
 
-    #[tool(description = "Search types by name substring; optionally filter to published only")]
+    #[tool(
+        description = "Search types by name substring, returning whole Type records. Optionally scope the search to group_ids and/or category_ids (a Category resolves down through its Groups) — searching 'raven' unscoped also returns its blueprint, its SKINs and every NPC variant sharing the word, and category_ids: [6] is how you keep the ship. published_only drops unpublished Types. Every filter applies to the whole match set before the limit, so a scoped search still returns a full page, and results come back in ascending type ID so the same question gets the same answer twice. Use sde_find_types instead when you want a set defined by an attribute or taxonomy rather than by a name, or minimal rows over whole records."
+    )]
     async fn sde_search_types(
         &self,
         Parameters(p): Parameters<SearchTypesParam>,
     ) -> Result<String, ErrorData> {
         let limit = p.limit.unwrap_or(10) as usize;
         let published_only = p.published_only.unwrap_or(false);
-        // Read from `published_types` rather than from each candidate's `published`
-        // field, which is the same answer from the same scan: the filter has to run
-        // over the whole match set before the limit, and a field read would mean a
-        // seek and parse per candidate to do it.
+        let group_filter = self.resolve_group_filter(
+            p.group_ids.as_deref().unwrap_or_default(),
+            p.category_ids.as_deref().unwrap_or_default(),
+        )?;
+        // Both predicates are answered from indexes the scan already built, so
+        // filtering the whole match set costs a hash lookup per candidate rather
+        // than a seek and parse. `published_types` is the same `published` field
+        // this used to read off each returned record — read before the limit now,
+        // which is the point.
         let results = self.search_filtered_where(&self.store.types, &p.query, limit, |id| {
-            !published_only
-                || u32::try_from(id).is_ok_and(|t| self.store.published_types.contains(&t))
+            if !published_only && group_filter.is_none() {
+                return true;
+            }
+            let Ok(type_id) = u32::try_from(id) else {
+                return false;
+            };
+            if published_only && !self.store.published_types.contains(&type_id) {
+                return false;
+            }
+            group_filter.as_ref().is_none_or(|groups| {
+                self.store
+                    .type_group
+                    .get(&type_id)
+                    .is_some_and(|g| groups.contains(g))
+            })
         })?;
         Ok(serde_json::to_string(&results).unwrap())
     }
@@ -2744,6 +2780,8 @@ mod tests {
                 query: "trit".to_string(),
                 limit: None,
                 published_only: None,
+                group_ids: None,
+                category_ids: None,
             }))
             .await
             .unwrap();
@@ -2776,6 +2814,8 @@ mod tests {
                 query: "tritan".to_string(),
                 limit: None,
                 published_only: Some(true),
+                group_ids: None,
+                category_ids: None,
             }))
             .await
             .unwrap();
@@ -3604,6 +3644,124 @@ mod tests {
                 .call("sde_search_types", serde_json::json!({"query": "badger"}))
                 .await?;
             assert_eq!(keys_of(&badger), vec![648, 36333, 60106]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_types_scopes_to_groups_and_categories() -> anyhow::Result<()> {
+            // "badger" unscoped is the Hauler and both of its SKINs — the exact
+            // shape of the complaint: a fuzzy name search returns the SKINs and NPC
+            // variants the caller then has to discard.
+            let seam = Seam::boot().await?;
+            let unscoped = seam
+                .call("sde_search_types", serde_json::json!({"query": "badger"}))
+                .await?;
+            assert_eq!(keys_of(&unscoped), vec![648, 36333, 60106]);
+
+            // Group 28 Hauler keeps the ship.
+            let by_group = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "group_ids": [28]}),
+                )
+                .await?;
+            assert_eq!(keys_of(&by_group), vec![648]);
+
+            // Category 91 SKINs keeps its complement, resolved down through group
+            // 1950 — a Category owns no Types directly.
+            let by_category = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "category_ids": [91]}),
+                )
+                .await?;
+            assert_eq!(keys_of(&by_category), vec![36333, 60106]);
+
+            // Several Groups at once, and the two filters AND rather than union:
+            // group 1950 is a SKIN, so naming it alongside category 6 Ship leaves
+            // nothing.
+            let several = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "group_ids": [28, 1950]}),
+                )
+                .await?;
+            assert_eq!(keys_of(&several), vec![648, 36333, 60106]);
+            let anded = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "group_ids": [1950], "category_ids": [6]}),
+                )
+                .await?;
+            assert!(keys_of(&anded).is_empty());
+
+            // An unscoped search is unchanged, and naming no Group and no Category
+            // is not a filter that matches nothing.
+            let empty_scope = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "group_ids": [], "category_ids": []}),
+                )
+                .await?;
+            assert_eq!(keys_of(&empty_scope), keys_of(&unscoped));
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_types_scope_applies_before_the_limit() -> anyhow::Result<()> {
+            // Six Types match "mining"; four are drones. Scoping after the cap would
+            // take some two of the six and then drop whatever was not a drone.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "mining", "category_ids": [18], "limit": 2}),
+                )
+                .await?;
+            assert_eq!(keys_of(&r), vec![1202, 3218]);
+
+            // And it composes with published_only: of the four drones matching
+            // "mining", 10248 and 10252 are unpublished, so a published page of two
+            // is what exists — and a page of two is what comes back.
+            let published = seam
+                .call(
+                    "sde_search_types",
+                    serde_json::json!({
+                        "query": "mining",
+                        "category_ids": [18],
+                        "published_only": true,
+                        "limit": 2
+                    }),
+                )
+                .await?;
+            assert_eq!(keys_of(&published), vec![1202, 3218]);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn search_types_rejects_an_undeclared_group_or_category() -> anyhow::Result<()> {
+            // Same contract as sde_find_types: a typo'd taxonomy ID is a caller
+            // mistake, and answering it with an empty result set is the confident
+            // wrong answer this epic exists to stop.
+            let seam = Seam::boot().await?;
+            let bad_group = seam
+                .try_call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "group_ids": [999999]}),
+                )
+                .await;
+            assert!(bad_group.is_err(), "undeclared group must be an error");
+
+            let bad_category = seam
+                .try_call(
+                    "sde_search_types",
+                    serde_json::json!({"query": "badger", "category_ids": [999999]}),
+                )
+                .await;
+            assert!(
+                bad_category.is_err(),
+                "undeclared category must be an error"
+            );
             seam.shutdown().await
         }
 

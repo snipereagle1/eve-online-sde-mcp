@@ -31,12 +31,12 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 **Startup flow** (`main.rs`):
 1. `download::check_and_update` — HEAD checks CCP's stable redirect URL, downloads+extracts the ~81 MB zip if build number changed, stores `meta.json` with current build
-2. `scan::scan_sde` — reads all 17 JSONL files, builds in-memory `HashMap<id, byte_offset>` and `HashMap<name_lowercase, byte_offset>` per file; also builds `product_to_blueprint` reverse map, `stargate_graph` adjacency map, and `attribute_modifiers` (reverse map from `dogmaEffects.modifierInfo`, keyed by `modifiedAttributeID`)
+2. `scan::scan_sde` — reads all 17 JSONL files, builds in-memory `HashMap<id, byte_offset>` and a `NameIndex` (`name_lowercase` -> the `_key`s carrying it) per file; also builds `product_to_blueprint` reverse map, `stargate_graph` adjacency map, and `attribute_modifiers` (reverse map from `dogmaEffects.modifierInfo`, keyed by `modifiedAttributeID`)
 3. `SdeMcpServer::serve` — runs MCP stdio transport with 28 tools
 
 **Data access pattern** (`tools/query.rs`):
 - ID lookup: `id_index.get(id)` → seek to byte offset → read one line → deserialize
-- Name search: iterate `name_index`, check `contains(query)`, seek+read matches
+- Name search: iterate `name_index`, check `contains(query)`, collect the matching IDs, filter them, sort ascending, truncate to the limit, then seek+read — filtering and ordering happen before the cap, never after
 - Language filter: `apply_language_filter` recursively replaces `{"en": ..., "de": ...}` objects with the chosen language string (falls back to `"en"`)
 
 **Key files**:
