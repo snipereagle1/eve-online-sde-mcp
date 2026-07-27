@@ -518,10 +518,11 @@ impl SdeMcpServer {
             }
             (None, None, None) => {
                 return Err(ErrorData::invalid_params(
-                    "sde_find_types needs at least one predicate; available: attribute \
-                     {id, op?, value?}, group_ids, category_ids, type_ids. \
-                     meta_group_ids, published_only and query narrow a candidate set \
-                     but cannot produce one",
+                    format!(
+                        "sde_find_types needs at least one predicate; available: \
+                         {STANDALONE_PREDICATES}. {NARROW_ONLY_PREDICATES} narrow a \
+                         candidate set but cannot produce one"
+                    ),
                     None,
                 ));
             }
@@ -617,9 +618,10 @@ impl SdeMcpServer {
             })
             .collect();
 
+        let types_len = types.len();
         Ok(FindTypesResult {
-            returned: types.len(),
-            truncated: total_matched > types.len(),
+            returned: types_len,
+            truncated: total_matched > types_len,
             types,
             total_matched,
             groups: self.roll_up_groups(&matched),
@@ -634,6 +636,18 @@ impl SdeMcpServer {
                 .as_ref()
                 .map(|_| ATTRIBUTE_SEMANTICS.to_string()),
             attribute_default,
+            // The reciprocal of `sde_get_modifiers`' pointer, fired on the same
+            // moment of confusion approached from the other side: an attribute
+            // predicate that matched nothing, where the caller may have wanted
+            // MODIFIES all along. Present only when an attribute predicate actually
+            // ran and returned nothing — a zero-match taxonomy query has no such
+            // ambiguity to resolve.
+            guidance: guidance_for(
+                p.attribute.as_ref().map(|a| a.id),
+                total_matched,
+                total_matched > types_len,
+                |attr| self.store.attribute_modifiers.contains_key(&attr),
+            ),
         })
     }
 
@@ -1132,7 +1146,29 @@ impl SdeMcpServer {
                 }
             }
         }
-        Ok(serde_json::json!({"attribute_id": attribute_id, "modified_by": rows}))
+        // The wrong turn this whole feature exists to close. "Which Types MODIFY X"
+        // and "which Types HAVE X" are near-identical in English and disjoint in the
+        // data, so an empty modifier list reads as "the SDE knows nothing about this
+        // attribute" when it means "nothing modifies it — Types may still carry it".
+        // This fires at the moment of confusion rather than relying on the tool
+        // description having been read first, which is why it is worth a response key.
+        let nothing_modifies = rows.is_empty();
+        let mut out = serde_json::json!({"attribute_id": attribute_id, "modified_by": rows});
+        if nothing_modifies {
+            let explicit_type_count = u32::try_from(attribute_id)
+                .ok()
+                .and_then(|id| self.store.attribute_types.get(&id))
+                .map_or(0, Vec::len);
+            out["explicit_type_count"] = serde_json::json!(explicit_type_count);
+            out["guidance"] = serde_json::json!(format!(
+                "Nothing in the SDE modifies attribute {attribute_id}, which is not the \
+                 same as the SDE having no data for it: {explicit_type_count} Types \
+                 record an ExplicitValue for it. MODIFIES and HAS are disjoint \
+                 questions over disjoint data. To list the Types that carry it, call \
+                 sde_find_types with attribute {{\"id\": {attribute_id}}}."
+            ));
+        }
+        Ok(out)
     }
 
     /// Direction-d: a module-centric "all tunable levers" view. For the type's every
@@ -1458,7 +1494,7 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows."
+        description = "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows. This tool answers which Types MODIFY an attribute; sde_find_types answers which Types HAVE one, as a stored ExplicitValue. They are disjoint questions over disjoint data, and the English is nearly identical — an empty modified_by here does NOT mean no Type carries the attribute, and when it is empty the response says how many do and points you at sde_find_types."
     )]
     async fn sde_get_modifiers(
         &self,
@@ -1862,7 +1898,9 @@ EVE Online Static Data Export (SDE) query server. Data is read-only game data in
 Pick the most direct tool — most questions are ONE call, not a fan-out:
 - \"What skills / what order to fly SHIP or use MODULE\" → sde_get_skill_plan with ALL target type IDs in one call. Its output already gives the topo-sorted prerequisite order, each skill's rank, per-level SP cost (sp_by_level), running cumulative SP, and which target needs it. Do NOT call sde_get_type_dogma or sde_get_skill_sp per skill to rebuild this.
 - \"Which skills/ships boost ATTRIBUTE X (e.g. mining yield, attr 77)\" → sde_get_modifiers with attribute_id — one call returns every modifier, one row per owning type. Read source_type_id/source_type_name as the bonus SOURCE (e.g. Astrogeology); required_skill_id/required_skill_name is only a target-module filter, NOT the source. Use type_id for the inverse, effect_id for a single effect's modifierInfo.
-- Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery.
+- HAS vs MODIFIES — the two questions sound alike and use disjoint data. \"Which Types HAVE attribute X\" (carry a stored ExplicitValue for it) → sde_find_types with attribute {id: X}. \"Which Types MODIFY attribute X\" (boost/penalise it) → sde_get_modifiers with attribute_id X. An empty answer from either is NOT evidence the other is empty: nothing modifies attr 1971, yet 66 Types carry it. Both tools say so on an empty result and name the other — read that before concluding the SDE lacks the data.
+- Finding the attribute or effect ID in the first place → sde_search_dogma by name. Needs a contiguous substring: it matches text, so a spaced phrase will not reach a camelCase-only identifier.
+- Known exact names → IDs → sde_resolve_types (one bulk call). Use sde_search_types only for fuzzy/unknown-name discovery. Note sde_resolve_types answers one ID per exact name, so a name shared by several Types resolves to the lowest ID only.
 - Several types or dogma records at once → sde_get_types / sde_get_types_dogma (batched), not many single calls.
 - Decoding skill prereqs from raw dogma → pass resolve_names:true to sde_get_type_dogma instead of memorizing attribute IDs 182/277 etc.
 - \"How do I build / manufacture / produce X\" or \"bill of materials / production chain\" → sde_build_type FIRST (classifies the whole build tree + buy-vs-build gates), then sde_get_production_chain for quantities. Do NOT give fitting advice (modules/tank/DPS) for a build request unless the user explicitly asks about fitting.
@@ -2028,6 +2066,80 @@ pub(crate) struct FindTypesResult {
     attribute_semantics: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attribute_default: Option<f64>,
+    /// Fires on the two responses a caller is most likely to misread: an attribute
+    /// predicate that matched nothing (which may mean they wanted MODIFIES), and a
+    /// truncated page (where the `groups` rollup is the narrowing axis but nothing
+    /// says so). Absent otherwise, per the self-description rule — a guidance key
+    /// present on every response would be noise the caller learns to skip, which
+    /// defeats the point of it appearing at the moment of confusion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance: Option<String>,
+}
+
+/// The predicates that can stand alone, and those that cannot. ADR 0003 requires
+/// every text needing this distinction to **derive** from one statement of it
+/// rather than restate it, or they drift the next time a predicate is added —
+/// which is exactly what happened when `type_ids` moved sides (ADR Amendment 1).
+///
+/// Deliberately phrased as "can stand alone" rather than as produce-versus-narrow.
+/// Since Amendment 1 the two are no longer the same partition: `type_ids` both
+/// produces a candidate set *and* narrows one, so a taxonomy reading of this list
+/// is now wrong where a can-it-be-the-only-predicate reading stays true.
+const STANDALONE_PREDICATES: &str =
+    "attribute {id, op?, value?}, group_ids, category_ids, type_ids";
+const NARROW_ONLY_PREDICATES: &str = "meta_group_ids, published_only and query";
+
+/// The two narrow cases where a `sde_find_types` response invites a wrong
+/// conclusion. Kept a free function so the branch is testable without a store, and
+/// so the empty case and the truncated case cannot both fire — an empty result is
+/// never truncated, so their conditions are disjoint by construction.
+///
+/// `anything_modifies` is a closure rather than a bool because it is only worth a
+/// map lookup in the empty-attribute case.
+fn guidance_for(
+    attribute_id: Option<u64>,
+    total_matched: usize,
+    truncated: bool,
+    anything_modifies: impl Fn(u64) -> bool,
+) -> Option<String> {
+    if let Some(attr) = attribute_id
+        && total_matched == 0
+    {
+        // Naming the count is what makes this actionable rather than consoling: the
+        // caller learns whether the other tool has an answer before spending a call.
+        return Some(if anything_modifies(attr) {
+            format!(
+                "No Type records an ExplicitValue for attribute {attr}. Every Type \
+                 still HAS it at its DefaultValue — this tool matches stored rows \
+                 only. Something in the SDE does MODIFY this attribute, so if you \
+                 meant 'what boosts {attr}' rather than 'what carries {attr}', call \
+                 sde_get_modifiers with attribute_id {attr}."
+            )
+        } else {
+            format!(
+                "No Type records an ExplicitValue for attribute {attr}, and nothing \
+                 in the SDE modifies it either. Every Type still HAS it at its \
+                 DefaultValue — this tool matches stored rows only. Check the \
+                 attribute is the one you meant with sde_search_dogma."
+            )
+        });
+    }
+    // Story 35: a call that succeeded, matched thousands, and came back cut. The
+    // rollup below already is the narrowing axis; this says so rather than leaving
+    // it to be inferred. Deliberately does not offer paging — offset pagination is
+    // Out of Scope in #37, and suggesting it would send the caller after a
+    // parameter that does not exist.
+    truncated.then(|| {
+        format!(
+            "{total_matched} Types matched and only the first page is returned; \
+             raising limit alone will not make this cheap. The `groups` rollup below \
+             counts the full match set, not this page, so it is the axis to narrow \
+             on: re-ask naming the Groups you want. Any of {STANDALONE_PREDICATES} \
+             can carry the query; {NARROW_ONLY_PREDICATES} narrow it further, and \
+             project_attributes keeps rows small when you do need many of them. \
+             There is no offset — narrow the predicate rather than paging."
+        )
+    })
 }
 
 // ── sde_search_dogma ─────────────────────────────────────────────────────────
@@ -5529,6 +5641,139 @@ mod tests {
                 projected["types"][0]["attributes"],
                 serde_json::json!({"64": 1.0, "77": 13.0})
             );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_modifiers_points_at_the_selector_when_nothing_modifies() -> anyhow::Result<()>
+        {
+            // The exact wrong turn that motivated the epic, reproduced: attribute 1971
+            // is modified by nothing and carried by Types, so a bare empty answer is
+            // what an agent previously read as "the SDE has no data".
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_modifiers",
+                    serde_json::json!({"attribute_id": 1971}),
+                )
+                .await?;
+            assert_eq!(
+                r["modified_by"].as_array().unwrap().len(),
+                0,
+                "fixture pins 1971 as modified by nothing"
+            );
+            // The count is the whole point: it tells the caller the other tool has an
+            // answer before they spend a call finding out.
+            assert_eq!(r["explicit_type_count"], 5);
+            let g = r["guidance"].as_str().expect("guidance on an empty answer");
+            assert!(
+                g.contains("sde_find_types"),
+                "names the tool that answers: {g}"
+            );
+            assert!(g.contains('5'), "quotes the count of carriers: {g}");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_modifiers_stays_quiet_when_it_has_an_answer() -> anyhow::Result<()> {
+            // Self-description keys appear exactly when the thing they describe ran.
+            // Guidance on a non-empty answer would be noise a caller learns to skip.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_get_modifiers", serde_json::json!({"attribute_id": 77}))
+                .await?;
+            assert!(!r["modified_by"].as_array().unwrap().is_empty());
+            assert!(r.get("guidance").is_none(), "no guidance when not confused");
+            assert!(r.get("explicit_type_count").is_none());
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_points_at_modifiers_when_nothing_carries() -> anyhow::Result<()> {
+            // The reciprocal direction: a predicate that matched nothing, on an
+            // attribute something does modify — so MODIFIES may be what was wanted.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 77, "op": "eq", "value": 999999.0}}),
+                )
+                .await?;
+            assert_eq!(r["total_matched"], 0);
+            let g = r["guidance"].as_str().expect("guidance on an empty match");
+            assert!(g.contains("sde_get_modifiers"), "names the other tool: {g}");
+            assert!(
+                g.contains("DefaultValue"),
+                "restates ExplicitValue-only: {g}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_says_so_when_nothing_modifies_it_either() -> anyhow::Result<()> {
+            // Attribute 30 is declared, carried by no Type and modified by nothing.
+            // Pointing at sde_get_modifiers here would send the caller to a second
+            // empty answer, so the guidance sends them to check the attribute instead.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"attribute": {"id": 30}}),
+                )
+                .await?;
+            assert_eq!(r["total_matched"], 0);
+            let g = r["guidance"].as_str().expect("guidance on an empty match");
+            assert!(
+                !g.contains("sde_get_modifiers"),
+                "must not route to a tool that is also empty: {g}"
+            );
+            assert!(
+                g.contains("sde_search_dogma"),
+                "routes to verification: {g}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_tells_a_truncated_caller_how_to_narrow() -> anyhow::Result<()> {
+            // Epic story 35: the call succeeded, matched more than the page, and the
+            // `groups` rollup is already the right narrowing axis — but nothing said so.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [18], "limit": 2}),
+                )
+                .await?;
+            assert_eq!(r["truncated"], true);
+            let g = r["guidance"]
+                .as_str()
+                .expect("guidance on a truncated page");
+            assert!(g.contains("groups"), "names the rollup as the axis: {g}");
+            assert!(
+                g.contains("group_ids"),
+                "names a predicate that exists: {g}"
+            );
+            // Offset pagination is Out of Scope in #37; guidance must not invent it.
+            assert!(
+                !g.contains("offset parameter to page"),
+                "must not promise paging: {g}"
+            );
+            // The count quoted is always the full match set, never the page.
+            assert!(g.contains("5 Types matched"), "quotes total_matched: {g}");
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_stays_quiet_on_a_complete_answer() -> anyhow::Result<()> {
+            // Neither empty nor truncated: nothing to warn about, so no key.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_find_types", serde_json::json!({"category_ids": [18]}))
+                .await?;
+            assert_eq!(r["truncated"], false);
+            assert!(r["total_matched"].as_u64().unwrap() > 0);
+            assert!(r.get("guidance").is_none(), "no guidance when not confused");
             seam.shutdown().await
         }
 
