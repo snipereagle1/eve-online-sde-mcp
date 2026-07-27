@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::store::{Activity, BlueprintRef, DogmaText, ModifierRef, SdeIndex, SdeStore};
+use crate::store::{Activity, BlueprintRef, DogmaText, ModifierRef, NameIndex, SdeIndex, SdeStore};
 
 const SDE_FILE_COUNT: u64 = 17;
 
@@ -148,7 +148,7 @@ fn scan_index_with(
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
-    let mut name_index = HashMap::new();
+    let mut name_index = NameIndex::default();
     let mut line = Vec::new();
     let mut offset = 0u64;
 
@@ -177,6 +177,11 @@ fn scan_index_with(
             }
         }
     }
+
+    // Sorted once here, like `group_types`, so a name shared by several records
+    // has a stable internal order rather than the file's. Every scanned file
+    // happens to be `_key`-ascending today; nothing guarantees the next one is.
+    name_index.sort();
 
     pb.inc(1);
     Ok(SdeIndex {
@@ -470,7 +475,7 @@ fn scan_blueprints(
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         product_to_blueprint,
     ))
@@ -600,7 +605,7 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<TypeDogmaScan> {
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         effect_to_types,
         attribute_types,
@@ -735,7 +740,7 @@ fn scan_dogma_effects(path: &Path, pb: &ProgressBar) -> Result<DogmaEffectsScan>
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         attribute_modifiers,
         corpus,
@@ -899,7 +904,7 @@ mod tests {
 
         assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
         assert!(
-            store.types.name_index.contains_key("tritanium"),
+            store.types.name_index.lowest_id("tritanium").is_some(),
             "Tritanium name index missing"
         );
         assert!(store.types.id_index.contains_key(&16227), "Ferox missing");
@@ -913,7 +918,11 @@ mod tests {
             "Perimeter missing"
         );
         assert!(
-            store.map_solar_systems.name_index.contains_key("jita"),
+            store
+                .map_solar_systems
+                .name_index
+                .lowest_id("jita")
+                .is_some(),
             "Jita name index missing"
         );
 
@@ -1052,8 +1061,8 @@ mod tests {
         assert_eq!(idx.id_index.len(), 2);
         assert!(idx.id_index.contains_key(&34));
         assert!(idx.id_index.contains_key(&35));
-        assert!(idx.name_index.contains_key("tritanium"));
-        assert!(idx.name_index.contains_key("pyerite"));
+        assert!(idx.name_index.lowest_id("tritanium").is_some());
+        assert!(idx.name_index.lowest_id("pyerite").is_some());
     }
 
     #[test]

@@ -1,23 +1,103 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::PathBuf;
 
 pub(crate) struct SdeIndex {
     pub(crate) path: PathBuf,
     /// `_key` -> the byte offset of its line. The only map that addresses the file.
     pub(crate) id_index: HashMap<u64, u64>,
-    /// Lowercased English name -> the `_key` of the record carrying it.
-    ///
-    /// A `_key` rather than a byte offset, even though a name search ends in a
-    /// seek: an ID is what callers order by (ascending, so a query's answer is the
-    /// same in every process, unlike `HashMap` iteration) and what every other
-    /// index is keyed by, so a predicate like `published_only` or a Group scope
-    /// filters the whole match set from memory instead of seeking and parsing a
-    /// record per candidate. The offset is one `id_index` hit away.
+    /// Lowercased English name -> the `_key`s carrying it.
     ///
     /// Only keyed lines are indexed here: a record with a name but no `_key` would
     /// be unreachable by name. No such record exists in build 3444265 — all 17
     /// scanned files key every line.
-    pub(crate) name_index: HashMap<String, u64>,
+    pub(crate) name_index: NameIndex,
+}
+
+/// Lowercased English name -> the `_key`s of the records carrying it, ascending.
+///
+/// `_key`s rather than byte offsets, even though a name search ends in a seek: an
+/// ID is what callers order by (ascending, so a query's answer is the same in
+/// every process, unlike `HashMap` iteration) and what every other index is keyed
+/// by, so a predicate like `published_only` or a Group scope filters the whole
+/// match set from memory instead of seeking and parsing a record per candidate.
+/// The offset is one `SdeIndex::id_index` hit away.
+///
+/// A name maps to many records, not one. Keeping a single ID per name lost 2,228
+/// of build 3444265's Types to overwriting — 229 of them share the name "Deathless
+/// Circle Data Fragment" — and marketGroups lost a further 1,105. The loss was
+/// silent: name search did not truncate and did not warn, the records were simply
+/// not there.
+///
+/// Two maps rather than one `HashMap<String, Vec<u64>>` because names are *almost*
+/// unique: 1,413 of the 63,343 indexed names are shared, and only 3,339 of the
+/// 66,682 entries are the second or later member of a group. A `Vec` per name pays
+/// a 24-byte header and a heap allocation on all 63,343 of them — measured against
+/// build 3444265 at **+4.2 MiB peak RSS**, against an ADR that budgets ~32 MB for
+/// the whole epic. Paying it only on the names that need it costs **+0.5 MiB**.
+/// The extra `shared` lookup is per *matched* name, not per indexed one, so a
+/// search does not pay for the split either.
+#[derive(Default)]
+pub(crate) struct NameIndex {
+    /// Every name, valued by the lowest `_key` carrying it.
+    first: HashMap<String, u64>,
+    /// The names carried by more than one record, valued by every one of their
+    /// `_key`s ascending — including the one in `first`, so a lookup is a branch
+    /// rather than a merge.
+    shared: HashMap<String, Vec<u64>>,
+}
+
+impl NameIndex {
+    /// Record that `name` (already lowercased) belongs to `id`. One `Entry` rather
+    /// than a `get` then an `insert`: this runs once per line of every scanned
+    /// file, so the second hash of the same string is 66,682 of them.
+    pub(crate) fn insert(&mut self, name: String, id: u64) {
+        match self.first.entry(name) {
+            Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            Entry::Occupied(mut slot) => {
+                let lowest = *slot.get();
+                self.shared
+                    .entry(slot.key().clone())
+                    .or_insert_with(|| vec![lowest])
+                    .push(id);
+                if id < lowest {
+                    slot.insert(id);
+                }
+            }
+        }
+    }
+
+    /// Put every collision group in ascending order. Called once at the end of a
+    /// scan, like `group_types` — a file's own order is not a contract.
+    pub(crate) fn sort(&mut self) {
+        for ids in self.shared.values_mut() {
+            ids.sort_unstable();
+        }
+    }
+
+    /// The lowest `_key` under `name`, for callers whose contract is one answer.
+    pub(crate) fn lowest_id(&self, name: &str) -> Option<u64> {
+        self.first.get(name).copied()
+    }
+
+    /// The `_key`s of every record whose name contains `needle`, in no particular
+    /// order — callers sort. Answered entirely from resident strings, so narrowing
+    /// a match set costs no seek.
+    pub(crate) fn ids_containing(&self, needle: &str) -> Vec<u64> {
+        let needle = needle.to_lowercase();
+        let mut out = Vec::new();
+        for (name, &id) in &self.first {
+            if !name.contains(&needle) {
+                continue;
+            }
+            match self.shared.get(name) {
+                Some(ids) => out.extend_from_slice(ids),
+                None => out.push(id),
+            }
+        }
+        out
+    }
 }
 
 /// Which blueprint activity yields a product. Manufacturing and reaction are the

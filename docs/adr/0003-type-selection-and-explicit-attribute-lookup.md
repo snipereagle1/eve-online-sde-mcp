@@ -200,6 +200,21 @@ schedule working, not an omission to fix.
   `sde_search_types`: nondeterministic result ordering across runs, and
   `published_only` filtering *after* the limit, so `limit:10,
   published_only:true` could return 3 while thousands matched.
+
+  Sorting requires an ID, so `name_index` came to hold each name's `_key`
+  instead of its byte offset — which `id_index` already maps — and the filter
+  predicate is handed that ID, so `published_only` reads `published_types`
+  rather than seeking and parsing a record per candidate to read the same field.
+
+  A name also turned out to key more than one record: 2,228 Types and 1,105
+  marketGroups were unreachable by name because one offset per name overwrote
+  the rest, silently. `NameIndex` therefore keys every name to its lowest ID and
+  keeps a second, small map of only the 1,413 shared names. Measured (release
+  builds, `/usr/bin/time -v`, five runs each): peak RSS 31.9 → 32.4 MB,
+  **+0.5 MB**, with startup inside run-to-run variance (0.48 → 0.53 s). The
+  obvious `HashMap<String, Vec<u64>>` costs **+4.2 MiB** instead — 63,343 `Vec`
+  headers and heap allocations to carry 3,339 extra IDs — which would have put
+  peak RSS at 36.2 MB against this ADR's ~32 MB projection.
 - `sde_find_types` and `sde_get_modifiers` answer near-identical English
   questions ("which Types **have** attribute X" vs "which Types **modify** it")
   with disjoint data. Beyond describing the contrast, each tool points at the

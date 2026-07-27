@@ -16,19 +16,6 @@ pub fn fetch_by_id(index: &SdeIndex, id: u64) -> anyhow::Result<Value> {
     fetch_at_offset(&index.path, offset)
 }
 
-/// The `_key`s of every record whose lowercased English name contains `query`,
-/// in no particular order — callers sort. Answered entirely from resident
-/// strings, so narrowing a match set costs no seek.
-pub fn ids_matching_name(index: &SdeIndex, query: &str) -> Vec<u64> {
-    let q = query.to_lowercase();
-    index
-        .name_index
-        .iter()
-        .filter(|(name, _)| name.contains(&q))
-        .map(|(_, &id)| id)
-        .collect()
-}
-
 /// The records whose English name contains `query`, ascending by `_key` and
 /// capped at `limit`.
 ///
@@ -50,7 +37,7 @@ pub fn search_by_name(
     limit: usize,
     mut keep: impl FnMut(u64) -> bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut ids = ids_matching_name(index, query);
+    let mut ids = index.name_index.ids_containing(query);
     ids.retain(|&id| keep(id));
     ids.sort_unstable();
     ids.truncate(limit);

@@ -31,11 +31,13 @@ turns into a test that passes while production returns nothing.
 | Attribute predicate, non-default | attr 64 `damageMultiplier` (default 1.0): Hobgoblin II (2456) stores 1.92 |
 | Attribute predicate, **equal to default** | attr 64 on the four mining drones (1202, 3218, 10248, 10252), all storing 1.0 — this is what stops a `not_default` filter passing vacuously |
 | Dogma search by spaced phrase | attr 1971 `jumpFatigueMultiplier` → "Jump Fatigue Multiplier" / "Multiplier for jump fatigue distance"; attr 9 `hp` → "Structure Hitpoints". Neither phrase occurs in the camelCase `name` |
-| MetaGroup filter | 11 of 27 types carry `metaGroupID` (1, 2 and 4 are all represented) |
+| MetaGroup filter | 11 of 29 types carry `metaGroupID` (1, 2 and 4 are all represented) |
 | MetaGroup **absence** | Hoarder (651) carries attr 1971 but no `metaGroupID`, so it must not be silently counted as Tech I |
 | Group / Category rollup | category 6 Ship spans groups 27, 28, 419, 463, 898; category 16 Skill spans 257 and 1218; category 18 Drone spans 100 and 101 |
 | Truncation vs. complete result | group 18 Mineral holds 8 types |
 | `published_only` applied before `limit` | 10248 and 10252 are unpublished and both match "mining", alongside four published matches (1202, 3218, 3386, 17940) |
+| Deterministic name-search order | mapSolarSystems is deliberately **not** in `_key` order in the file, so scan order and ID order disagree |
+| Name shared by several Types | 36333 and 60106 are both "Badger Wiyrkomi SKIN" (group 1950, category 91) — a real collision, and one of 1,016 in `types.jsonl`. Searching "badger" also returns the Badger hauler (648), which is what Group/Category scoping exists to separate |
 
 Every `groupID` a type references is declared, every group resolves to a
 declared category, and every `attributeID` in `typeDogma.jsonl` is declared in

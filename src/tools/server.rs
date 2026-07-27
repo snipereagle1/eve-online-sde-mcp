@@ -728,14 +728,15 @@ impl SdeMcpServer {
     /// treating it as a real filter would additionally drop Types missing from
     /// `name_index`.
     ///
-    /// Inherits `name_index`'s one-ID-per-distinct-name shape, so a Type sharing
-    /// its name with another is not reachable through `query`. That is the index's
-    /// existing behaviour (`sde_search_types` has it too), not something this
-    /// predicate introduces.
+    /// A name shared by several Types resolves to all of them: `name_index` keys
+    /// one entry per name and values it with every ID carrying it.
     fn resolve_query_filter(&self, query: Option<&str>) -> Option<HashSet<u64>> {
         let needle = query.map(str::trim).filter(|q| !q.is_empty())?;
         Some(
-            query::ids_matching_name(&self.store.types, needle)
+            self.store
+                .types
+                .name_index
+                .ids_containing(needle)
                 .into_iter()
                 .collect(),
         )
@@ -1542,12 +1543,18 @@ impl SdeMcpServer {
             .names
             .unwrap_or_default()
             .iter()
-            .map(
-                |name| match self.store.types.name_index.get(&name.to_lowercase()) {
-                    Some(&id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
+            .map(|name| {
+                // The lowest ID when a name is shared — 1,016 names in build
+                // 3444265 are, up to 229 Types deep. One ID per name is this
+                // tool's contract and stays that way; the lowest is at least the
+                // same one on every call, where the overwritten offset this
+                // replaced was whichever record the scan reached last. Callers
+                // needing the whole group use sde_search_types, which returns it.
+                match self.store.types.name_index.lowest_id(&name.to_lowercase()) {
+                    Some(id) => serde_json::json!({"name": name, "type_id": id, "found": true}),
                     None => serde_json::json!({"name": name, "found": false}),
-                },
-            )
+                }
+            })
             .collect();
         Ok(
             serde_json::to_string(&serde_json::json!({"by_id": by_id, "by_name": by_name}))
@@ -2616,7 +2623,7 @@ mod tests {
         crate::store::SdeIndex {
             path: std::path::PathBuf::from("/dev/null"),
             id_index: HashMap::new(),
-            name_index: HashMap::new(),
+            name_index: crate::store::NameIndex::default(),
         }
     }
 
@@ -3577,6 +3584,27 @@ mod tests {
             assert_eq!(keys_of(&a), vec![1202, 3218, 3386, 10248, 10252, 17940]);
             assert_eq!(keys_of(&a), keys_of(&b));
             Ok(())
+        }
+
+        #[tokio::test]
+        async fn search_types_returns_every_type_sharing_a_name() -> anyhow::Result<()> {
+            // Types 36333 and 60106 are both named "Badger Wiyrkomi SKIN" in the
+            // SDE. One ID per name kept whichever the scan reached last and dropped
+            // the other — 2,228 Types in build 3444265, with no truncation flag and
+            // no warning to say so.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call("sde_search_types", serde_json::json!({"query": "wiyrkomi"}))
+                .await?;
+            assert_eq!(keys_of(&r), vec![36333, 60106]);
+
+            // And the shared name does not crowd out the rest of the match set:
+            // "badger" is the Hauler plus both of its SKINs, in ID order.
+            let badger = seam
+                .call("sde_search_types", serde_json::json!({"query": "badger"}))
+                .await?;
+            assert_eq!(keys_of(&badger), vec![648, 36333, 60106]);
+            seam.shutdown().await
         }
 
         #[tokio::test]
@@ -5055,6 +5083,23 @@ mod tests {
                     {"group_id": 101, "name": "Mining Drone", "count": 2},
                 ])
             );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn find_types_query_reaches_every_type_sharing_a_name() -> anyhow::Result<()> {
+            // The `query` predicate resolves a substring through the same
+            // `name_index`, so it lost the same colliding Types sde_search_types
+            // did. Both "Badger Wiyrkomi SKIN"s are in the answer.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_find_types",
+                    serde_json::json!({"category_ids": [91], "query": "wiyrkomi"}),
+                )
+                .await?;
+            assert_eq!(ids_of(&r), vec![36333, 60106]);
+            assert_eq!(r["total_matched"], 2);
             seam.shutdown().await
         }
 

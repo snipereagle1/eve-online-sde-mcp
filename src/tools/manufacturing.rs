@@ -835,7 +835,7 @@ mod tests {
         SdeIndex {
             path: std::path::PathBuf::from("/dev/null"),
             id_index: HashMap::new(),
-            name_index: HashMap::new(),
+            name_index: crate::store::NameIndex::default(),
         }
     }
 
