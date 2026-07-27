@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memchr::memmem;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use crate::store::{Activity, BlueprintRef, ModifierRef, SdeIndex, SdeStore};
+use crate::store::{Activity, BlueprintRef, DogmaText, ModifierRef, NameIndex, SdeIndex, SdeStore};
 
 const SDE_FILE_COUNT: u64 = 17;
 
@@ -25,20 +25,22 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         .progress_chars("#>-"),
     );
 
-    let types = scan_index(&root.join("types.jsonl"), &pb)?;
-    let groups = scan_index(&root.join("groups.jsonl"), &pb)?;
+    let types = scan_types(&root.join("types.jsonl"), &pb)?;
+    let (groups, category_groups) = scan_groups(&root.join("groups.jsonl"), &pb)?;
     let categories = scan_index(&root.join("categories.jsonl"), &pb)?;
     let (blueprints, product_to_blueprint) = scan_blueprints(&root.join("blueprints.jsonl"), &pb)?;
     let type_materials = scan_index(&root.join("typeMaterials.jsonl"), &pb)?;
-    let (type_dogma, effect_to_types) = scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
+    let (type_dogma, effect_to_types, attribute_types) =
+        scan_type_dogma(&root.join("typeDogma.jsonl"), &pb)?;
     let map_solar_systems = scan_index(&root.join("mapSolarSystems.jsonl"), &pb)?;
     let map_constellations = scan_index(&root.join("mapConstellations.jsonl"), &pb)?;
     let map_regions = scan_index(&root.join("mapRegions.jsonl"), &pb)?;
     let stargate_graph = scan_stargates(&root.join("mapStargates.jsonl"), &pb)?;
     let npc_stations = scan_index(&root.join("npcStations.jsonl"), &pb)?;
     let market_groups = scan_index(&root.join("marketGroups.jsonl"), &pb)?;
-    let dogma_attributes = scan_index(&root.join("dogmaAttributes.jsonl"), &pb)?;
-    let (dogma_effects, attribute_modifiers) =
+    let (dogma_attributes, dogma_attribute_text) =
+        scan_dogma_attributes(&root.join("dogmaAttributes.jsonl"), &pb)?;
+    let (dogma_effects, attribute_modifiers, dogma_effect_text) =
         scan_dogma_effects(&root.join("dogmaEffects.jsonl"), &pb)?;
     let factions = scan_index(&root.join("factions.jsonl"), &pb)?;
     let npc_corporations = scan_index(&root.join("npcCorporations.jsonl"), &pb)?;
@@ -58,7 +60,7 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         release_date: release_date.to_owned(),
         files_scanned: SDE_FILE_COUNT as usize,
         last_updated: release_date.to_owned(),
-        types,
+        types: types.index,
         groups,
         categories,
         blueprints,
@@ -78,6 +80,14 @@ pub fn scan_sde(sde_dir: &Path, build: u64, release_date: &str) -> Result<Arc<Sd
         stargate_graph,
         attribute_modifiers,
         effect_to_types,
+        attribute_types,
+        type_group: types.type_group,
+        group_types: types.group_types,
+        type_meta_group: types.type_meta_group,
+        category_groups,
+        published_types: types.published_types,
+        dogma_attribute_text,
+        dogma_effect_text,
     }))
 }
 
@@ -99,6 +109,14 @@ pub fn scan_index_pub(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     scan_index(path, pb)
 }
 
+/// Exposed for `manufacturing`'s tests, whose stores have to carry the same
+/// derived maps a real scan produces now that `me_mode` reads `type_meta_group`
+/// instead of re-reading the Type record.
+#[cfg(test)]
+pub fn scan_types_pub(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
+    scan_types(path, pb)
+}
+
 #[cfg(test)]
 pub fn scan_blueprints_pub(
     path: &Path,
@@ -108,6 +126,18 @@ pub fn scan_blueprints_pub(
 }
 
 fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
+    scan_index_with(path, pb, |_, _| {})
+}
+
+/// The generic memmem pass, with a hook that sees every keyed line. Files that
+/// need a derived map on top of `id`/`name` ride along here rather than reading
+/// the file a second time — the whole point of the memmem approach is one pass.
+/// `on_line` is called with the `_key` and the trimmed line bytes.
+fn scan_index_with(
+    path: &Path,
+    pb: &ProgressBar,
+    mut on_line: impl FnMut(u64, &[u8]),
+) -> Result<SdeIndex> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -118,7 +148,7 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
-    let mut name_index = HashMap::new();
+    let mut name_index = NameIndex::default();
     let mut line = Vec::new();
     let mut offset = 0u64;
 
@@ -139,11 +169,19 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
         }
         if let Some(key) = extract_key(trimmed) {
             id_index.insert(key, line_start);
-        }
-        if let Some(name) = extract_name_en(trimmed) {
-            name_index.insert(name.to_lowercase(), line_start);
+            on_line(key, trimmed);
+            // Nested inside the key branch because `name_index` stores the `_key`,
+            // not the offset — see `SdeIndex::name_index` for why.
+            if let Some(name) = extract_name_en(trimmed) {
+                name_index.insert(name.to_lowercase(), key);
+            }
         }
     }
+
+    // Sorted once here, like `group_types`, so a name shared by several records
+    // has a stable internal order rather than the file's. Every scanned file
+    // happens to be `_key`-ascending today; nothing guarantees the next one is.
+    name_index.sort();
 
     pb.inc(1);
     Ok(SdeIndex {
@@ -151,6 +189,180 @@ fn scan_index(path: &Path, pb: &ProgressBar) -> Result<SdeIndex> {
         id_index,
         name_index,
     })
+}
+
+/// What one pass over types.jsonl yields. A struct rather than a tuple because
+/// `type_group` and `type_meta_group` are both `HashMap<u32, u32>` and a caller
+/// destructuring them the wrong way round would compile.
+pub(crate) struct TypesScan {
+    pub(crate) index: SdeIndex,
+    pub(crate) type_group: HashMap<u32, u32>,
+    pub(crate) group_types: HashMap<u32, Vec<u32>>,
+    pub(crate) type_meta_group: HashMap<u32, u32>,
+    pub(crate) published_types: HashSet<u32>,
+}
+
+/// Scan types.jsonl into the usual id/name indexes plus the Group taxonomy that
+/// `sde_find_types` filters and rolls up on: `type_group`, its inverse
+/// `group_types`, the MetaGroup of the Types that have one, and the set of
+/// published Types.
+///
+/// `groupID`, `metaGroupID` and `published` ride along in this pass rather than
+/// being seeked per Type at query time, because all three are needed for the
+/// **whole** match set: `published_only` and the MetaGroup filter have to apply
+/// before the limit, and the `groups` rollup has to count every match rather than
+/// the returned page. Per-Type seeks would cost 11,836 reads for a single Category.
+fn scan_types(path: &Path, pb: &ProgressBar) -> Result<TypesScan> {
+    let mut type_group: HashMap<u32, u32> = HashMap::new();
+    let mut group_types: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut type_meta_group: HashMap<u32, u32> = HashMap::new();
+    let mut published_types: HashSet<u32> = HashSet::new();
+
+    let index = scan_index_with(path, pb, |key, line| {
+        // Types and Groups are keyed `u32` here to match `attribute_types`; a
+        // `_key` beyond that range would be a schema change, and dropping it beats
+        // truncating it onto another Type.
+        let (Ok(type_id), Some(Ok(group_id))) = (
+            u32::try_from(key),
+            extract_number_field(line, b"\"groupID\":").map(u32::try_from),
+        ) else {
+            return;
+        };
+        type_group.insert(type_id, group_id);
+        group_types.entry(group_id).or_default().push(type_id);
+        // Sparse by design: 74% of Types have no `metaGroupID`, and the field is
+        // also written as an explicit `null`, which parses as absent here. Either
+        // way the Type stays out of the map, because a MetaGroup this scan invented
+        // would be read as a tier the SDE never assigned.
+        if let Some(Ok(meta_group_id)) =
+            extract_number_field(line, b"\"metaGroupID\":").map(u32::try_from)
+        {
+            type_meta_group.insert(type_id, meta_group_id);
+        }
+        // Only a literal `true` enrolls a Type. Every Type in build 3444265
+        // carries the field, so a missing one is unknown provenance and must not
+        // slip past a `published_only` filter.
+        if extract_bool_field(line, b"\"published\":") == Some(true) {
+            published_types.insert(type_id);
+        }
+    })?;
+
+    // Sorted once here, like `attribute_types`, so a taxonomy query inherits a
+    // stable ascending type_id order instead of re-sorting per call.
+    for types in group_types.values_mut() {
+        types.sort_unstable();
+    }
+
+    Ok(TypesScan {
+        index,
+        type_group,
+        group_types,
+        type_meta_group,
+        published_types,
+    })
+}
+
+/// Scan groups.jsonl into the usual indexes plus `categoryID -> groups`. A
+/// Category owns no Types directly, so `category_ids` resolves downward through
+/// this map — the lookup the SDE's own records only express upward.
+fn scan_groups(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u32, Vec<u32>>)> {
+    let mut category_groups: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    let index = scan_index_with(path, pb, |key, line| {
+        let (Ok(group_id), Some(Ok(category_id))) = (
+            u32::try_from(key),
+            extract_number_field(line, b"\"categoryID\":").map(u32::try_from),
+        ) else {
+            return;
+        };
+        category_groups
+            .entry(category_id)
+            .or_default()
+            .push(group_id);
+    })?;
+
+    for groups in category_groups.values_mut() {
+        groups.sort_unstable();
+    }
+
+    Ok((index, category_groups))
+}
+
+/// Scan dogmaAttributes.jsonl into the usual id/name indexes plus the attribute
+/// half of the `sde_search_dogma` text corpus. Rides the existing memmem pass — no
+/// second read of the file, and no new file scanned — but each line is also fully
+/// parsed by the hook, which is affordable here and nowhere else: 2,141 records
+/// against `types.jsonl`'s 52,821.
+///
+/// `defaultValue` is carried along with the text rather than seeked per query, per
+/// ADR 0003: it costs nothing once a record per attribute is resident anyway.
+fn scan_dogma_attributes(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, Vec<DogmaText>)> {
+    /// The dogmaAttributes text fields. `name` and `description` are bare strings
+    /// here while `displayName` is a localized map — the asymmetry
+    /// [`en_text`] exists to absorb — so all three are read as untyped values.
+    #[derive(serde::Deserialize)]
+    struct AttributeText {
+        name: Option<serde_json::Value>,
+        #[serde(rename = "displayName")]
+        display_name: Option<serde_json::Value>,
+        description: Option<serde_json::Value>,
+        #[serde(rename = "defaultValue")]
+        default_value: Option<f64>,
+    }
+
+    let mut corpus: Vec<DogmaText> = Vec::new();
+    let mut parse_failures = 0u64;
+    let index = scan_index_with(path, pb, |key, line| {
+        let parsed = match serde_json::from_slice::<AttributeText>(line) {
+            Ok(parsed) => parsed,
+            // Counted rather than swallowed, like the other custom scanners: a
+            // schema drift here would empty the corpus and make `sde_search_dogma`
+            // answer "no such attribute" for every query — the failure this whole
+            // tool exists to end, arriving silently.
+            Err(_) => {
+                parse_failures += 1;
+                return;
+            }
+        };
+        let Ok(id) = u32::try_from(key) else { return };
+        corpus.push(DogmaText {
+            id,
+            name: en_text(parsed.name.as_ref()),
+            display_name: en_text(parsed.display_name.as_ref()),
+            description: en_text(parsed.description.as_ref()),
+            default_value: parsed.default_value,
+        });
+    })?;
+
+    if parse_failures > 0 {
+        tracing::warn!(
+            "{}: {parse_failures} dogmaAttributes line(s) failed to parse; \
+             sde_search_dogma cannot see them (possible SDE schema change)",
+            path.display()
+        );
+    }
+
+    corpus.sort_unstable_by_key(|record| record.id);
+    Ok((index, corpus))
+}
+
+/// The English text of a dogma name, label or description, whichever of the two
+/// shapes the SDE writes it in: a bare string (`dogmaAttributes.name` and
+/// `.description`) or a localized map (`dogmaAttributes.displayName`,
+/// `dogmaEffects.displayName` and `.description`). Taking either per field means
+/// the corpus does not encode which file a record came from, and neither file's
+/// shape is assumed — the assumption the empty `name_index` on these two files came
+/// from in the first place.
+///
+/// An empty string is dropped rather than stored: it is not searchable text, and a
+/// hit reporting it as the field that matched would be a lie.
+fn en_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = match value? {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(map) => map.get("en")?.as_str()?,
+        _ => return None,
+    };
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn scan_blueprints(
@@ -263,21 +475,34 @@ fn scan_blueprints(
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         product_to_blueprint,
     ))
 }
 
-/// Scan typeDogma.jsonl into the id→offset index (like every other file) and a
-/// reverse `effect_to_types` map keyed by `effectID`. A dogma effect's
+/// Scan typeDogma.jsonl into the id→offset index (like every other file) and two
+/// reverse maps.
+///
+/// `effect_to_types` is keyed by `effectID`. A dogma effect's
 /// `modifierInfo.skillTypeID` is only a required-skill *filter* on the boosted
 /// modules, not the effect's source — the real source is the type whose
 /// `dogmaEffects` array owns the effect. This reverse map records that ownership
 /// so `sde_get_modifiers` direction-b can name the actual bonus source (e.g.
-/// Astrogeology, not just Mining). Mirrors `scan_blueprints`'s tuple-returning,
+/// Astrogeology, not just Mining).
+///
+/// `attribute_types` is keyed by `attributeID` and holds every Type that records
+/// an ExplicitValue for it. It rides along in this pass — which already
+/// full-parses every line for `effect_to_types` — so `sde_find_types` never
+/// touches the file at query time. Mirrors `scan_blueprints`'s tuple-returning,
 /// typed-inner-struct pattern.
-fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u64, Vec<u64>>)> {
+type TypeDogmaScan = (
+    SdeIndex,
+    HashMap<u64, Vec<u64>>,
+    HashMap<u32, Vec<(u32, f32)>>,
+);
+
+fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<TypeDogmaScan> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -291,17 +516,26 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
         key: u64,
         #[serde(rename = "dogmaEffects")]
         dogma_effects: Option<Vec<EffectRef>>,
+        #[serde(rename = "dogmaAttributes")]
+        dogma_attributes: Option<Vec<AttributeRef>>,
     }
     #[derive(serde::Deserialize)]
     struct EffectRef {
         #[serde(rename = "effectID")]
         effect_id: u64,
     }
+    #[derive(serde::Deserialize)]
+    struct AttributeRef {
+        #[serde(rename = "attributeID")]
+        attribute_id: u32,
+        value: Option<f32>,
+    }
 
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut effect_to_types: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut attribute_types: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
     let mut buf = String::new();
     let mut offset = 0u64;
     let mut parse_failures = 0u64;
@@ -337,6 +571,19 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
                 .or_default()
                 .push(parsed.key);
         }
+        // Types are keyed `u32` here; a `_key` beyond that range would be a schema
+        // change, and dropping it is better than truncating it onto another Type.
+        if let Ok(type_id) = u32::try_from(parsed.key) {
+            for a in parsed.dogma_attributes.into_iter().flatten() {
+                // A row with no `value` records no ExplicitValue, so it must not
+                // become a phantom 0.0 that a `lt` predicate would match.
+                let Some(value) = a.value else { continue };
+                attribute_types
+                    .entry(a.attribute_id)
+                    .or_default()
+                    .push((type_id, value));
+            }
+        }
     }
 
     if parse_failures > 0 {
@@ -347,26 +594,36 @@ fn scan_type_dogma(path: &Path, pb: &ProgressBar) -> Result<(SdeIndex, HashMap<u
         );
     }
 
+    // Sorted once here so `sde_find_types` inherits a stable, ascending type_id
+    // order for free on every query rather than re-sorting per call.
+    for types in attribute_types.values_mut() {
+        types.sort_unstable_by_key(|&(type_id, _)| type_id);
+    }
+
     pb.inc(1);
     Ok((
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         effect_to_types,
+        attribute_types,
     ))
 }
 
-/// Scan dogmaEffects.jsonl into both the id→offset index (like every other file)
-/// and a reverse modifier map keyed by `modifiedAttributeID`. Mirrors
-/// `scan_blueprints`'s tuple-returning, typed-inner-struct pattern. `modifierInfo`
-/// ships as a real JSON array (verified against build 3396210), so it deserializes
-/// straight into `Vec<RawMod>` with no inner-string parsing.
-fn scan_dogma_effects(
-    path: &Path,
-    pb: &ProgressBar,
-) -> Result<(SdeIndex, HashMap<u64, Vec<ModifierRef>>)> {
+/// Scan dogmaEffects.jsonl into the id→offset index (like every other file), a
+/// reverse modifier map keyed by `modifiedAttributeID`, and the effect half of the
+/// `sde_search_dogma` text corpus. Mirrors `scan_blueprints`'s tuple-returning,
+/// typed-inner-struct pattern. `modifierInfo` ships as a real JSON array (verified
+/// against build 3396210), so it deserializes straight into `Vec<RawMod>` with no
+/// inner-string parsing.
+///
+/// The corpus rides this pass because it already full-parses every line: the text
+/// costs three more fields on `Line`, not another read of the file.
+type DogmaEffectsScan = (SdeIndex, HashMap<u64, Vec<ModifierRef>>, Vec<DogmaText>);
+
+fn scan_dogma_effects(path: &Path, pb: &ProgressBar) -> Result<DogmaEffectsScan> {
     pb.set_message(
         path.file_name()
             .unwrap_or_default()
@@ -380,6 +637,14 @@ fn scan_dogma_effects(
         key: u64,
         #[serde(rename = "modifierInfo")]
         modifier_info: Option<Vec<RawMod>>,
+        // Untyped for the same reason as in `scan_dogma_attributes`, and it is not
+        // the same asymmetry: an effect's `name` is a bare string like an
+        // attribute's, but its `description` is a localized map where the
+        // attribute's is a bare string.
+        name: Option<serde_json::Value>,
+        #[serde(rename = "displayName")]
+        display_name: Option<serde_json::Value>,
+        description: Option<serde_json::Value>,
     }
     #[derive(serde::Deserialize)]
     struct RawMod {
@@ -398,6 +663,7 @@ fn scan_dogma_effects(
     let mut reader = BufReader::with_capacity(65536, file);
     let mut id_index = HashMap::new();
     let mut attribute_modifiers: HashMap<u64, Vec<ModifierRef>> = HashMap::new();
+    let mut corpus: Vec<DogmaText> = Vec::new();
     let mut buf = String::new();
     let mut offset = 0u64;
     let mut parse_failures = 0u64;
@@ -428,6 +694,17 @@ fn scan_dogma_effects(
             }
         };
         id_index.insert(parsed.key, line_start);
+        if let Ok(id) = u32::try_from(parsed.key) {
+            corpus.push(DogmaText {
+                id,
+                name: en_text(parsed.name.as_ref()),
+                display_name: en_text(parsed.display_name.as_ref()),
+                description: en_text(parsed.description.as_ref()),
+                // A DogmaEffect has no DefaultValue; only the attribute half of the
+                // corpus ever carries one.
+                default_value: None,
+            });
+        }
         for m in parsed.modifier_info.into_iter().flatten() {
             // A modifier with no target attribute can't be reverse-indexed; skip it.
             let (Some(modified), Some(modifying)) = (m.modified, m.modifying) else {
@@ -456,14 +733,17 @@ fn scan_dogma_effects(
         );
     }
 
+    corpus.sort_unstable_by_key(|record| record.id);
+
     pb.inc(1);
     Ok((
         SdeIndex {
             path: path.to_path_buf(),
             id_index,
-            name_index: HashMap::new(),
+            name_index: NameIndex::default(),
         },
         attribute_modifiers,
+        corpus,
     ))
 }
 
@@ -517,9 +797,31 @@ fn scan_stargates(path: &Path, pb: &ProgressBar) -> Result<HashMap<u64, Vec<u64>
 }
 
 fn extract_key(line: &[u8]) -> Option<u64> {
-    let pos = memmem::find(line, b"\"_key\":")?;
-    let rest = line[pos + 7..].trim_ascii_start();
-    parse_u64_prefix(rest)
+    extract_number_field(line, b"\"_key\":")
+}
+
+/// Read an unsigned integer field out of a raw JSONL line. `field` carries its own
+/// opening quote (`"groupID":`), which is what keeps it from matching
+/// `marketGroupID`; a JSON string can never contain an unescaped `"`, so the
+/// needle cannot be found inside a localized name or description either.
+fn extract_number_field(line: &[u8], field: &[u8]) -> Option<u64> {
+    let pos = memmem::find(line, field)?;
+    parse_u64_prefix(line[pos + field.len()..].trim_ascii_start())
+}
+
+/// As [`extract_number_field`], for a JSON boolean. Returns `None` when the field
+/// is absent or holds something other than `true`/`false`, leaving the caller to
+/// decide what absence means.
+fn extract_bool_field(line: &[u8], field: &[u8]) -> Option<bool> {
+    let pos = memmem::find(line, field)?;
+    let rest = line[pos + field.len()..].trim_ascii_start();
+    if rest.starts_with(b"true") {
+        Some(true)
+    } else if rest.starts_with(b"false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn extract_name_en(line: &[u8]) -> Option<String> {
@@ -602,7 +904,7 @@ mod tests {
 
         assert!(store.types.id_index.contains_key(&34), "Tritanium missing");
         assert!(
-            store.types.name_index.contains_key("tritanium"),
+            !store.types.name_index.ids_for("tritanium").is_empty(),
             "Tritanium name index missing"
         );
         assert!(store.types.id_index.contains_key(&16227), "Ferox missing");
@@ -616,7 +918,11 @@ mod tests {
             "Perimeter missing"
         );
         assert!(
-            store.map_solar_systems.name_index.contains_key("jita"),
+            !store
+                .map_solar_systems
+                .name_index
+                .ids_for("jita")
+                .is_empty(),
             "Jita name index missing"
         );
 
@@ -673,7 +979,7 @@ mod tests {
         assert_eq!(tritanium["_key"], 34);
         assert_eq!(tritanium["groupID"], 18);
 
-        let results = query::search_by_name(&store.types, "ferox", 10).unwrap();
+        let results = query::search_by_name(&store.types, "ferox", 10, |_| true).unwrap();
         let keys: Vec<_> = results.iter().filter_map(|v| v["_key"].as_u64()).collect();
         assert!(
             keys.contains(&16227),
@@ -755,8 +1061,8 @@ mod tests {
         assert_eq!(idx.id_index.len(), 2);
         assert!(idx.id_index.contains_key(&34));
         assert!(idx.id_index.contains_key(&35));
-        assert!(idx.name_index.contains_key("tritanium"));
-        assert!(idx.name_index.contains_key("pyerite"));
+        assert!(!idx.name_index.ids_for("tritanium").is_empty());
+        assert!(!idx.name_index.ids_for("pyerite").is_empty());
     }
 
     #[test]
@@ -829,7 +1135,7 @@ mod tests {
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
-        let (idx, mods) = scan_dogma_effects(&path, &pb).unwrap();
+        let (idx, mods, _) = scan_dogma_effects(&path, &pb).unwrap();
 
         assert!(idx.id_index.contains_key(&391));
         assert!(
@@ -859,7 +1165,7 @@ mod tests {
 "#;
         let (_f, path) = write_fixture(fixture);
         let pb = hidden_pb();
-        let (idx, eff_to_types) = scan_type_dogma(&path, &pb).unwrap();
+        let (idx, eff_to_types, _) = scan_type_dogma(&path, &pb).unwrap();
 
         assert!(idx.id_index.contains_key(&3386));
         assert!(idx.id_index.contains_key(&3410));

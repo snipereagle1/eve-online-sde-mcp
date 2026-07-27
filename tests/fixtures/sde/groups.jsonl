@@ -1,5 +1,14 @@
-{"_key": 18, "name": {"en": "Mineral"}, "categoryID": 4, "published": true}
-{"_key": 27, "name": {"en": "Battleship"}, "categoryID": 6, "published": true}
-{"_key": 419, "name": {"en": "Combat Battlecruiser"}, "categoryID": 6, "published": true}
-{"_key": 462, "name": {"en": "Veldspar"}, "categoryID": 25, "published": true}
-{"_key": 489, "name": {"en": "Battlecruiser Blueprint"}, "categoryID": 9, "published": true}
+{"_key": 18, "name": {"de": "Mineralien", "en": "Mineral", "es": "Mineral", "fr": "Minéral", "ja": "無機物", "ko": "광물", "ru": "Минералы", "zh": "矿物"}, "categoryID": 4, "published": true}
+{"_key": 27, "name": {"de": "Schlachtschiff", "en": "Battleship", "es": "Acorazado", "fr": "Cuirassé", "ja": "戦艦", "ko": "배틀쉽", "ru": "Линкор", "zh": "战列舰"}, "categoryID": 6, "published": true}
+{"_key": 28, "name": {"de": "Transporter", "en": "Hauler", "es": "Nave de mercancías", "fr": "Cargo", "ja": "ハウラー", "ko": "운반선", "ru": "Перевозчик", "zh": "运载舰"}, "categoryID": 6, "published": true}
+{"_key": 100, "name": {"de": "Kampfdrohne", "en": "Combat Drone", "es": "Dron de combate", "fr": "Drone de combat", "ja": "戦闘用ドローン", "ko": "전투 드론", "ru": "Боевой дрон", "zh": "战斗无人机"}, "categoryID": 18, "published": true}
+{"_key": 101, "name": {"de": "Bergbaudrohne", "en": "Mining Drone", "es": "Dron minero", "fr": "Drone d'extraction", "ja": "採掘専門ドローン", "ko": "채굴 드론", "ru": "Буровой дрон", "zh": "采矿无人机"}, "categoryID": 18, "published": true}
+{"_key": 257, "name": {"de": "Raumschiff-Kommando", "en": "Spaceship Command", "es": "Manejo de naves espaciales", "fr": "Pilotage de vaisseau", "ja": "宇宙船操作", "ko": "함선 운용", "ru": "Допуски к управлению кораблями", "zh": "飞船操控学"}, "categoryID": 16, "published": true}
+{"_key": 419, "name": {"de": "Kampf-Schlachtkreuzer", "en": "Combat Battlecruiser", "es": "Crucero de combate", "fr": "Croiseur de bataille de combat", "ja": "戦闘巡洋戦艦", "ko": "컴뱃 배틀크루저", "ru": "Линейный крейсер общего назначения", "zh": "战斗战列巡洋舰"}, "categoryID": 6, "published": true}
+{"_key": 462, "name": {"de": "Veldspar", "en": "Veldspar", "es": "Veldspar", "fr": "Veldspar", "ja": "ベルドスパー", "ko": "벨드스파", "ru": "Veldspar", "zh": "凡晶石"}, "categoryID": 25, "published": true}
+{"_key": 463, "name": {"de": "Bergbaubarkasse", "en": "Mining Barge", "es": "Gabarra minera", "fr": "Barge d'extraction", "ja": "採掘艦", "ko": "채광선", "ru": "Буровой корабль", "zh": "采矿驳船"}, "categoryID": 6, "published": true}
+{"_key": 464, "name": {"de": "Strip-Miner", "en": "Strip Miner", "es": "extractor minero", "fr": "Laser d'extraction intensive", "ja": "ストリップマイナー", "ko": "가속 채굴기", "ru": "Буровой лазер валовой выемки", "zh": "露天采矿器"}, "categoryID": 7, "published": true}
+{"_key": 489, "name": {"de": "Schlachtkreuzer-Blueprint", "en": "Battlecruiser Blueprint", "es": "Plano de crucero de combate", "fr": "Plan de construction Croiseur de bataille", "ja": "巡洋戦艦ブループリント", "ko": "배틀크루저 블루프린트", "ru": "Чертежи линейного крейсера", "zh": "战列巡洋舰蓝图"}, "categoryID": 9, "published": true}
+{"_key": 898, "name": {"de": "Black Ops", "en": "Black Ops", "es": "Operaciones secretas", "fr": "Forces spéciales", "ja": "秘密工作艦", "ko": "블랙옵스", "ru": "Тяжёлый диверсионный корабль", "zh": "黑隐特勤舰"}, "categoryID": 6, "published": true}
+{"_key": 1218, "name": {"de": "Ressourcenverarbeitung", "en": "Resource Processing", "es": "Procesamiento de recursos", "fr": "Traitement des ressources", "ja": "資源加工", "ko": "자원 정제", "ru": "Добыча и переработка сырья", "zh": "资源处理"}, "categoryID": 16, "published": true}
+{"_key": 1950, "name": {"de": "Permanenter SKIN", "en": "Permanent SKIN", "es": "SKIN permanente", "fr": "SKIN permanent", "ja": "永続SKIN", "ko": "무기한 SKIN", "ru": "Бессрочный шаблон", "zh": "永久涂装"}, "categoryID": 91, "published": true}
