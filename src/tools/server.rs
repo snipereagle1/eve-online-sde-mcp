@@ -168,6 +168,21 @@ pub struct TypeIdsParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct TypesDogmaParam {
+    /// EVE type IDs to fetch in one call
+    pub type_ids: Vec<u64>,
+    /// Return only these DogmaAttributes for each Type instead of all of them — a
+    /// field selector. A Type recording no ExplicitValue for one of them simply has
+    /// no entry for it; that is absence, not a zero and not the DefaultValue.
+    /// Effects are unaffected.
+    pub attribute_ids: Option<Vec<u64>>,
+    /// Join attributeID→name and decode skill-prerequisite attrs (182/183/184 +
+    /// levels) into a `requiredSkill` object, exactly as sde_get_type_dogma does.
+    /// Default false keeps the raw records.
+    pub resolve_names: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct ResolveTypesParam {
     /// Type IDs to resolve to names
     pub type_ids: Option<Vec<u64>>,
@@ -382,6 +397,30 @@ impl SdeMcpServer {
                 });
             }
         }
+    }
+
+    /// In-place: drop every `dogmaAttributes` entry the caller did not name. A
+    /// requested attribute the Type records no ExplicitValue for has no entry to
+    /// keep, so it is simply absent — the same distinction `sde_find_types`'
+    /// attribute predicate enforces, and the reason this is not reported as a zero.
+    ///
+    /// `dogmaEffects` is left alone: this selects attributes (effect selection is
+    /// out of scope), and dropping effects would make a projected response unusable
+    /// for a caller that wants both. Projecting away attributes 277–279 also strips
+    /// the levels [`Self::annotate_dogma_names`] pairs with a skill prerequisite, so
+    /// a caller asking for 182 alone gets `level: 0` — its own projection, honoured.
+    fn project_dogma_attributes(val: &mut serde_json::Value, wanted: &HashSet<u64>) {
+        let Some(attrs) = val
+            .get_mut("dogmaAttributes")
+            .and_then(|a| a.as_array_mut())
+        else {
+            return;
+        };
+        attrs.retain(|a| {
+            a.get("attributeID")
+                .and_then(|x| x.as_u64())
+                .is_some_and(|id| wanted.contains(&id))
+        });
     }
 
     /// `sde_find_types`: apply the predicates, sort, truncate, then hydrate only
@@ -1282,17 +1321,32 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false."
+        description = "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false. Pass attribute_ids to project each Type's dogma down to just those DogmaAttributes — ships carry over a hundred, so reading two fields across 60 of them costs kilobytes instead of hundreds. An attribute a Type records no ExplicitValue for is absent from its entry rather than an error, and effects are returned either way. resolve_names annotates each returned attribute with its name and decodes skill prerequisites, exactly as sde_get_type_dogma does. Omitting both returns today's full record unchanged."
     )]
     async fn sde_get_types_dogma(
         &self,
-        Parameters(p): Parameters<TypeIdsParam>,
+        Parameters(p): Parameters<TypesDogmaParam>,
     ) -> Result<String, ErrorData> {
+        // Built once for the batch rather than per Type.
+        let wanted: Option<HashSet<u64>> = p
+            .attribute_ids
+            .as_ref()
+            .map(|ids| ids.iter().copied().collect());
+        let resolve_names = p.resolve_names.unwrap_or(false);
         let out: Vec<_> = p
             .type_ids
             .iter()
             .map(|&id| match query::fetch_by_id(&self.store.type_dogma, id) {
                 Ok(mut v) => {
+                    // Project before resolving names, so a projected call joins
+                    // names for the attributes asked for rather than the hundred a
+                    // ship carries.
+                    if let Some(wanted) = wanted.as_ref() {
+                        Self::project_dogma_attributes(&mut v, wanted);
+                    }
+                    if resolve_names {
+                        self.annotate_dogma_names(&mut v);
+                    }
                     self.filter(&mut v);
                     serde_json::json!({"type_id": id, "found": true, "dogma": v})
                 }
@@ -3372,6 +3426,161 @@ mod tests {
                     .iter()
                     .any(|a| a["requiredSkill"]["skill_name"] == "Astrogeology"
                         && a["requiredSkill"]["level"] == 3)
+            );
+            seam.shutdown().await
+        }
+
+        /// The `attributeID`s of one `sde_get_types_dogma` entry, in returned order.
+        fn attribute_ids_of(entry: &serde_json::Value) -> Vec<u64> {
+            entry["dogma"]["dogmaAttributes"]
+                .as_array()
+                .expect("dogmaAttributes array")
+                .iter()
+                .map(|a| a["attributeID"].as_u64().expect("attributeID"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_projects_to_the_named_attributes() -> anyhow::Result<()> {
+            // The five haulers and Black Ops each store six attributes; a caller
+            // comparing jump fatigue wants one of them.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({
+                        "type_ids": [648, 651, 22428], "attribute_ids": [1971]
+                    }),
+                )
+                .await?;
+            let entries = r.as_array().unwrap();
+            assert_eq!(entries.len(), 3);
+            for entry in entries {
+                assert_eq!(entry["found"], true);
+                assert_eq!(attribute_ids_of(entry), vec![1971]);
+            }
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_projection_omits_an_attribute_the_type_does_not_carry()
+        -> anyhow::Result<()> {
+            // The Hobgoblin II records damageMultiplier (64) but no miningAmount
+            // (77). Naming both must yield the one it has and no entry — not a zero
+            // and not the DefaultValue — for the one it does not, and must not fail
+            // the call.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [2456], "attribute_ids": [64, 77]}),
+                )
+                .await?;
+            assert_eq!(r[0]["found"], true);
+            assert_eq!(attribute_ids_of(&r[0]), vec![64]);
+
+            // An attribute no fixture Type carries at all is the same answer.
+            let none = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [2456], "attribute_ids": [1971]}),
+                )
+                .await?;
+            assert_eq!(none[0]["found"], true);
+            assert_eq!(attribute_ids_of(&none[0]), Vec::<u64>::new());
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_resolve_names_annotates_the_batch() -> anyhow::Result<()> {
+            // The parameter the single-Type call already takes; passing it here used
+            // to be a schema error.
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({
+                        "type_ids": [17940], "attribute_ids": [182, 278], "resolve_names": true
+                    }),
+                )
+                .await?;
+            let attrs = r[0]["dogma"]["dogmaAttributes"].as_array().unwrap();
+            assert!(
+                attrs.iter().any(|a| a["attributeName"] == "requiredSkill1"
+                    && a["requiredSkill"]["skill_name"] == "Astrogeology"),
+                "projected attributes carry their names: {r}"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_without_the_new_parameters_returns_the_whole_record()
+        -> anyhow::Result<()> {
+            // Existing callers depend on this: omitting both parameters must leave
+            // the record exactly as the single-Type call returns it.
+            let seam = Seam::boot().await?;
+            let batch = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": [17940]}),
+                )
+                .await?;
+            let single = seam
+                .call("sde_get_type_dogma", serde_json::json!({"type_id": 17940}))
+                .await?;
+            assert_eq!(batch[0]["dogma"], single);
+            assert_eq!(
+                serde_json::to_string(&batch[0]["dogma"]).unwrap(),
+                serde_json::to_string(&single).unwrap(),
+                "byte-identical, not merely equal"
+            );
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_still_reports_missing_ids_per_id_under_projection()
+        -> anyhow::Result<()> {
+            let seam = Seam::boot().await?;
+            let r = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({
+                        "type_ids": [648, 999999, 22428], "attribute_ids": [1971]
+                    }),
+                )
+                .await?;
+            assert_eq!(r[0]["type_id"], 648);
+            assert_eq!(r[0]["found"], true);
+            assert_eq!(r[1]["type_id"], 999999);
+            assert_eq!(r[1]["found"], false);
+            assert_eq!(r[2]["found"], true);
+            seam.shutdown().await
+        }
+
+        #[tokio::test]
+        async fn get_types_dogma_projection_shrinks_the_response() -> anyhow::Result<()> {
+            // The point of the parameter. Fixture Types carry six attributes where a
+            // real ship carries over a hundred, and the per-entry envelope is fixed
+            // cost either way, so the ratio here badly understates the real one —
+            // less than half is what six attributes can show.
+            let seam = Seam::boot().await?;
+            let types = serde_json::json!([648, 651, 22428, 22430, 85236]);
+            let full = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": types}),
+                )
+                .await?;
+            let projected = seam
+                .call(
+                    "sde_get_types_dogma",
+                    serde_json::json!({"type_ids": types, "attribute_ids": [1971]}),
+                )
+                .await?;
+            let (full, projected) = (full.to_string().len(), projected.to_string().len());
+            assert!(
+                projected * 2 < full,
+                "projected {projected} B vs full {full} B"
             );
             seam.shutdown().await
         }
