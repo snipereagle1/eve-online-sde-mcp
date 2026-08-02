@@ -6,6 +6,16 @@ use super::*;
 use crate::store::SdeStore;
 use crate::tools::testkit::{default_store, make_index};
 
+/// A minimal `mapSolarSystems.jsonl` declaring just the given IDs, so a route test
+/// can build a synthetic stargate graph whose endpoints the server accepts as real.
+fn systems_jsonl(ids: &[u64]) -> String {
+    ids.iter()
+        .map(|id| format!(r#"{{"_key":{id},"name":{{"en":"System {id}"}}}}"#))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 #[tokio::test]
 async fn bfs_route_finds_direct_connection() {
     let mut graph = HashMap::new();
@@ -130,9 +140,11 @@ async fn sde_find_route_returns_path_with_correct_jump_count() {
     graph.insert(2u64, vec![1u64, 3u64]);
     graph.insert(3u64, vec![2u64, 4u64]);
     graph.insert(4u64, vec![3u64]);
+    let (_f, systems) = make_index(&systems_jsonl(&[1, 2, 3, 4]));
     let server = SdeMcpServer::new(
         Arc::new(SdeStore {
             stargate_graph: graph,
+            map_solar_systems: systems,
             ..default_store()
         }),
         None,
@@ -156,10 +168,13 @@ async fn sde_find_route_returns_error_for_unreachable_system() {
     let mut graph = HashMap::new();
     graph.insert(1u64, vec![2u64]);
     graph.insert(2u64, vec![1u64]);
-    // system 99 is isolated
+    // system 99 is a declared system with no stargates, so it is reachable from
+    // nowhere — distinct from an ID the SDE never declared, which errors earlier.
+    let (_f, systems) = make_index(&systems_jsonl(&[1, 2, 99]));
     let server = SdeMcpServer::new(
         Arc::new(SdeStore {
             stargate_graph: graph,
+            map_solar_systems: systems,
             ..default_store()
         }),
         None,
@@ -262,10 +277,7 @@ async fn sde_get_npc_station_returns_record_for_known_id() {
     assert_eq!(v["_key"], 60003760);
 }
 
-/// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-/// and a real MCP client talking to it over an in-memory duplex transport.
-/// Every test here drives a tool the way a client does — over the wire, not
-/// by calling the handler method directly.
+/// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
 mod mcp_seam {
     use crate::tools::testkit::*;
 
@@ -402,4 +414,54 @@ mod mcp_seam {
         assert!(err.is_err(), "expected error for unreachable system");
         seam.shutdown().await
     }
+}
+
+#[tokio::test]
+async fn sde_find_route_rejects_a_system_id_the_sde_does_not_declare() {
+    let (_f, systems) = make_index(&systems_jsonl(&[1, 2]));
+    let server = SdeMcpServer::new(
+        Arc::new(SdeStore {
+            stargate_graph: HashMap::from([(1u64, vec![2u64]), (2u64, vec![1u64])]),
+            map_solar_systems: systems,
+            ..default_store()
+        }),
+        None,
+    );
+    // Same ID for both endpoints: the trivial-route short-circuit must not answer
+    // ahead of the check, or a typo comes back as a confident zero-jump route.
+    let err = server
+        .sde_find_route(Parameters(RouteParam {
+            from_system_id: 30000149,
+            to_system_id: 30000149,
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("30000149 not found"),
+        "got {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn sde_find_route_returns_zero_jumps_for_a_declared_system_to_itself() {
+    let (_f, systems) = make_index(&systems_jsonl(&[1, 2]));
+    let server = SdeMcpServer::new(
+        Arc::new(SdeStore {
+            stargate_graph: HashMap::from([(1u64, vec![2u64]), (2u64, vec![1u64])]),
+            map_solar_systems: systems,
+            ..default_store()
+        }),
+        None,
+    );
+    let result = server
+        .sde_find_route(Parameters(RouteParam {
+            from_system_id: 1,
+            to_system_id: 1,
+        }))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(v["jumps"], 0);
+    assert_eq!(v["path"].as_array().unwrap().len(), 1);
 }

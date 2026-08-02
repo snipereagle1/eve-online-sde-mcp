@@ -111,8 +111,14 @@ impl ClientHandler for DummyClient {
     }
 }
 
-/// A booted client/server pair. Call [`Seam::shutdown`] at the end of a test to
-/// cancel the client and join the server task.
+/// A booted client/server pair: a real scan of `tests/fixtures/sde`, a real
+/// `SdeMcpServer`, and a real MCP client talking to it over an in-memory duplex
+/// transport. A test driving a tool through this is exercising it the way a client
+/// does — over the wire, not by calling the handler method directly — which is why
+/// each domain's tests keep a `mod mcp_seam` for the ones that do.
+///
+/// Call [`Seam::shutdown`] at the end of a test to cancel the client and join the
+/// server task.
 pub(crate) struct Seam {
     pub(crate) client: RunningService<RoleClient, DummyClient>,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,

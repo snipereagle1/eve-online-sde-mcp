@@ -48,10 +48,7 @@ async fn sde_get_npc_corporation_returns_record_for_known_id() {
     assert_eq!(v["factionID"], 500001);
 }
 
-/// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-/// and a real MCP client talking to it over an in-memory duplex transport.
-/// Every test here drives a tool the way a client does — over the wire, not
-/// by calling the handler method directly.
+/// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
 mod mcp_seam {
     use crate::tools::testkit::*;
 

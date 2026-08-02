@@ -16,6 +16,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::tools::SdeMcpServer;
+use crate::tools::query;
 
 // ── Parameter structs ────────────────────────────────────────────────────────
 
@@ -141,6 +142,18 @@ impl SdeMcpServer {
         let store = Arc::clone(&self.store);
         let from = p.from_system_id;
         let to = p.to_system_id;
+        // Both endpoints are checked against the solar-system index, not the
+        // stargate graph: a system with no gates is absent from the graph but is
+        // still a real system, and `from == to` on an ID the SDE never declared
+        // must error like every other undeclared ID rather than return 0 jumps.
+        for id in [from, to] {
+            if query::fetch_by_id(&store.map_solar_systems, id).is_err() {
+                return Err(ErrorData::invalid_params(
+                    format!("ID {id} not found in solarSystems"),
+                    None,
+                ));
+            }
+        }
         let path = tokio::task::spawn_blocking(move || bfs_route(&store.stargate_graph, from, to))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;

@@ -11,8 +11,6 @@ use super::query;
 use super::query::pick_name;
 use crate::store::SdeStore;
 
-// ── Parameter structs ────────────────────────────────────────────────────────
-
 // ── Server ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -150,10 +148,6 @@ impl ServerHandler for SdeMcpServer {
     }
 }
 
-// ── sde_find_types ───────────────────────────────────────────────────────────
-
-// ── sde_search_dogma ─────────────────────────────────────────────────────────
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -168,25 +162,6 @@ mod tests {
         assert_eq!(v["build"], 42);
         assert_eq!(v["release_date"], "2024-01-01");
         assert_eq!(v["files_scanned"], 17);
-    }
-
-    #[tokio::test]
-    async fn mcp_handshake_initialize_and_list_tools() -> anyhow::Result<()> {
-        let seam = crate::tools::testkit::Seam::serving(make_server().store, None).await?;
-        let tools = seam.client.list_all_tools().await?;
-        assert!(tools.len() >= 28, "expected ≥28 tools, got {}", tools.len());
-        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-        assert!(names.contains(&"sde_status"));
-        assert!(names.contains(&"sde_find_route"));
-        assert!(names.contains(&"sde_get_market_group_tree"));
-        assert!(names.contains(&"sde_get_type_dogma"));
-        assert!(names.contains(&"sde_get_skill_plan"));
-        assert!(names.contains(&"sde_get_modifiers"));
-        assert!(names.contains(&"sde_get_types"));
-        assert!(names.contains(&"sde_get_types_dogma"));
-        assert!(names.contains(&"sde_resolve_types"));
-        assert!(names.contains(&"sde_get_skill_sp"));
-        seam.shutdown().await
     }
 
     /// The agent-visible contract: every tool's name, description and input schema,
@@ -210,9 +185,13 @@ mod tests {
 
         let golden =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tools-list.json");
-        if std::env::var_os("SDE_UPDATE_TOOLS_LIST").is_some() {
+        // Exactly "1", never mere presence: a stray `SDE_UPDATE_TOOLS_LIST=0` left
+        // exported in a shell would otherwise turn this guard into a rubber stamp.
+        // The rewrite still fails the test, so a regenerating run is never green and
+        // the new golden has to be read and committed deliberately.
+        if std::env::var("SDE_UPDATE_TOOLS_LIST").as_deref() == Ok("1") {
             std::fs::write(&golden, &actual)?;
-            return Ok(());
+            anyhow::bail!("rewrote {} — review and commit it", golden.display());
         }
         let expected = std::fs::read_to_string(&golden)?;
         assert_eq!(
@@ -224,10 +203,22 @@ mod tests {
         Ok(())
     }
 
-    /// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-    /// and a real MCP client talking to it over an in-memory duplex transport.
-    /// Every test here drives a tool the way a client does — over the wire, not
-    /// by calling the handler method directly.
+    /// The other half of what a client reads before it routes: the server
+    /// instructions. They are prompt-critical for the same reason tool
+    /// descriptions are, and nothing else asserts they reach the wire.
+    #[tokio::test]
+    async fn initialize_carries_the_server_instructions() -> anyhow::Result<()> {
+        let seam = crate::tools::testkit::Seam::serving(make_server().store, None).await?;
+        let instructions = seam.client.peer_info().and_then(|i| i.instructions.clone());
+        seam.shutdown().await?;
+        assert_eq!(
+            instructions.as_deref(),
+            Some(crate::tools::guidance::SERVER_INSTRUCTIONS)
+        );
+        Ok(())
+    }
+
+    /// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
     mod mcp_seam {
         use crate::tools::testkit::Seam;
 

@@ -801,12 +801,6 @@ const ATTRIBUTE_SEMANTICS: &str = "ExplicitValue only: rows are Types that recor
      DogmaAttribute in typeDogma. Every other Type still HAS the attribute, at \
      attribute_default, and is deliberately not listed.";
 
-/// The MetaGroups a call is restricted to, or `None` when it names none. Unlike
-/// [`SdeMcpServer::resolve_group_filter`] this validates nothing: `metaGroups.jsonl`
-/// is deliberately not scanned, so the server holds no list of declared MetaGroups
-/// to check an ID against and cannot tell a typo from a MetaGroup no Type uses. An
-/// ID too large to be one is dropped rather than errored for the same reason — it
-/// simply matches nothing, which is what the response then reports.
 /// The Types a call is restricted to, or `None` when it names none. Doubles as a
 /// candidate source: it is the one narrowing predicate that can stand alone,
 /// because producing from it is bounded by what the caller typed rather than by a
@@ -826,6 +820,12 @@ fn resolve_type_id_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
     )
 }
 
+/// The MetaGroups a call is restricted to, or `None` when it names none. Unlike
+/// [`SdeMcpServer::resolve_group_filter`] this validates nothing: `metaGroups.jsonl`
+/// is deliberately not scanned, so the server holds no list of declared MetaGroups
+/// to check an ID against and cannot tell a typo from a MetaGroup no Type uses. An
+/// ID too large to be one is dropped rather than errored for the same reason — it
+/// simply matches nothing, which is what the response then reports.
 fn resolve_meta_group_filter(p: &FindTypesParam) -> Option<HashSet<u32>> {
     let named = p.meta_group_ids.as_deref().filter(|ids| !ids.is_empty())?;
     Some(

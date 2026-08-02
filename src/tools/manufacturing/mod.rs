@@ -2,11 +2,11 @@
 //! decision tree (`build_type`), and compute a quantity-resolved production chain
 //! (`production_chain`).
 //!
-//! These live in their own module rather than `server.rs` because the engine is a
-//! self-contained graph algorithm (classify → DFS the build DAG → topo-accumulate
-//! demand → run-round with material efficiency). The `#[tool]` entry points in
-//! `server.rs` are thin `spawn_blocking` wrappers over the free functions here,
-//! mirroring how `sde_get_skill_plan` wraps `build_skill_plan`.
+//! The engine is a self-contained graph algorithm (classify → DFS the build DAG →
+//! topo-accumulate demand → run-round with material efficiency), kept as free
+//! functions over `SdeStore` so it is testable without a server. The two `#[tool]`
+//! entry points at the bottom of this file are thin `spawn_blocking` wrappers over
+//! them, mirroring how `sde_get_skill_plan` wraps `build_skill_plan`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -147,15 +147,7 @@ fn meta_group_of(store: &SdeStore, type_id: u64) -> Option<u64> {
 
 fn type_name(store: &SdeStore, type_id: u64, lang: Option<&str>) -> Option<String> {
     let value = query::fetch_by_id(&store.types, type_id).ok()?;
-    match value.get("name")? {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(map) => lang
-            .and_then(|l| map.get(l))
-            .or_else(|| map.get("en"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        _ => None,
-    }
+    query::pick_name(value.get("name"), lang)
 }
 
 /// Classify how `type_id` is produced. Blueprint-first, falling back to a

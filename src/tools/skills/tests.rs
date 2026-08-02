@@ -173,10 +173,7 @@ fn build_skill_plan_flags_assumed_rank_for_rankless_skill() {
     assert_eq!(step.rank, 1, "defaults to rank 1");
 }
 
-/// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-/// and a real MCP client talking to it over an in-memory duplex transport.
-/// Every test here drives a tool the way a client does — over the wire, not
-/// by calling the handler method directly.
+/// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
 mod mcp_seam {
     use crate::tools::testkit::*;
 

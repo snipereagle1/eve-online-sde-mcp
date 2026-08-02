@@ -84,10 +84,7 @@ async fn sde_get_market_group_tree_single_node_has_no_parent() {
     assert_eq!(v[0]["_key"], 1);
 }
 
-/// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-/// and a real MCP client talking to it over an in-memory duplex transport.
-/// Every test here drives a tool the way a client does — over the wire, not
-/// by calling the handler method directly.
+/// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
 mod mcp_seam {
     use crate::tools::testkit::*;
 

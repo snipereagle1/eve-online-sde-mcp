@@ -66,10 +66,7 @@ async fn sde_get_blueprint_for_product_returns_null_for_unknown_product() {
     assert_eq!(v["result"], serde_json::Value::Null);
 }
 
-/// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
-/// and a real MCP client talking to it over an in-memory duplex transport.
-/// Every test here drives a tool the way a client does — over the wire, not
-/// by calling the handler method directly.
+/// Tool tests driven over the wire — see [`crate::tools::testkit::Seam`].
 mod mcp_seam {
     use crate::tools::testkit::*;
 

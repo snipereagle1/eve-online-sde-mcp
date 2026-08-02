@@ -56,7 +56,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 **SDE data directory layout**: `~/.local/share/eve-sde-mcp/sde-{build}/` containing the extracted JSONL files. Old build dirs are deleted on successful download.
 
-**Adding a new tool**: add a field to `SdeStore` + `SdeIndex` in `store.rs`, scan it in `scan.rs`, then add a `#[tool]` method to the `#[tool_router]` impl of the domain module it belongs to. A new domain needs its own directory, a `mod` line in `tools/mod.rs`, and a `+ Self::<domain>_router()` in `server.rs`. Every tool must also be added to the pinned `tools/list` contract test in `server.rs`.
+**Adding a new tool**: add a field to `SdeStore` + `SdeIndex` in `store.rs`, scan it in `scan.rs`, then add a `#[tool]` method to the `#[tool_router]` impl of the domain module it belongs to. A new domain needs its own directory, a `mod` line in `tools/mod.rs`, and a `+ Self::<domain>_router()` in `server.rs`. The pinned `tools/list` contract test enumerates the router automatically, so there is no list to edit — instead regenerate its golden with `SDE_UPDATE_TOOLS_LIST=1 cargo test tools_list_matches_the_pinned_contract`, then read the diff to `tests/fixtures/tools-list.json` and commit it. That run deliberately fails; a green suite means the contract matched without a rewrite.
 
 ## Configuration
 
