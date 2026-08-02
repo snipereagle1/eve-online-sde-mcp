@@ -54,21 +54,6 @@ pub struct CategoryIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct BlueprintTypeIdParam {
-    pub blueprint_type_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ProductTypeIdParam {
-    pub product_type_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct MarketGroupIdParam {
-    pub market_group_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct AttributeIdParam {
     pub attribute_id: u64,
 }
@@ -76,16 +61,6 @@ pub struct AttributeIdParam {
 #[derive(Deserialize, JsonSchema)]
 pub struct EffectIdParam {
     pub effect_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct FactionIdParam {
-    pub faction_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct CorporationIdParam {
-    pub corporation_id: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1659,79 +1634,6 @@ impl SdeMcpServer {
         .unwrap())
     }
 
-    #[tool(description = "Get a blueprint by its blueprint type ID")]
-    async fn sde_get_blueprint(
-        &self,
-        Parameters(p): Parameters<BlueprintTypeIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.blueprints, p.blueprint_type_id, "blueprints")
-    }
-
-    #[tool(
-        description = "Get the blueprint that produces a given product type, tagged with the activity that makes it. Returns {\"blueprint\": {...}, \"activity\": \"manufacturing\"|\"reaction\"} — the activity tells you whether the product is manufactured or comes out of a reaction (the two are distinct production paths with different rules; reactions ignore material efficiency). {\"result\": null} means the product has no blueprint at all (a raw material you must buy/mine). For a full multi-tier bill of materials, prefer sde_build_type."
-    )]
-    async fn sde_get_blueprint_for_product(
-        &self,
-        Parameters(p): Parameters<ProductTypeIdParam>,
-    ) -> Result<String, ErrorData> {
-        let Some(&bp_ref) = self.store.product_to_blueprint.get(&p.product_type_id) else {
-            return Ok(serde_json::json!({"result": null}).to_string());
-        };
-        let mut blueprint = query::fetch_by_id(&self.store.blueprints, bp_ref.blueprint_id)
-            .map_err(|_| {
-                ErrorData::internal_error(
-                    format!("blueprint {} missing from index", bp_ref.blueprint_id),
-                    None,
-                )
-            })?;
-        self.filter(&mut blueprint);
-        Ok(serde_json::json!({
-            "blueprint": blueprint,
-            "activity": bp_ref.activity.as_str(),
-        })
-        .to_string())
-    }
-
-    #[tool(description = "Get a market group by its market group ID")]
-    async fn sde_get_market_group(
-        &self,
-        Parameters(p): Parameters<MarketGroupIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.market_groups, p.market_group_id, "marketGroups")
-    }
-
-    #[tool(
-        description = "Get the full ancestor chain for a market group, from root to the given group"
-    )]
-    async fn sde_get_market_group_tree(
-        &self,
-        Parameters(p): Parameters<MarketGroupIdParam>,
-    ) -> Result<String, ErrorData> {
-        const MAX_HOPS: usize = 20;
-        let mut chain = Vec::new();
-        let mut id = p.market_group_id;
-        loop {
-            if chain.len() >= MAX_HOPS {
-                return Err(ErrorData::internal_error(
-                    "Market group chain exceeds 20 hops",
-                    None,
-                ));
-            }
-            let mut val = query::fetch_by_id(&self.store.market_groups, id).map_err(|_| {
-                ErrorData::invalid_params(format!("ID {id} not found in marketGroups"), None)
-            })?;
-            self.filter(&mut val);
-            let parent = val.get("parentGroupID").and_then(|v| v.as_u64());
-            chain.push(val);
-            match parent {
-                Some(pid) => id = pid,
-                None => break,
-            }
-        }
-        chain.reverse();
-        Ok(serde_json::to_string(&chain).unwrap())
-    }
-
     #[tool(description = "Get a dogma attribute by its attribute ID")]
     async fn sde_get_dogma_attribute(
         &self,
@@ -1763,26 +1665,6 @@ impl SdeMcpServer {
         self.fetch_filtered(&self.store.dogma_effects, p.effect_id, "dogmaEffects")
     }
 
-    #[tool(description = "Get a faction by its faction ID")]
-    async fn sde_get_faction(
-        &self,
-        Parameters(p): Parameters<FactionIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.factions, p.faction_id, "factions")
-    }
-
-    #[tool(description = "Get an NPC corporation by its corporation ID")]
-    async fn sde_get_npc_corporation(
-        &self,
-        Parameters(p): Parameters<CorporationIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(
-            &self.store.npc_corporations,
-            p.corporation_id,
-            "npcCorporations",
-        )
-    }
-
     #[tool(description = "Get a SKIN (ship SKINs) by its skin ID")]
     async fn sde_get_skin(
         &self,
@@ -1797,7 +1679,11 @@ impl SdeMcpServer {
 /// an existing one composes automatically.
 impl SdeMcpServer {
     fn tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
-        Self::server_router() + Self::map_router()
+        Self::server_router()
+            + Self::blueprints_router()
+            + Self::map_router()
+            + Self::market_router()
+            + Self::politics_router()
     }
 }
 
@@ -2539,9 +2425,7 @@ fn topo_order(acc: &PlanAcc) -> Result<Vec<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::testkit::{
-        default_store, make_blueprint_index, make_index, make_server, write_fixture,
-    };
+    use crate::tools::testkit::{default_store, make_index, make_server, write_fixture};
 
     #[tokio::test]
     async fn sde_status_returns_build_metadata() {
@@ -2881,144 +2765,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sde_get_blueprint_returns_record_for_known_id() {
-        let fixture = r#"{"_key":683,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}],"time":6000}}}
-"#;
-        let (_f, blueprints, product_to_blueprint) = make_blueprint_index(fixture);
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                blueprints,
-                product_to_blueprint,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_blueprint(Parameters(BlueprintTypeIdParam {
-                blueprint_type_id: 683,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 683);
-    }
-
-    #[tokio::test]
-    async fn sde_get_blueprint_for_product_returns_blueprint_for_known_product() {
-        let fixture = r#"{"_key":683,"activities":{"manufacturing":{"products":[{"typeID":582,"quantity":1}],"time":6000}}}
-"#;
-        let (_f, blueprints, product_to_blueprint) = make_blueprint_index(fixture);
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                blueprints,
-                product_to_blueprint,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_blueprint_for_product(Parameters(ProductTypeIdParam {
-                product_type_id: 582,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["blueprint"]["_key"], 683);
-        assert_eq!(v["activity"], "manufacturing");
-    }
-
-    #[tokio::test]
-    async fn sde_get_blueprint_for_product_returns_null_for_unknown_product() {
-        let server = make_server();
-        let result = server
-            .sde_get_blueprint_for_product(Parameters(ProductTypeIdParam {
-                product_type_id: 99999,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["result"], serde_json::Value::Null);
-    }
-
-    #[tokio::test]
-    async fn sde_get_market_group_returns_record_for_known_id() {
-        let (_f, market_groups) =
-            make_index("{\"_key\":4,\"name\":{\"en\":\"Ships\"},\"parentGroupID\":null}\n");
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                market_groups,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_market_group(Parameters(MarketGroupIdParam { market_group_id: 4 }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 4);
-    }
-
-    #[tokio::test]
-    async fn sde_get_market_group_returns_error_for_missing_id() {
-        let server = make_server();
-        let result = server
-            .sde_get_market_group(Parameters(MarketGroupIdParam {
-                market_group_id: 99,
-            }))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("99"));
-    }
-
-    #[tokio::test]
-    async fn sde_get_market_group_tree_walks_multi_level_chain() {
-        // root (id=1) → child (id=2) → grandchild (id=3)
-        let fixture = concat!(
-            "{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n",
-            "{\"_key\":2,\"name\":{\"en\":\"Child\"},\"parentGroupID\":1}\n",
-            "{\"_key\":3,\"name\":{\"en\":\"Grandchild\"},\"parentGroupID\":2}\n",
-        );
-        let (_f, market_groups) = make_index(fixture);
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                market_groups,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_market_group_tree(Parameters(MarketGroupIdParam { market_group_id: 3 }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["_key"], 1); // root first
-        assert_eq!(arr[1]["_key"], 2);
-        assert_eq!(arr[2]["_key"], 3); // requested group last
-    }
-
-    #[tokio::test]
-    async fn sde_get_market_group_tree_single_node_has_no_parent() {
-        let (_f, market_groups) = make_index("{\"_key\":1,\"name\":{\"en\":\"Root\"}}\n");
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                market_groups,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_market_group_tree(Parameters(MarketGroupIdParam { market_group_id: 1 }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 1);
-        assert_eq!(v[0]["_key"], 1);
-    }
-
-    #[tokio::test]
     async fn sde_get_dogma_attribute_returns_record_for_known_id() {
         let (_f, dogma_attributes) =
             make_index("{\"_key\":37,\"name\":{\"en\":\"CPU\"},\"unitID\":5}\n");
@@ -3065,49 +2811,6 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["_key"], 11);
-    }
-
-    #[tokio::test]
-    async fn sde_get_faction_returns_record_for_known_id() {
-        let (_f, factions) = make_index(
-            "{\"_key\":500001,\"name\":{\"en\":\"Caldari State\"},\"corporationID\":1000035}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                factions,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_faction(Parameters(FactionIdParam { faction_id: 500001 }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 500001);
-    }
-
-    #[tokio::test]
-    async fn sde_get_npc_corporation_returns_record_for_known_id() {
-        let (_f, npc_corporations) = make_index(
-            "{\"_key\":1000035,\"name\":{\"en\":\"Caldari Navy\"},\"factionID\":500001}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                npc_corporations,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_npc_corporation(Parameters(CorporationIdParam {
-                corporation_id: 1000035,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 1000035);
-        assert_eq!(v["factionID"], 500001);
     }
 
     #[tokio::test]
@@ -3627,66 +3330,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn get_blueprint_returns_its_activities() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_blueprint",
-                    serde_json::json!({"blueprint_type_id": 16228}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 16228);
-            assert!(r["activities"]["manufacturing"].is_object());
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_blueprint_for_product_walks_the_reverse_map() -> anyhow::Result<()> {
-            // The Ferox blueprint makes the Ferox.
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_blueprint_for_product",
-                    serde_json::json!({"product_type_id": 16227}),
-                )
-                .await?;
-            assert_eq!(r["blueprint"]["_key"], 16228);
-            assert_eq!(r["activity"], "manufacturing");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_market_group_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_market_group",
-                    serde_json::json!({"market_group_id": 1857}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 1857);
-            assert_eq!(r["name"], "Minerals");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_market_group_tree_returns_root_to_leaf_ancestry() -> anyhow::Result<()> {
-            // Minerals → Materials → Manufacture & Research.
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_market_group_tree",
-                    serde_json::json!({"market_group_id": 1857}),
-                )
-                .await?;
-            let arr = r.as_array().unwrap();
-            assert_eq!(arr.len(), 3);
-            assert_eq!(arr[0]["_key"], 475); // root: Manufacture & Research
-            assert_eq!(arr[2]["_key"], 1857); // leaf: Minerals
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
         async fn get_dogma_attribute_returns_the_record_for_an_id() -> anyhow::Result<()> {
             let seam = Seam::boot().await?;
             let r = seam
@@ -3708,31 +3351,6 @@ mod tests {
                 .await?;
             assert_eq!(r["_key"], 11);
             assert_eq!(r["name"], "loPower");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_faction_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call("sde_get_faction", serde_json::json!({"faction_id": 500001}))
-                .await?;
-            assert_eq!(r["_key"], 500001);
-            assert_eq!(r["name"], "Caldari State");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_npc_corporation_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_npc_corporation",
-                    serde_json::json!({"corporation_id": 1000035}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 1000035);
-            assert_eq!(r["name"], "Caldari Navy");
             seam.shutdown().await
         }
 
