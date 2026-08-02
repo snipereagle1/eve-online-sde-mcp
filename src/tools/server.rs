@@ -64,42 +64,6 @@ pub struct ProductTypeIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct SolarSystemParam {
-    /// Solar system ID (provide this or name)
-    pub system_id: Option<u64>,
-    /// Solar system name (provide this or system_id)
-    pub name: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct SearchParam {
-    pub query: String,
-    pub limit: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct RegionParam {
-    pub region_id: Option<u64>,
-    pub name: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ConstellationIdParam {
-    pub constellation_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct StationIdParam {
-    pub station_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct RouteParam {
-    pub from_system_id: u64,
-    pub to_system_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct MarketGroupIdParam {
     pub market_group_id: u64,
 }
@@ -317,13 +281,13 @@ impl SdeMcpServer {
         Self { store, language }
     }
 
-    fn filter(&self, value: &mut serde_json::Value) {
+    pub(crate) fn filter(&self, value: &mut serde_json::Value) {
         if let Some(ref lang) = self.language {
             query::apply_language_filter(value, lang);
         }
     }
 
-    fn fetch_filtered(
+    pub(crate) fn fetch_filtered(
         &self,
         index: &crate::store::SdeIndex,
         id: u64,
@@ -336,7 +300,7 @@ impl SdeMcpServer {
         Ok(serde_json::to_string(&val).unwrap())
     }
 
-    fn search_filtered(
+    pub(crate) fn search_filtered(
         &self,
         index: &crate::store::SdeIndex,
         q: &str,
@@ -349,7 +313,7 @@ impl SdeMcpServer {
     /// satisfies `keep`. The predicate runs over the whole match set before the
     /// limit — see [`query::search_by_name`] — so a narrowed search still returns a
     /// full page when one exists.
-    fn search_filtered_where(
+    pub(crate) fn search_filtered_where(
         &self,
         index: &crate::store::SdeIndex,
         q: &str,
@@ -365,13 +329,13 @@ impl SdeMcpServer {
     }
 
     /// English (or configured-language) name of a type, or None if unknown.
-    fn type_name(&self, id: u64) -> Option<String> {
+    pub(crate) fn type_name(&self, id: u64) -> Option<String> {
         let v = query::fetch_by_id(&self.store.types, id).ok()?;
         pick_name(v.get("name"), self.language.as_deref())
     }
 
     /// Name of a dogma attribute by id, or None.
-    fn attribute_name(&self, id: u64) -> Option<String> {
+    pub(crate) fn attribute_name(&self, id: u64) -> Option<String> {
         let v = query::fetch_by_id(&self.store.dogma_attributes, id).ok()?;
         pick_name(v.get("name"), self.language.as_deref())
     }
@@ -379,7 +343,7 @@ impl SdeMcpServer {
     /// True if a type is a skill (category 16), via type→group→category. Used by the
     /// levers view to float skills above implants/boosters/ships when listing what
     /// modifies an attribute — the skill sources are what a training plan cares about.
-    fn is_skill(&self, type_id: u64) -> bool {
+    pub(crate) fn is_skill(&self, type_id: u64) -> bool {
         let Ok(t) = query::fetch_by_id(&self.store.types, type_id) else {
             return false;
         };
@@ -1314,7 +1278,7 @@ impl SdeMcpServer {
 
 // ── Tool implementations ─────────────────────────────────────────────────────
 
-#[tool_router]
+#[tool_router(router = server_router, vis = "pub(crate)")]
 impl SdeMcpServer {
     #[tool(
         description = "Get SDE metadata: build number, release date, data directory, files scanned"
@@ -1728,103 +1692,6 @@ impl SdeMcpServer {
         .to_string())
     }
 
-    #[tool(description = "Get a solar system by ID or name")]
-    async fn sde_get_solar_system(
-        &self,
-        Parameters(p): Parameters<SolarSystemParam>,
-    ) -> Result<String, ErrorData> {
-        match (p.system_id, p.name) {
-            (Some(id), _) => {
-                self.fetch_filtered(&self.store.map_solar_systems, id, "mapSolarSystems")
-            }
-            (None, Some(name)) => {
-                let results = self.search_filtered(&self.store.map_solar_systems, &name, 1)?;
-                results
-                    .into_iter()
-                    .next()
-                    .map(|v| serde_json::to_string(&v).unwrap())
-                    .ok_or_else(|| {
-                        ErrorData::invalid_params(format!("Solar system '{name}' not found"), None)
-                    })
-            }
-            (None, None) => Err(ErrorData::invalid_params("Provide system_id or name", None)),
-        }
-    }
-
-    #[tool(description = "Search solar systems by name substring")]
-    async fn sde_search_solar_systems(
-        &self,
-        Parameters(p): Parameters<SearchParam>,
-    ) -> Result<String, ErrorData> {
-        let limit = p.limit.unwrap_or(10) as usize;
-        let results = self.search_filtered(&self.store.map_solar_systems, &p.query, limit)?;
-        Ok(serde_json::to_string(&results).unwrap())
-    }
-
-    #[tool(description = "Get a region by ID or name")]
-    async fn sde_get_region(
-        &self,
-        Parameters(p): Parameters<RegionParam>,
-    ) -> Result<String, ErrorData> {
-        match (p.region_id, p.name) {
-            (Some(id), _) => self.fetch_filtered(&self.store.map_regions, id, "mapRegions"),
-            (None, Some(name)) => {
-                let results = self.search_filtered(&self.store.map_regions, &name, 1)?;
-                results
-                    .into_iter()
-                    .next()
-                    .map(|v| serde_json::to_string(&v).unwrap())
-                    .ok_or_else(|| {
-                        ErrorData::invalid_params(format!("Region '{name}' not found"), None)
-                    })
-            }
-            (None, None) => Err(ErrorData::invalid_params("Provide region_id or name", None)),
-        }
-    }
-
-    #[tool(description = "Get a constellation by its constellation ID")]
-    async fn sde_get_constellation(
-        &self,
-        Parameters(p): Parameters<ConstellationIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(
-            &self.store.map_constellations,
-            p.constellation_id,
-            "mapConstellations",
-        )
-    }
-
-    #[tool(description = "Get an NPC station by its station ID")]
-    async fn sde_get_npc_station(
-        &self,
-        Parameters(p): Parameters<StationIdParam>,
-    ) -> Result<String, ErrorData> {
-        self.fetch_filtered(&self.store.npc_stations, p.station_id, "npcStations")
-    }
-
-    #[tool(
-        description = "Find the shortest route between two solar systems; returns jump count and system ID path"
-    )]
-    async fn sde_find_route(
-        &self,
-        Parameters(p): Parameters<RouteParam>,
-    ) -> Result<String, ErrorData> {
-        let store = Arc::clone(&self.store);
-        let from = p.from_system_id;
-        let to = p.to_system_id;
-        let path = tokio::task::spawn_blocking(move || bfs_route(&store.stargate_graph, from, to))
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        match path {
-            Some(p) => Ok(serde_json::to_string(&serde_json::json!({
-                "jumps": p.len().saturating_sub(1),
-                "path": p,
-            }))
-            .unwrap()),
-            None => Err(ErrorData::invalid_params("No route found", None)),
-        }
-    }
-
     #[tool(description = "Get a market group by its market group ID")]
     async fn sde_get_market_group(
         &self,
@@ -1925,6 +1792,15 @@ impl SdeMcpServer {
     }
 }
 
+/// The one router the handler dispatches on, summed from each domain's. A new
+/// domain module is the only thing that changes this function — a new tool inside
+/// an existing one composes automatically.
+impl SdeMcpServer {
+    fn tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        Self::server_router() + Self::map_router()
+    }
+}
+
 #[tool_handler(name = "eve-sde-mcp", version = "0.1.0")]
 impl ServerHandler for SdeMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1935,39 +1811,6 @@ impl ServerHandler for SdeMcpServer {
             ))
             .with_instructions(SERVER_INSTRUCTIONS)
     }
-}
-
-// ── BFS route ────────────────────────────────────────────────────────────────
-
-fn bfs_route(graph: &HashMap<u64, Vec<u64>>, from: u64, to: u64) -> Option<Vec<u64>> {
-    if from == to {
-        return Some(vec![from]);
-    }
-    let mut queue = std::collections::VecDeque::new();
-    let mut prev: HashMap<u64, u64> = HashMap::new();
-    queue.push_back(from);
-    prev.insert(from, from);
-    while let Some(curr) = queue.pop_front() {
-        if let Some(neighbors) = graph.get(&curr) {
-            for &next in neighbors {
-                if let std::collections::hash_map::Entry::Vacant(e) = prev.entry(next) {
-                    e.insert(curr);
-                    if next == to {
-                        let mut path = vec![to];
-                        let mut node = to;
-                        while node != from {
-                            node = prev[&node];
-                            path.push(node);
-                        }
-                        path.reverse();
-                        return Some(path);
-                    }
-                    queue.push_back(next);
-                }
-            }
-        }
-    }
-    None
 }
 
 // ── Skill plan ───────────────────────────────────────────────────────────────
@@ -2721,28 +2564,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bfs_route_finds_direct_connection() {
-        let mut graph = HashMap::new();
-        graph.insert(1, vec![2]);
-        graph.insert(2, vec![1]);
-        let path = bfs_route(&graph, 1, 2).unwrap();
-        assert_eq!(path, vec![1, 2]);
-    }
-
-    #[tokio::test]
-    async fn bfs_route_returns_none_for_unreachable() {
-        let graph = HashMap::new();
-        assert!(bfs_route(&graph, 1, 2).is_none());
-    }
-
-    #[tokio::test]
-    async fn bfs_route_same_system() {
-        let graph = HashMap::new();
-        let path = bfs_route(&graph, 42, 42).unwrap();
-        assert_eq!(path, vec![42]);
-    }
-
-    #[tokio::test]
     async fn sde_get_type_returns_record_for_known_id() {
         let (_f, types) =
             make_index("{\"_key\":34,\"name\":{\"en\":\"Tritanium\"},\"published\":true}\n");
@@ -3005,102 +2826,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sde_get_solar_system_by_id_returns_record() {
-        let (_f, map_solar_systems) = make_index(
-            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_solar_systems,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_solar_system(Parameters(SolarSystemParam {
-                system_id: Some(30000142),
-                name: None,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 30000142);
-    }
-
-    #[tokio::test]
-    async fn sde_get_solar_system_by_name_returns_record() {
-        let (_f, map_solar_systems) = make_index(
-            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_solar_systems,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_solar_system(Parameters(SolarSystemParam {
-                system_id: None,
-                name: Some("Jita".to_string()),
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 30000142);
-    }
-
-    #[tokio::test]
-    async fn sde_get_solar_system_by_name_prefers_the_system_actually_named_that() {
-        // Both real records: Mohas (30000031) sorts ahead of Moh (30000042) by ID and
-        // contains its name, so the single row this tool takes used to be the wrong
-        // system — silently, and then fed onward into sde_find_route as a `_key`.
-        let (_f, map_solar_systems) = make_index(
-            "{\"_key\":30000031,\"name\":{\"en\":\"Mohas\"}}\n{\"_key\":30000042,\"name\":{\"en\":\"Moh\"}}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_solar_systems,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_solar_system(Parameters(SolarSystemParam {
-                system_id: None,
-                name: Some("Moh".to_string()),
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 30000042);
-        assert_eq!(v["name"]["en"], "Moh");
-    }
-
-    #[tokio::test]
-    async fn sde_get_region_by_name_prefers_the_region_actually_named_that() {
-        let (_f, map_regions) = make_index(
-            "{\"_key\":10000001,\"name\":{\"en\":\"Derelik North\"}}\n{\"_key\":10000002,\"name\":{\"en\":\"Derelik\"}}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_regions,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_region(Parameters(RegionParam {
-                region_id: None,
-                name: Some("Derelik".to_string()),
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 10000002);
-    }
-
-    #[tokio::test]
     async fn sde_resolve_types_prefers_the_published_record_of_a_shared_name() {
         // Both real: 3591 and 27539 are both "Angel Control Tower", and the lower ID
         // is the unpublished legacy record. Answering with it sends every follow-up
@@ -3153,58 +2878,6 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["by_name"][0]["type_id"], 10248);
-    }
-
-    #[tokio::test]
-    async fn sde_find_route_returns_path_with_correct_jump_count() {
-        // A → B → C → D: 3 jumps, 4 systems
-        let mut graph = HashMap::new();
-        graph.insert(1u64, vec![2u64]);
-        graph.insert(2u64, vec![1u64, 3u64]);
-        graph.insert(3u64, vec![2u64, 4u64]);
-        graph.insert(4u64, vec![3u64]);
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                stargate_graph: graph,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_find_route(Parameters(RouteParam {
-                from_system_id: 1,
-                to_system_id: 4,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["jumps"], 3);
-        assert_eq!(v["path"].as_array().unwrap().len(), 4);
-        assert_eq!(v["path"][0], 1);
-        assert_eq!(v["path"][3], 4);
-    }
-
-    #[tokio::test]
-    async fn sde_find_route_returns_error_for_unreachable_system() {
-        let mut graph = HashMap::new();
-        graph.insert(1u64, vec![2u64]);
-        graph.insert(2u64, vec![1u64]);
-        // system 99 is isolated
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                stargate_graph: graph,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_find_route(Parameters(RouteParam {
-                from_system_id: 1,
-                to_system_id: 99,
-            }))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("No route found"));
     }
 
     #[tokio::test]
@@ -3465,95 +3138,6 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("99"));
-    }
-
-    #[tokio::test]
-    async fn sde_search_solar_systems_returns_matches() {
-        let (_f, map_solar_systems) = make_index(
-            "{\"_key\":30000142,\"name\":{\"en\":\"Jita\"},\"securityStatus\":0.9459}\n\
-             {\"_key\":30000144,\"name\":{\"en\":\"Perimeter\"},\"securityStatus\":0.9531}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_solar_systems,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_search_solar_systems(Parameters(SearchParam {
-                query: "jit".to_string(),
-                limit: None,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 1);
-        assert_eq!(v[0]["_key"], 30000142);
-    }
-
-    #[tokio::test]
-    async fn sde_get_region_returns_record_by_id() {
-        let (_f, map_regions) = make_index("{\"_key\":10000002,\"name\":{\"en\":\"The Forge\"}}\n");
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_regions,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_region(Parameters(RegionParam {
-                region_id: Some(10000002),
-                name: None,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 10000002);
-    }
-
-    #[tokio::test]
-    async fn sde_get_constellation_returns_record_for_known_id() {
-        let (_f, map_constellations) = make_index(
-            "{\"_key\":20000020,\"name\":{\"en\":\"Kimotoro\"},\"regionID\":10000002}\n",
-        );
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                map_constellations,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_constellation(Parameters(ConstellationIdParam {
-                constellation_id: 20000020,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 20000020);
-    }
-
-    #[tokio::test]
-    async fn sde_get_npc_station_returns_record_for_known_id() {
-        let (_f, npc_stations) =
-            make_index("{\"_key\":60003760,\"solarSystemID\":30000142,\"ownerID\":1000035}\n");
-        let server = SdeMcpServer::new(
-            Arc::new(SdeStore {
-                npc_stations,
-                ..default_store()
-            }),
-            None,
-        );
-        let result = server
-            .sde_get_npc_station(Parameters(StationIdParam {
-                station_id: 60003760,
-            }))
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(v["_key"], 60003760);
     }
 
     /// The MCP seam: a real scan of `tests/fixtures/sde`, a real `SdeMcpServer`,
@@ -4068,141 +3652,6 @@ mod tests {
                 .await?;
             assert_eq!(r["blueprint"]["_key"], 16228);
             assert_eq!(r["activity"], "manufacturing");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_solar_system_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_solar_system",
-                    serde_json::json!({"system_id": 30000142}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 30000142);
-            assert_eq!(r["name"], "Jita");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn search_solar_systems_matches_a_name_substring() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_search_solar_systems",
-                    serde_json::json!({"query": "jita"}),
-                )
-                .await?;
-            assert!(r.as_array().unwrap().iter().any(|v| v["_key"] == 30000142));
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn search_solar_systems_orders_by_id_across_separate_processes() -> anyhow::Result<()>
-        {
-            // The SolarSystem search shares the Type search's helper and inherits
-            // the same correction. The fixture's records are deliberately not in ID
-            // order in the file, so scan order and ID order disagree.
-            let first = Seam::boot().await?;
-            let a = first
-                .call(
-                    "sde_search_solar_systems",
-                    serde_json::json!({"query": "i"}),
-                )
-                .await?;
-            first.shutdown().await?;
-
-            let second = Seam::boot().await?;
-            let b = second
-                .call(
-                    "sde_search_solar_systems",
-                    serde_json::json!({"query": "i"}),
-                )
-                .await?;
-            second.shutdown().await?;
-
-            assert_eq!(
-                keys_of(&a),
-                vec![30000138, 30000140, 30000142, 30000144, 30000145, 30000149]
-            );
-            assert_eq!(keys_of(&a), keys_of(&b));
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn get_region_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call("sde_get_region", serde_json::json!({"region_id": 10000002}))
-                .await?;
-            assert_eq!(r["_key"], 10000002);
-            assert_eq!(r["name"], "The Forge");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_constellation_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_constellation",
-                    serde_json::json!({"constellation_id": 20000020}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 20000020);
-            assert_eq!(r["name"], "Kimotoro");
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_npc_station_returns_the_record_for_an_id() -> anyhow::Result<()> {
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_npc_station",
-                    serde_json::json!({"station_id": 60003760}),
-                )
-                .await?;
-            assert_eq!(r["_key"], 60003760);
-            assert_eq!(r["solarSystemID"], 30000142);
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn find_route_returns_the_shortest_stargate_path() -> anyhow::Result<()> {
-            // Jita → Perimeter is 1 jump.
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_find_route",
-                    serde_json::json!({
-                        "from_system_id": 30000142,
-                        "to_system_id": 30000144,
-                    }),
-                )
-                .await?;
-            assert_eq!(r["jumps"], 1);
-            assert_eq!(r["path"].as_array().unwrap().len(), 2);
-            assert_eq!(r["path"][0], 30000142);
-            assert_eq!(r["path"][1], 30000144);
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn find_route_errors_when_no_path_exists() -> anyhow::Result<()> {
-            // Ikuchi has no stargates in the fixture, so it is unreachable.
-            let seam = Seam::boot().await?;
-            let err = seam
-                .try_call(
-                    "sde_find_route",
-                    serde_json::json!({
-                        "from_system_id": 30000142,
-                        "to_system_id": 30000138,
-                    }),
-                )
-                .await;
-            assert!(err.is_err(), "expected error for unreachable system");
             seam.shutdown().await
         }
 
