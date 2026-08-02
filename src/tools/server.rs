@@ -2810,74 +2810,9 @@ fn topo_order(acc: &PlanAcc) -> Result<Vec<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
-
-    fn write_fixture(content: &str) -> (tempfile::NamedTempFile, std::path::PathBuf) {
-        let mut f = tempfile::Builder::new()
-            .suffix(".jsonl")
-            .tempfile()
-            .unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        let path = f.path().to_path_buf();
-        (f, path)
-    }
-
-    fn make_index(content: &str) -> (tempfile::NamedTempFile, crate::store::SdeIndex) {
-        let (_f, path) = write_fixture(content);
-        let pb = indicatif::ProgressBar::hidden();
-        let idx = crate::scan::scan_index_pub(&path, &pb).unwrap();
-        (_f, idx)
-    }
-
-    fn make_server() -> SdeMcpServer {
-        SdeMcpServer::new(Arc::new(default_store()), None)
-    }
-
-    fn empty_index() -> crate::store::SdeIndex {
-        crate::store::SdeIndex {
-            path: std::path::PathBuf::from("/dev/null"),
-            id_index: HashMap::new(),
-            name_index: crate::store::NameIndex::default(),
-        }
-    }
-
-    fn default_store() -> SdeStore {
-        SdeStore {
-            data_dir: std::path::PathBuf::from("/tmp"),
-            build: 42,
-            release_date: "2024-01-01".to_string(),
-            files_scanned: 17,
-            last_updated: "2024-01-01".to_string(),
-            types: empty_index(),
-            groups: empty_index(),
-            categories: empty_index(),
-            blueprints: empty_index(),
-            type_materials: empty_index(),
-            type_dogma: empty_index(),
-            map_solar_systems: empty_index(),
-            map_constellations: empty_index(),
-            map_regions: empty_index(),
-            npc_stations: empty_index(),
-            market_groups: empty_index(),
-            dogma_attributes: empty_index(),
-            dogma_effects: empty_index(),
-            factions: empty_index(),
-            npc_corporations: empty_index(),
-            skins: empty_index(),
-            product_to_blueprint: HashMap::new(),
-            stargate_graph: HashMap::new(),
-            attribute_modifiers: HashMap::new(),
-            effect_to_types: HashMap::new(),
-            attribute_types: HashMap::new(),
-            type_group: HashMap::new(),
-            group_types: HashMap::new(),
-            type_meta_group: HashMap::new(),
-            category_groups: HashMap::new(),
-            published_types: HashSet::new(),
-            dogma_attribute_text: Vec::new(),
-            dogma_effect_text: Vec::new(),
-        }
-    }
+    use crate::tools::testkit::{
+        default_store, make_blueprint_index, make_index, make_server, write_fixture,
+    };
 
     #[tokio::test]
     async fn sde_status_returns_build_metadata() {
@@ -3131,28 +3066,8 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_handshake_initialize_and_list_tools() -> anyhow::Result<()> {
-        use rmcp::{ClientHandler, ServiceExt as _, model::ClientInfo};
-
-        #[derive(Clone, Default)]
-        struct DummyClient;
-        impl ClientHandler for DummyClient {
-            fn get_info(&self) -> ClientInfo {
-                ClientInfo::default()
-            }
-        }
-
-        let (server_transport, client_transport) = tokio::io::duplex(65536);
-        let store = make_server().store;
-        let server_handle = tokio::spawn(async move {
-            SdeMcpServer::new(store, None)
-                .serve(server_transport)
-                .await?
-                .waiting()
-                .await?;
-            anyhow::Ok(())
-        });
-        let client = DummyClient.serve(client_transport).await?;
-        let tools = client.list_all_tools().await?;
+        let seam = crate::tools::testkit::Seam::serving(make_server().store, None).await?;
+        let tools = seam.client.list_all_tools().await?;
         assert!(tools.len() >= 28, "expected ≥28 tools, got {}", tools.len());
         let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"sde_status"));
@@ -3165,9 +3080,7 @@ mod tests {
         assert!(names.contains(&"sde_get_types_dogma"));
         assert!(names.contains(&"sde_resolve_types"));
         assert!(names.contains(&"sde_get_skill_sp"));
-        client.cancel().await?;
-        let _ = server_handle.await;
-        Ok(())
+        seam.shutdown().await
     }
 
     /// The agent-visible contract: every tool's name, description and input schema,
@@ -3179,30 +3092,9 @@ mod tests {
     /// when a tool is genuinely added or changed.
     #[tokio::test]
     async fn tools_list_matches_the_pinned_contract() -> anyhow::Result<()> {
-        use rmcp::{ClientHandler, ServiceExt as _, model::ClientInfo};
-
-        #[derive(Clone, Default)]
-        struct DummyClient;
-        impl ClientHandler for DummyClient {
-            fn get_info(&self) -> ClientInfo {
-                ClientInfo::default()
-            }
-        }
-
-        let (server_transport, client_transport) = tokio::io::duplex(65536);
-        let store = make_server().store;
-        let server_handle = tokio::spawn(async move {
-            SdeMcpServer::new(store, None)
-                .serve(server_transport)
-                .await?
-                .waiting()
-                .await?;
-            anyhow::Ok(())
-        });
-        let client = DummyClient.serve(client_transport).await?;
-        let mut tools = client.list_all_tools().await?;
-        client.cancel().await?;
-        let _ = server_handle.await;
+        let seam = crate::tools::testkit::Seam::serving(make_server().store, None).await?;
+        let mut tools = seam.client.list_all_tools().await?;
+        seam.shutdown().await?;
 
         // Sorted by name so the snapshot does not encode router composition order,
         // which is an implementation detail; `serde_json::Map` is a `BTreeMap` here,
@@ -3210,15 +3102,16 @@ mod tests {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         let actual = serde_json::to_string_pretty(&tools)? + "\n";
 
-        let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tools-list.json");
+        let golden =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tools-list.json");
         if std::env::var_os("SDE_UPDATE_TOOLS_LIST").is_some() {
             std::fs::write(&golden, &actual)?;
             return Ok(());
         }
         let expected = std::fs::read_to_string(&golden)?;
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "the MCP tool contract drifted from {}",
             golden.display()
         );
@@ -3426,25 +3319,6 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("No route found"));
-    }
-
-    fn make_blueprint_index(
-        content: &str,
-    ) -> (
-        tempfile::NamedTempFile,
-        crate::store::SdeIndex,
-        HashMap<u64, crate::store::BlueprintRef>,
-    ) {
-        let mut f = tempfile::Builder::new()
-            .suffix(".jsonl")
-            .tempfile()
-            .unwrap();
-        use std::io::Write as _;
-        f.write_all(content.as_bytes()).unwrap();
-        let path = f.path().to_path_buf();
-        let pb = indicatif::ProgressBar::hidden();
-        let (idx, p2b) = crate::scan::scan_blueprints_pub(&path, &pb).unwrap();
-        (f, idx, p2b)
     }
 
     #[tokio::test]
@@ -3801,114 +3675,7 @@ mod tests {
     /// Every test here drives a tool the way a client does — over the wire, not
     /// by calling the handler method directly.
     mod mcp_seam {
-        use rmcp::{
-            ClientHandler, RoleClient, ServiceExt as _,
-            model::{CallToolRequestParams, CallToolResult, ClientInfo},
-            service::RunningService,
-        };
-
-        use crate::tools::server::SdeMcpServer;
-
-        #[derive(Clone, Default)]
-        struct DummyClient;
-
-        impl ClientHandler for DummyClient {
-            fn get_info(&self) -> ClientInfo {
-                ClientInfo::default()
-            }
-        }
-
-        /// A booted client/server pair. Call [`Seam::shutdown`] at the end of a
-        /// test to cancel the client and join the server task.
-        struct Seam {
-            client: RunningService<RoleClient, DummyClient>,
-            server: tokio::task::JoinHandle<anyhow::Result<()>>,
-        }
-
-        impl Seam {
-            /// Scan the JSONL fixtures and serve them to a live client.
-            async fn boot() -> anyhow::Result<Self> {
-                Self::boot_with_language(Some("en".to_string())).await
-            }
-
-            /// As [`Seam::boot`], but with an explicit server language — `None` is
-            /// the default all-languages mode, where localized fields come back as
-            /// full eight-language maps.
-            async fn boot_with_language(language: Option<String>) -> anyhow::Result<Self> {
-                let fixture_dir =
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
-                let store = crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15")?;
-
-                let (server_transport, client_transport) = tokio::io::duplex(65536);
-                let server = tokio::spawn(async move {
-                    SdeMcpServer::new(store, language)
-                        .serve(server_transport)
-                        .await?
-                        .waiting()
-                        .await?;
-                    anyhow::Ok(())
-                });
-                let client = DummyClient.serve(client_transport).await?;
-                Ok(Self { client, server })
-            }
-
-            /// Call `tool` and parse its single text content block as JSON.
-            async fn call(
-                &self,
-                tool: &str,
-                args: serde_json::Value,
-            ) -> anyhow::Result<serde_json::Value> {
-                let result = self.try_call(tool, args).await?;
-                let text = result
-                    .content
-                    .first()
-                    .and_then(|c| c.raw.as_text())
-                    .map(|t| t.text.as_str())
-                    .expect("expected text content");
-                Ok(serde_json::from_str(text).expect("invalid JSON in tool response"))
-            }
-
-            /// Call `tool` without interpreting the result — for asserting that a
-            /// call fails.
-            async fn try_call(
-                &self,
-                tool: &str,
-                args: serde_json::Value,
-            ) -> anyhow::Result<CallToolResult> {
-                let mut request = CallToolRequestParams::new(tool.to_string());
-                if let Some(map) = args.as_object().filter(|m| !m.is_empty()) {
-                    request = request.with_arguments(map.clone());
-                }
-                Ok(self.client.call_tool(request).await?)
-            }
-
-            async fn shutdown(self) -> anyhow::Result<()> {
-                self.client.cancel().await?;
-                let _ = self.server.await;
-                Ok(())
-            }
-        }
-
-        /// The `type_id`s of a `sde_find_types` answer, in the order returned.
-        fn ids_of(response: &serde_json::Value) -> Vec<u64> {
-            response["types"]
-                .as_array()
-                .expect("types array")
-                .iter()
-                .map(|t| t["type_id"].as_u64().expect("type_id"))
-                .collect()
-        }
-
-        /// The `_key`s of a name-search answer — a bare array of whole records —
-        /// in the order returned.
-        fn keys_of(response: &serde_json::Value) -> Vec<u64> {
-            response
-                .as_array()
-                .expect("array of records")
-                .iter()
-                .map(|t| t["_key"].as_u64().expect("_key"))
-                .collect()
-        }
+        use crate::tools::testkit::{Seam, ids_of, keys_of};
 
         #[tokio::test]
         async fn status_reports_the_scanned_build() -> anyhow::Result<()> {
