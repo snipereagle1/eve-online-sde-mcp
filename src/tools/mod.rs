@@ -1,4 +1,5 @@
 pub(crate) mod blueprints;
+pub(crate) mod dogma;
 pub(crate) mod guidance;
 pub(crate) mod manufacturing;
 pub(crate) mod map;
