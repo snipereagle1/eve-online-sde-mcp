@@ -3170,6 +3170,61 @@ mod tests {
         Ok(())
     }
 
+    /// The agent-visible contract: every tool's name, description and input schema,
+    /// as a client sees them over `tools/list`. Descriptions are prompt-critical —
+    /// they are what an agent routes on — so a reworded one is a behavioral change
+    /// even though no code path moved, and a dropped router is invisible to every
+    /// other test here. Regenerate deliberately with
+    /// `SDE_UPDATE_TOOLS_LIST=1 cargo test tools_list_matches_the_pinned_contract`
+    /// when a tool is genuinely added or changed.
+    #[tokio::test]
+    async fn tools_list_matches_the_pinned_contract() -> anyhow::Result<()> {
+        use rmcp::{ClientHandler, ServiceExt as _, model::ClientInfo};
+
+        #[derive(Clone, Default)]
+        struct DummyClient;
+        impl ClientHandler for DummyClient {
+            fn get_info(&self) -> ClientInfo {
+                ClientInfo::default()
+            }
+        }
+
+        let (server_transport, client_transport) = tokio::io::duplex(65536);
+        let store = make_server().store;
+        let server_handle = tokio::spawn(async move {
+            SdeMcpServer::new(store, None)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            anyhow::Ok(())
+        });
+        let client = DummyClient.serve(client_transport).await?;
+        let mut tools = client.list_all_tools().await?;
+        client.cancel().await?;
+        let _ = server_handle.await;
+
+        // Sorted by name so the snapshot does not encode router composition order,
+        // which is an implementation detail; `serde_json::Map` is a `BTreeMap` here,
+        // so every nested key order is already canonical.
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let actual = serde_json::to_string_pretty(&tools)? + "\n";
+
+        let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tools-list.json");
+        if std::env::var_os("SDE_UPDATE_TOOLS_LIST").is_some() {
+            std::fs::write(&golden, &actual)?;
+            return Ok(());
+        }
+        let expected = std::fs::read_to_string(&golden)?;
+        assert_eq!(
+            actual, expected,
+            "the MCP tool contract drifted from {}",
+            golden.display()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sde_get_solar_system_by_id_returns_record() {
         let (_f, map_solar_systems) = make_index(
