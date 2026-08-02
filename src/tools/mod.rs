@@ -6,6 +6,7 @@ pub(crate) mod market;
 pub(crate) mod politics;
 pub(crate) mod query;
 mod server;
+pub(crate) mod skills;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub use server::SdeMcpServer;

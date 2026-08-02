@@ -17,6 +17,7 @@ use super::guidance::{
 };
 use super::manufacturing;
 use super::query;
+use super::query::pick_name;
 use crate::store::SdeStore;
 
 // ── Parameter structs ────────────────────────────────────────────────────────
@@ -78,21 +79,6 @@ pub struct TypeDogmaParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct SkillPlanTarget {
-    /// Type ID to train prerequisites for (ship, module, or a skill itself)
-    pub type_id: u64,
-    /// When the target is a skill, train it to this level (default 5). Ignored for
-    /// non-skill targets (their prerequisites keep the levels the item demands).
-    pub level_override: Option<u8>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct SkillPlanParam {
-    /// Targets are treated as separate items (not a merged fit); no variant expansion
-    pub targets: Vec<SkillPlanTarget>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct ModifierQueryParam {
     /// Direction-a: a skill/ship/type ID → the attributes it modifies + magnitudes
     pub type_id: Option<u64>,
@@ -137,14 +123,6 @@ pub struct ResolveTypesParam {
     pub type_ids: Option<Vec<u64>>,
     /// Exact type names to resolve to IDs (case-insensitive)
     pub names: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct SkillSpParam {
-    /// Skill rank directly (skillTimeConstant, attribute 275)
-    pub rank: Option<u64>,
-    /// Or a skill's type ID — its rank is looked up from dogma
-    pub type_id: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1368,25 +1346,6 @@ impl SdeMcpServer {
     }
 
     #[tool(
-        description = "Build a recursive skill-prerequisite training plan for one or more target type IDs (ships, modules, or skills). Returns each target's full prerequisite tree plus one merged, deduped (to the highest level demanded), topologically-sorted plan with per-skill rank, SP cost, running cumulative SP, the per-level SP curve (sp_by_level), and which targets require it."
-    )]
-    async fn sde_get_skill_plan(
-        &self,
-        Parameters(p): Parameters<SkillPlanParam>,
-    ) -> Result<String, ErrorData> {
-        let store = Arc::clone(&self.store);
-        let lang = self.language.clone();
-        let targets = p.targets;
-        let plan = tokio::task::spawn_blocking(move || {
-            build_skill_plan(&store, &targets, lang.as_deref())
-        })
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
-        Ok(serde_json::to_string(&plan).unwrap())
-    }
-
-    #[tool(
         description = "Plan how to manufacture / build / produce a Type (ship, module, component, …): the FIRST tool to call for 'how do I build X', 'what do I need to make X', 'bill of materials', or 'production chain'. Classifies the whole build tree and returns: whether the target is buildable (and its material-efficiency mode), the distinct decomposable origins present (manufactured vs reaction-output), per-origin buy-vs-build decision gates (each input tagged with its origin, ME mode, and required skills), the aggregate blueprint-job skills across the chain, and any out-of-scope leaves (invention or planetary-industry items you must buy). This is the classify-only router — neutral facts, no recommendations. Once the player picks what to build vs buy, call sde_get_production_chain for the resolved quantities and shopping list."
     )]
     async fn sde_build_type(
@@ -1608,32 +1567,6 @@ impl SdeMcpServer {
         )
     }
 
-    #[tool(
-        description = "Get the SP cost curve (levels 1-5: cumulative sp_to_reach and per-level increment) for a skill. Provide rank directly, or type_id to look its rank up."
-    )]
-    async fn sde_get_skill_sp(
-        &self,
-        Parameters(p): Parameters<SkillSpParam>,
-    ) -> Result<String, ErrorData> {
-        let rank = match (p.rank, p.type_id) {
-            (Some(rank), _) => rank,
-            (None, Some(type_id)) => skill_rank(&self.store, type_id).ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!("type {type_id} is not a skill (no rank attribute 275)"),
-                    None,
-                )
-            })?,
-            (None, None) => {
-                return Err(ErrorData::invalid_params("Provide rank or type_id", None));
-            }
-        };
-        Ok(serde_json::to_string(&serde_json::json!({
-            "rank": rank,
-            "levels": sp_breakdown(rank),
-        }))
-        .unwrap())
-    }
-
     #[tool(description = "Get a dogma attribute by its attribute ID")]
     async fn sde_get_dogma_attribute(
         &self,
@@ -1684,6 +1617,7 @@ impl SdeMcpServer {
             + Self::map_router()
             + Self::market_router()
             + Self::politics_router()
+            + Self::skills_router()
     }
 }
 
@@ -1698,14 +1632,6 @@ impl ServerHandler for SdeMcpServer {
             .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
-
-// ── Skill plan ───────────────────────────────────────────────────────────────
-
-use serde_json::Value;
-
-const ATTR_RANK: u64 = 275; // skillTimeConstant
-const PREREQ_SLOTS: [(u64, u64); 3] = [(182, 277), (183, 278), (184, 279)]; // (skillID, levelID)
-const MAX_SKILL_DEPTH: usize = 12;
 
 // ── sde_find_types ───────────────────────────────────────────────────────────
 
@@ -2050,20 +1976,6 @@ impl AttributeOp {
     }
 }
 
-/// Pick the English (or requested-language) string from a localized name field,
-/// tolerating both `{"en": "X"}` objects and already-filtered plain strings.
-fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
-    match name {
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Object(m)) => lang
-            .and_then(|l| m.get(l))
-            .or_else(|| m.get("en"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
 /// Human-readable name for a dogma modifier `operation` code (EVE's canonical
 /// dogma Operator enum). The magnitude alone is ambiguous — e.g. op 6 with
 /// magnitude 5.0 is "+5% per stacking source", NOT "+5 flat". Surfacing this
@@ -2082,342 +1994,6 @@ fn operation_label(op: i64) -> &'static str {
         7 => "postAssignment (set, applied last)",
         _ => "unknown",
     }
-}
-
-/// Cumulative skill points to have a skill of the given rank at `level`.
-/// EVE's canonical curve: SP(L) = round(rank · 250 · (√32)^(L-1)); √32 = 2^2.5.
-/// Verified against the rank-1 points 250/1414/8000/45255/256000 — `round` (not ceil)
-/// is what matches: 1414.21→1414, 45254.83→45255, and it absorbs the float noise that
-/// makes the exact integer points (8000, 256000) compute as e.g. 256000.00000005.
-fn skill_sp(rank: u64, level: u8) -> u64 {
-    if level == 0 {
-        return 0;
-    }
-    let sqrt32 = 32f64.sqrt();
-    (rank as f64 * 250.0 * sqrt32.powi(level as i32 - 1)).round() as u64
-}
-
-/// A skill's own rank (attribute 275), or None if the type is not a skill.
-fn skill_rank(store: &SdeStore, type_id: u64) -> Option<u64> {
-    let dogma = query::fetch_by_id(&store.type_dogma, type_id).ok()?;
-    let attrs = dogma.get("dogmaAttributes")?.as_array()?;
-    attrs.iter().find_map(|a| {
-        let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
-        (aid == ATTR_RANK)
-            .then(|| a.get("value").and_then(|x| x.as_f64()))
-            .flatten()
-            .map(|v| v.round() as u64)
-    })
-}
-
-/// A type's direct skill prerequisites as (skill_id, level) pairs.
-fn direct_prereqs(store: &SdeStore, type_id: u64) -> Vec<(u64, u8)> {
-    let Ok(dogma) = query::fetch_by_id(&store.type_dogma, type_id) else {
-        return Vec::new();
-    };
-    let Some(attrs) = dogma.get("dogmaAttributes").and_then(|a| a.as_array()) else {
-        return Vec::new();
-    };
-    let value_of = |attr_id: u64| -> Option<f64> {
-        attrs.iter().find_map(|a| {
-            let aid = a.get("attributeID").and_then(|x| x.as_u64())?;
-            (aid == attr_id)
-                .then(|| a.get("value").and_then(|x| x.as_f64()))
-                .flatten()
-        })
-    };
-    let mut out = Vec::new();
-    for (skill_attr, level_attr) in PREREQ_SLOTS {
-        if let Some(skill_id) = value_of(skill_attr) {
-            let level = value_of(level_attr).unwrap_or(1.0).round().clamp(1.0, 5.0) as u8;
-            out.push((skill_id as u64, level));
-        }
-    }
-    out
-}
-
-/// serde `skip_serializing_if` predicate: omit a `bool` field when it's false.
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-#[derive(serde::Serialize, Debug)]
-struct PrereqNode {
-    skill_id: u64,
-    skill_name: Option<String>,
-    required_level: u8,
-    rank: u64,
-    /// True when `rank` was defaulted to 1 because the skill has no rank attribute
-    /// (275) — its SP cost is therefore a lower-bound estimate, not authoritative.
-    #[serde(skip_serializing_if = "is_false")]
-    rank_assumed: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    prerequisites: Vec<PrereqNode>,
-}
-
-#[derive(serde::Serialize, Debug)]
-struct SpLevel {
-    level: u8,
-    /// Total SP to have the skill at this level (cumulative from 0).
-    sp_to_reach: u64,
-    /// SP to train just this level, i.e. from level-1 to level.
-    increment: u64,
-}
-
-/// Full SP cost curve (levels 1..=5) for a skill of the given rank.
-fn sp_breakdown(rank: u64) -> Vec<SpLevel> {
-    let mut prev = 0u64;
-    (1..=5)
-        .map(|level| {
-            let sp_to_reach = skill_sp(rank, level);
-            let increment = sp_to_reach - prev;
-            prev = sp_to_reach;
-            SpLevel {
-                level,
-                sp_to_reach,
-                increment,
-            }
-        })
-        .collect()
-}
-
-#[derive(serde::Serialize, Debug)]
-struct PlanStep {
-    skill_id: u64,
-    skill_name: Option<String>,
-    required_level: u8,
-    rank: u64,
-    /// See `PrereqNode::rank_assumed`.
-    #[serde(skip_serializing_if = "is_false")]
-    rank_assumed: bool,
-    sp_for_level: u64,
-    cumulative_sp: u64,
-    /// Per-level SP cost (levels 1..=5) so callers can rank yield-per-SP without
-    /// rebuilding the SP table by hand.
-    sp_by_level: Vec<SpLevel>,
-    required_by: Vec<u64>,
-}
-
-#[derive(serde::Serialize, Debug)]
-struct TargetTree {
-    type_id: u64,
-    name: Option<String>,
-    tree: Vec<PrereqNode>,
-}
-
-#[derive(serde::Serialize, Debug)]
-struct SkillPlan {
-    targets: Vec<TargetTree>,
-    plan: Vec<PlanStep>,
-    total_sp: u64,
-}
-
-#[derive(Default)]
-struct Merged {
-    level: u8,
-    rank: u64,
-    rank_assumed: bool,
-    required_by: std::collections::BTreeSet<u64>,
-}
-
-/// Accumulators shared across one skill-plan call.
-struct PlanAcc {
-    merged: HashMap<u64, Merged>,
-    edges: HashMap<u64, std::collections::BTreeSet<u64>>, // prereq_skill -> dependent skills
-}
-
-/// Recursively build the prereq tree for one skill, threading provenance and the
-/// merged/edges accumulators. `path` is the active DFS stack for cycle detection.
-fn build_node(
-    store: &SdeStore,
-    lang: Option<&str>,
-    skill_id: u64,
-    level: u8,
-    target_id: u64,
-    acc: &mut PlanAcc,
-    path: &mut Vec<u64>,
-) -> Result<PrereqNode, String> {
-    if path.contains(&skill_id) {
-        return Err(format!(
-            "skill prerequisite cycle detected at skill {skill_id}"
-        ));
-    }
-    if path.len() >= MAX_SKILL_DEPTH {
-        return Err(format!(
-            "skill prerequisite depth exceeds {MAX_SKILL_DEPTH}"
-        ));
-    }
-    let (rank, rank_assumed) = match skill_rank(store, skill_id) {
-        Some(r) => (r, false),
-        None => {
-            tracing::warn!(
-                "skill-plan: skill {skill_id} has no rank attribute (275); \
-                 assuming rank 1 — its SP cost is a lower-bound estimate"
-            );
-            (1, true)
-        }
-    };
-    {
-        let entry = acc.merged.entry(skill_id).or_default();
-        entry.level = entry.level.max(level);
-        entry.rank = rank;
-        entry.rank_assumed = rank_assumed;
-        entry.required_by.insert(target_id);
-    }
-    path.push(skill_id);
-    let mut prerequisites = Vec::new();
-    for (prereq_id, prereq_level) in direct_prereqs(store, skill_id) {
-        acc.edges.entry(prereq_id).or_default().insert(skill_id);
-        prerequisites.push(build_node(
-            store,
-            lang,
-            prereq_id,
-            prereq_level,
-            target_id,
-            acc,
-            path,
-        )?);
-    }
-    path.pop();
-    Ok(PrereqNode {
-        skill_id,
-        skill_name: pick_name(
-            query::fetch_by_id(&store.types, skill_id)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("name")),
-            lang,
-        ),
-        required_level: level,
-        rank,
-        rank_assumed,
-        prerequisites,
-    })
-}
-
-fn build_skill_plan(
-    store: &SdeStore,
-    targets: &[SkillPlanTarget],
-    lang: Option<&str>,
-) -> Result<SkillPlan, String> {
-    let mut acc = PlanAcc {
-        merged: HashMap::new(),
-        edges: HashMap::new(),
-    };
-    let mut target_trees = Vec::new();
-
-    for target in targets {
-        let mut path = Vec::new();
-        let tree = if let Some(rank) = skill_rank(store, target.type_id) {
-            // Target is itself a skill: train it (to override or 5) plus its prereqs.
-            let _ = rank;
-            let level = target.level_override.unwrap_or(5).clamp(1, 5);
-            vec![build_node(
-                store,
-                lang,
-                target.type_id,
-                level,
-                target.type_id,
-                &mut acc,
-                &mut path,
-            )?]
-        } else {
-            // Ship/module: expand its direct skill prerequisites.
-            let mut nodes = Vec::new();
-            for (skill_id, level) in direct_prereqs(store, target.type_id) {
-                nodes.push(build_node(
-                    store,
-                    lang,
-                    skill_id,
-                    level,
-                    target.type_id,
-                    &mut acc,
-                    &mut path,
-                )?);
-            }
-            nodes
-        };
-        target_trees.push(TargetTree {
-            type_id: target.type_id,
-            name: pick_name(
-                query::fetch_by_id(&store.types, target.type_id)
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| v.get("name")),
-                lang,
-            ),
-            tree,
-        });
-    }
-
-    let order = topo_order(&acc)?;
-
-    let mut plan = Vec::new();
-    let mut cumulative = 0u64;
-    for skill_id in order {
-        let m = &acc.merged[&skill_id];
-        let sp = skill_sp(m.rank, m.level);
-        cumulative += sp;
-        plan.push(PlanStep {
-            skill_id,
-            skill_name: pick_name(
-                query::fetch_by_id(&store.types, skill_id)
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| v.get("name")),
-                lang,
-            ),
-            required_level: m.level,
-            rank: m.rank,
-            rank_assumed: m.rank_assumed,
-            sp_for_level: sp,
-            cumulative_sp: cumulative,
-            sp_by_level: sp_breakdown(m.rank),
-            required_by: m.required_by.iter().copied().collect(),
-        });
-    }
-
-    Ok(SkillPlan {
-        targets: target_trees,
-        plan,
-        total_sp: cumulative,
-    })
-}
-
-/// Kahn's algorithm over the merged skill set, popping lowest skill_id first for
-/// stable output. Errors if a cycle leaves nodes unsorted.
-fn topo_order(acc: &PlanAcc) -> Result<Vec<u64>, String> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let mut indegree: HashMap<u64, usize> = acc.merged.keys().map(|&k| (k, 0)).collect();
-    for deps in acc.edges.values() {
-        for &s in deps {
-            *indegree.entry(s).or_insert(0) += 1;
-        }
-    }
-    let mut heap: BinaryHeap<Reverse<u64>> = indegree
-        .iter()
-        .filter(|&(_, &d)| d == 0)
-        .map(|(&k, _)| Reverse(k))
-        .collect();
-    let mut order = Vec::with_capacity(acc.merged.len());
-    while let Some(Reverse(n)) = heap.pop() {
-        order.push(n);
-        if let Some(deps) = acc.edges.get(&n) {
-            for &s in deps {
-                let d = indegree.get_mut(&s).unwrap();
-                *d -= 1;
-                if *d == 0 {
-                    heap.push(Reverse(s));
-                }
-            }
-        }
-    }
-    if order.len() != acc.merged.len() {
-        return Err("skill prerequisite cycle detected".to_string());
-    }
-    Ok(order)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3366,29 +2942,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn get_skill_plan_merges_multiple_targets_into_one_plan() -> anyhow::Result<()> {
-            // Covetor + ORE Deep Core Strip Miner → one merged plan.
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call(
-                    "sde_get_skill_plan",
-                    serde_json::json!({
-                        "targets": [{"type_id": 17476}, {"type_id": 87562}]
-                    }),
-                )
-                .await?;
-            let plan = r["plan"].as_array().unwrap();
-            // Mining deduped to level 5 (module demands 5), prereqs before dependents.
-            assert_eq!(plan[0]["skill_id"], 3386);
-            assert_eq!(plan[0]["required_level"], 5);
-            assert_eq!(plan[0]["sp_for_level"], 256000);
-            assert_eq!(plan[0]["required_by"].as_array().unwrap().len(), 2);
-            assert_eq!(plan.last().unwrap()["skill_id"], 17940); // Mining Barge last
-            assert_eq!(r["total_sp"], 312000);
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
         async fn get_modifiers_by_attribute_lists_every_owning_type() -> anyhow::Result<()> {
             // Direction-b: what modifies miningAmount (77).
             let seam = Seam::boot().await?;
@@ -3488,21 +3041,6 @@ mod tests {
             assert_eq!(r["by_id"][0]["name"], "ORE Deep Core Strip Miner");
             assert_eq!(r["by_name"][0]["type_id"], 17476);
             assert_eq!(r["by_name"][1]["type_id"], 3386);
-            seam.shutdown().await
-        }
-
-        #[tokio::test]
-        async fn get_skill_sp_returns_the_full_curve_for_a_skill() -> anyhow::Result<()> {
-            // Astrogeology is rank 3.
-            let seam = Seam::boot().await?;
-            let r = seam
-                .call("sde_get_skill_sp", serde_json::json!({"type_id": 3410}))
-                .await?;
-            assert_eq!(r["rank"], 3);
-            let lvls = r["levels"].as_array().unwrap();
-            assert_eq!(lvls[0]["sp_to_reach"], 750); // rank3 L1 = 3 × 250
-            assert_eq!(lvls[4]["sp_to_reach"], 768000); // rank3 L5 = 3 × 256000
-            assert_eq!(lvls[4]["increment"], 768000 - 3 * 45255);
             seam.shutdown().await
         }
 
@@ -5055,119 +4593,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn skill_sp_matches_canonical_rank1_points() {
-        assert_eq!(skill_sp(1, 1), 250);
-        assert_eq!(skill_sp(1, 2), 1414);
-        assert_eq!(skill_sp(1, 3), 8000);
-        assert_eq!(skill_sp(1, 4), 45255);
-        assert_eq!(skill_sp(1, 5), 256000);
-        assert_eq!(skill_sp(3, 3), 24000); // rank scales linearly
-        assert_eq!(skill_sp(1, 0), 0);
-    }
-
-    fn fixture_store() -> Arc<SdeStore> {
-        let fixture_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sde");
-        crate::scan::scan_sde(&fixture_dir, 3333874, "2024-01-15").unwrap()
-    }
-
-    #[test]
-    fn build_skill_plan_dedupes_to_highest_level_and_topo_sorts() {
-        let store = fixture_store();
-        let targets = vec![
-            SkillPlanTarget {
-                type_id: 17476,
-                level_override: None,
-            }, // Covetor (ship)
-            SkillPlanTarget {
-                type_id: 87562,
-                level_override: None,
-            }, // ORE module → Mining 5
-        ];
-        let plan = build_skill_plan(&store, &targets, Some("en")).unwrap();
-
-        let ids: Vec<u64> = plan.plan.iter().map(|s| s.skill_id).collect();
-        assert_eq!(
-            ids,
-            vec![3386, 3410, 17940],
-            "Mining → Astrogeology → Mining Barge"
-        );
-
-        let mining = &plan.plan[0];
-        assert_eq!(
-            mining.required_level, 5,
-            "deduped to highest demanded level"
-        );
-        assert_eq!(
-            mining.required_by,
-            vec![17476, 87562],
-            "provenance unions both targets"
-        );
-        assert_eq!(mining.sp_for_level, 256000);
-        assert_eq!(plan.total_sp, 312000);
-        assert_eq!(plan.plan.last().unwrap().cumulative_sp, 312000);
-
-        // Covetor target tree roots at Mining Barge (its only direct prereq).
-        let covetor = plan.targets.iter().find(|t| t.type_id == 17476).unwrap();
-        assert_eq!(covetor.tree[0].skill_id, 17940);
-        assert_eq!(covetor.tree[0].rank, 4);
-    }
-
-    #[test]
-    fn build_skill_plan_errors_on_cycle() {
-        // 100 requires 101, 101 requires 100 — both skills (have rank 275).
-        let (_d, type_dogma) = make_index(
-            "{\"_key\":100,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0},{\"attributeID\":182,\"value\":101.0},{\"attributeID\":277,\"value\":1.0}]}\n\
-             {\"_key\":101,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0},{\"attributeID\":182,\"value\":100.0},{\"attributeID\":277,\"value\":1.0}]}\n",
-        );
-        let (_t, types) = make_index(
-            "{\"_key\":100,\"name\":{\"en\":\"Loop A\"}}\n{\"_key\":101,\"name\":{\"en\":\"Loop B\"}}\n",
-        );
-        let store = Arc::new(SdeStore {
-            type_dogma,
-            types,
-            ..default_store()
-        });
-        let targets = vec![SkillPlanTarget {
-            type_id: 100,
-            level_override: None,
-        }];
-        let err = build_skill_plan(&store, &targets, None).unwrap_err();
-        assert!(err.contains("cycle"), "expected cycle error, got: {err}");
-    }
-
-    #[test]
-    fn sp_breakdown_increments_sum_to_cumulative() {
-        let b = sp_breakdown(1);
-        assert_eq!(b[0].sp_to_reach, 250);
-        assert_eq!(b[4].sp_to_reach, 256000);
-        // increments are level-to-level deltas
-        assert_eq!(b[0].increment, 250);
-        assert_eq!(b[1].increment, 1414 - 250);
-        // last increment + prior cumulative == final cumulative
-        assert_eq!(b[3].sp_to_reach + b[4].increment, b[4].sp_to_reach);
-    }
-
-    #[test]
-    fn skill_plan_steps_carry_full_sp_curve() {
-        let store = fixture_store();
-        let plan = build_skill_plan(
-            &store,
-            &[SkillPlanTarget {
-                type_id: 87562,
-                level_override: None,
-            }],
-            Some("en"),
-        )
-        .unwrap();
-        // Mining (rank 1) demanded at L5 — its sp_by_level still spans all 5 levels.
-        let mining = plan.plan.iter().find(|s| s.skill_id == 3386).unwrap();
-        assert_eq!(mining.sp_by_level.len(), 5);
-        assert_eq!(mining.sp_by_level[0].sp_to_reach, 250);
-        assert_eq!(mining.sp_by_level[4].sp_to_reach, mining.sp_for_level);
-    }
-
     #[tokio::test]
     async fn sde_get_modifiers_requires_exactly_one_arg() {
         let server = make_server();
@@ -5181,64 +4606,6 @@ mod tests {
             }))
             .await;
         assert!(err.is_err());
-    }
-
-    #[test]
-    fn build_skill_plan_errors_when_depth_exceeded() {
-        // Linear prereq chain 100→101→…→115 (16 deep), no cycle. Must trip the
-        // depth guard (MAX_SKILL_DEPTH = 12), not the cycle guard.
-        let mut dogma = String::new();
-        for id in 100u64..=114 {
-            dogma.push_str(&format!(
-                "{{\"_key\":{id},\"dogmaAttributes\":[{{\"attributeID\":275,\"value\":1.0}},{{\"attributeID\":182,\"value\":{next}.0}},{{\"attributeID\":277,\"value\":1.0}}]}}\n",
-                next = id + 1
-            ));
-        }
-        // Leaf skill at the end of the chain (has rank, no further prereq).
-        dogma
-            .push_str("{\"_key\":115,\"dogmaAttributes\":[{\"attributeID\":275,\"value\":1.0}]}\n");
-        let (_d, type_dogma) = make_index(&dogma);
-        let store = Arc::new(SdeStore {
-            type_dogma,
-            ..default_store()
-        });
-        let targets = vec![SkillPlanTarget {
-            type_id: 100,
-            level_override: None,
-        }];
-        let err = build_skill_plan(&store, &targets, None).unwrap_err();
-        assert!(err.contains("depth"), "expected depth error, got: {err}");
-    }
-
-    #[test]
-    fn build_skill_plan_handles_empty_targets() {
-        let store = fixture_store();
-        let plan = build_skill_plan(&store, &[], Some("en")).unwrap();
-        assert!(plan.plan.is_empty());
-        assert!(plan.targets.is_empty());
-        assert_eq!(plan.total_sp, 0);
-    }
-
-    #[test]
-    fn build_skill_plan_flags_assumed_rank_for_rankless_skill() {
-        // 200 is a module needing skill 201; 201 has no rank attribute (275), so
-        // its rank is defaulted to 1 and the step must be flagged rank_assumed.
-        let (_d, type_dogma) = make_index(
-            "{\"_key\":200,\"dogmaAttributes\":[{\"attributeID\":182,\"value\":201.0},{\"attributeID\":277,\"value\":3.0}]}\n\
-             {\"_key\":201,\"dogmaAttributes\":[]}\n",
-        );
-        let store = Arc::new(SdeStore {
-            type_dogma,
-            ..default_store()
-        });
-        let targets = vec![SkillPlanTarget {
-            type_id: 200,
-            level_override: None,
-        }];
-        let plan = build_skill_plan(&store, &targets, None).unwrap();
-        let step = plan.plan.iter().find(|s| s.skill_id == 201).unwrap();
-        assert!(step.rank_assumed, "rank-less skill should be flagged");
-        assert_eq!(step.rank, 1, "defaults to rank 1");
     }
 
     #[test]

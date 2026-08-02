@@ -95,6 +95,20 @@ fn is_localized(map: &serde_json::Map<String, Value>) -> bool {
         && map.keys().all(|k| LANG_CODES.contains(&k.as_str()))
 }
 
+/// Pick the English (or requested-language) string from a localized name field,
+/// tolerating both `{"en": "X"}` objects and already-filtered plain strings.
+pub(crate) fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
+    match name {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Object(m)) => lang
+            .and_then(|l| m.get(l))
+            .or_else(|| m.get("en"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
