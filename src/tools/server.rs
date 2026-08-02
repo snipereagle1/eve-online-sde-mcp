@@ -1,51 +1,17 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::wrapper::Parameters,
     model::{Implementation, ServerCapabilities, ServerInfo},
-    schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
 };
-use serde::Deserialize;
 
 use super::guidance::SERVER_INSTRUCTIONS;
-use super::manufacturing;
 use super::query;
 use super::query::pick_name;
 use crate::store::SdeStore;
 
 // ── Parameter structs ────────────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema)]
-pub struct BuildTypeParam {
-    /// The Type ID you want to manufacture/build (a ship, module, component, etc.)
-    pub product_type_id: u64,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ProductionChainParam {
-    /// The Type ID you want to build.
-    pub product_type_id: u64,
-    /// Number of runs (units, when output-per-run is 1) of the target to build. Default 1.
-    pub runs: Option<u64>,
-    /// Which decomposable origins to build rather than buy: any of "manufactured",
-    /// "reaction-output". Defaults to both (build the whole tree). Anything not built
-    /// lands in the shopping list.
-    pub build_origins: Option<Vec<String>>,
-    /// Force these Type IDs to be bought even when their origin is being built
-    /// (e.g. buy fuel blocks instead of decomposing them into ice + PI).
-    pub buy_type_ids: Option<Vec<u64>>,
-    /// Default material efficiency (%) applied to every manufacturing job. Default 0.
-    /// Reactions always ignore ME.
-    pub me: Option<i64>,
-    /// Per-Type material-efficiency overrides (%), keyed by Type ID; overrides `me`
-    /// for those types only.
-    pub me_overrides: Option<HashMap<u64, i64>>,
-}
 
 // ── Server ───────────────────────────────────────────────────────────────────
 
@@ -153,74 +119,6 @@ impl SdeMcpServer {
         }))
         .unwrap()
     }
-
-    #[tool(
-        description = "Plan how to manufacture / build / produce a Type (ship, module, component, …): the FIRST tool to call for 'how do I build X', 'what do I need to make X', 'bill of materials', or 'production chain'. Classifies the whole build tree and returns: whether the target is buildable (and its material-efficiency mode), the distinct decomposable origins present (manufactured vs reaction-output), per-origin buy-vs-build decision gates (each input tagged with its origin, ME mode, and required skills), the aggregate blueprint-job skills across the chain, and any out-of-scope leaves (invention or planetary-industry items you must buy). This is the classify-only router — neutral facts, no recommendations. Once the player picks what to build vs buy, call sde_get_production_chain for the resolved quantities and shopping list."
-    )]
-    async fn sde_build_type(
-        &self,
-        Parameters(p): Parameters<BuildTypeParam>,
-    ) -> Result<String, ErrorData> {
-        let store = Arc::clone(&self.store);
-        let lang = self.language.clone();
-        let target_id = p.product_type_id;
-        let result = tokio::task::spawn_blocking(move || {
-            manufacturing::build_type(&store, target_id, lang.as_deref())
-        })
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
-        Ok(serde_json::to_string(&result).unwrap())
-    }
-
-    #[tool(
-        description = "Compute the resolved production chain for a build: given the player's buy-vs-build decisions, returns per-Type build jobs (runs, output-per-run, leftover from run-rounding) and one consolidated shopping list grouped by origin (minerals, moon materials, PI, etc.), plus the aggregate job skills. Material efficiency reduces manufacturing material cost (floored at one unit per run); reactions ignore ME. Shared intermediates are counted once across the whole tree before run-rounding. Decisions: build_origins toggles which decomposable origins to build (default: build everything), buy_type_ids force-buys specific Types (e.g. fuel blocks), me / me_overrides set material efficiency. Call sde_build_type first to discover the decision gates."
-    )]
-    async fn sde_get_production_chain(
-        &self,
-        Parameters(p): Parameters<ProductionChainParam>,
-    ) -> Result<String, ErrorData> {
-        let build_origins: HashSet<manufacturing::Origin> = match p.build_origins {
-            Some(keys) => {
-                let mut set = HashSet::new();
-                for key in keys {
-                    let origin = manufacturing::Origin::from_key(&key).ok_or_else(|| {
-                        ErrorData::invalid_params(
-                            format!(
-                                "unknown build_origin '{key}' (expected 'manufactured' or 'reaction-output')"
-                            ),
-                            None,
-                        )
-                    })?;
-                    set.insert(origin);
-                }
-                set
-            }
-            None => HashSet::from([
-                manufacturing::Origin::Manufactured,
-                manufacturing::Origin::ReactionOutput,
-            ]),
-        };
-
-        let params = manufacturing::ChainParams {
-            target_id: p.product_type_id,
-            runs: p.runs.unwrap_or(1),
-            build_origins,
-            buy_type_ids: p.buy_type_ids.unwrap_or_default().into_iter().collect(),
-            me_default: p.me.unwrap_or(0),
-            me_overrides: p.me_overrides.unwrap_or_default(),
-        };
-
-        let store = Arc::clone(&self.store);
-        let lang = self.language.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            manufacturing::production_chain(&store, &params, lang.as_deref())
-        })
-        .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| ErrorData::invalid_params(e, None))?;
-        Ok(serde_json::to_string(&result).unwrap())
-    }
 }
 
 /// The one router the handler dispatches on, summed from each domain's. A new
@@ -232,6 +130,7 @@ impl SdeMcpServer {
             + Self::blueprints_router()
             + Self::dogma_router()
             + Self::types_router()
+            + Self::manufacturing_router()
             + Self::map_router()
             + Self::market_router()
             + Self::politics_router()
