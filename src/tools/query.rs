@@ -95,6 +95,82 @@ fn is_localized(map: &serde_json::Map<String, Value>) -> bool {
         && map.keys().all(|k| LANG_CODES.contains(&k.as_str()))
 }
 
+/// Pick the English (or requested-language) string from a localized name field,
+/// tolerating both `{"en": "X"}` objects and already-filtered plain strings.
+pub(crate) fn pick_name(name: Option<&Value>, lang: Option<&str>) -> Option<String> {
+    match name {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Object(m)) => lang
+            .and_then(|l| m.get(l))
+            .or_else(|| m.get("en"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// The fields a `sde_search_dogma` hit can match on, in the order they are
+/// reported. A record carrying none of the query's fields never becomes a hit; a
+/// record missing a field simply cannot list it, which is how a hit on attribute
+/// 277 (no `displayName` at all) reports `["description"]` and nothing else.
+pub(crate) const DOGMA_TEXT_FIELDS: [&str; 3] = ["name", "display_name", "description"];
+
+/// Every corpus record the query matches, built into `T` by `into_hit` and ordered
+/// name-matches-first, then ascending by ID.
+///
+/// The tiers matter under truncation: a name hit is the identifier the caller is
+/// looking for, while a description hit is often incidental, and burying the former
+/// behind a lower-numbered instance of the latter is how a search gets read as
+/// "not in the SDE". Within a tier the corpus's scan-time ID order survives,
+/// because [`slice::sort_by_key`] is stable — so repeated calls, and calls in
+/// different processes, agree.
+pub(crate) fn matching_records<T>(
+    corpus: &[crate::store::DogmaText],
+    query: &str,
+    mut into_hit: impl FnMut(&crate::store::DogmaText, Vec<&'static str>) -> T,
+) -> Vec<T>
+where
+    T: HasMatchedFields,
+{
+    let mut hits: Vec<T> = corpus
+        .iter()
+        .filter_map(|record| {
+            let fields = [
+                record.name.as_deref(),
+                record.display_name.as_deref(),
+                record.description.as_deref(),
+            ];
+            let matched: Vec<&'static str> = DOGMA_TEXT_FIELDS
+                .iter()
+                .zip(fields)
+                .filter(|(_, text)| text.is_some_and(|t| contains_ignore_case(t, query)))
+                .map(|(field, _)| *field)
+                .collect();
+            (!matched.is_empty()).then(|| into_hit(record, matched))
+        })
+        .collect();
+
+    hits.sort_by_key(|hit| u8::from(hit.matched_fields().first() != Some(&"name")));
+    hits
+}
+
+/// Lets [`matching_records`] rank the two hit shapes without either of them
+/// growing a sort key field that would then be serialized onto the wire.
+pub(crate) trait HasMatchedFields {
+    fn matched_fields(&self) -> &[&'static str];
+}
+
+/// ASCII case-insensitive substring test, allocating nothing. The corpus is
+/// English, so ASCII folding is the whole job; lowercasing every field of every
+/// record per query would allocate ~800 KB to answer one substring question.
+pub(crate) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

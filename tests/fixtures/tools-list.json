@@ -1,0 +1,936 @@
+[
+  {
+    "name": "sde_build_type",
+    "description": "Plan how to manufacture / build / produce a Type (ship, module, component, …): the FIRST tool to call for 'how do I build X', 'what do I need to make X', 'bill of materials', or 'production chain'. Classifies the whole build tree and returns: whether the target is buildable (and its material-efficiency mode), the distinct decomposable origins present (manufactured vs reaction-output), per-origin buy-vs-build decision gates (each input tagged with its origin, ME mode, and required skills), the aggregate blueprint-job skills across the chain, and any out-of-scope leaves (invention or planetary-industry items you must buy). This is the classify-only router — neutral facts, no recommendations. Once the player picks what to build vs buy, call sde_get_production_chain for the resolved quantities and shopping list.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "product_type_id": {
+          "description": "The Type ID you want to manufacture/build (a ship, module, component, etc.)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "product_type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_find_route",
+    "description": "Find the shortest route between two solar systems; returns jump count and system ID path",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "from_system_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to_system_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from_system_id",
+        "to_system_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_find_types",
+    "description": "Find the set of Types matching a predicate. Currently: attribute {id, op?, value?} selects Types that record an ExplicitValue for a DogmaAttribute, returned with that value; group_ids and category_ids select by taxonomy (a Category resolves down through its Groups); meta_group_ids narrows to a tier (1 Tech I, 2 Tech II, 4 Faction, ...); published_only drops unpublished Types; query narrows by name substring; type_ids evaluates only the Types you name, which is how you ask 'of these 60 I already hold, which are published / carry attribute X'. meta_group_ids, published_only and query narrow a candidate set and cannot be the only predicate; type_ids can, because you supplied the set. All predicates AND, so 'Black Ops hulls with a non-default jump fatigue multiplier' is one call. The attribute predicate is ExplicitValue-only — every Type technically HAS every attribute at its DefaultValue, so Types with no stored row are absent and the response says so. op is exists (default), eq, ne, gt, gte, lt, lte (each needs value), or not_default (drops Types whose stored value merely restates the attribute's DefaultValue). Every response carries a `groups` rollup naming each matched Group and its count, computed over the full match set rather than the returned page, so it stays correct when `truncated` is true — that rollup, not the rows, is how you ask what Groups a Category contains. project_attributes adds an `attributes` map of the DogmaAttribute values you name to every returned row, so 'the jump fatigue of every Black Ops hull' is one call and one page of ~70-byte rows; an attribute a Type records no ExplicitValue for is absent from its map rather than reported as zero or as the DefaultValue, while an attribute ID the SDE declares nowhere is rejected as a typo. Most Types carry no MetaGroup at all, so a meta_group_ids call also returns excluded_no_meta_group: the candidates dropped for having none. Absence is not Tech I — those Types are unclassified, not tier 1. Contrast sde_get_modifiers, which answers which Types MODIFY an attribute — a disjoint question with disjoint data; an empty answer there does not mean no Type carries the attribute.",
+    "inputSchema": {
+      "$defs": {
+        "AttributePredicate": {
+          "description": "The ExplicitValue predicate on `sde_find_types`. Every operator is already\nrestricted to Types holding an ExplicitValue for `id`; the operator only\nnarrows further. See [`AttributeOp`].",
+          "properties": {
+            "id": {
+              "description": "DogmaAttribute ID to select on (e.g. 1971 jumpFatigueMultiplier)",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "description": "One of \"exists\" (default), \"eq\", \"ne\", \"gt\", \"gte\", \"lt\", \"lte\",\n\"not_default\". The comparison operators require `value`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "value": {
+              "description": "The value to compare each Type's ExplicitValue against. Required by every\noperator except \"exists\" and \"not_default\", which ignore it.",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "attribute": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttributePredicate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Select Types by the DogmaAttribute values they record. Types sitting at the\nattribute's DefaultValue are never returned — see the response's\n`attribute_semantics`."
+        },
+        "category_ids": {
+          "description": "Restrict to Types whose Group belongs to any of these Categories (e.g. 6\nShip). Combined with `group_ids` it narrows further: both must hold.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "group_ids": {
+          "description": "Restrict to Types belonging to any of these Groups (e.g. 898 Black Ops).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Maximum rows to return (default: 100, capped at 1000). Predicates apply to\nthe whole candidate set first, so `total_matched` is the real count even\nwhen `truncated` is true.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "meta_group_ids": {
+          "description": "Restrict to Types whose MetaGroup is any of these (1 Tech I, 2 Tech II,\n4 Faction, …). Most Types carry no MetaGroup at all; those are excluded and\ncounted in the response's `excluded_no_meta_group` rather than being read as\nTech I. Narrows a candidate set; it cannot be the only predicate.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "project_attributes": {
+          "description": "Also return each row's ExplicitValue for these DogmaAttributes, in an\n`attributes` map. A projection, not a predicate: it never adds, drops or\nreorders a row. An attribute a Type records no ExplicitValue for is absent\nfrom its map — not a zero and not the attribute's DefaultValue. An attribute\nID the SDE declares nowhere is a typo and is rejected.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "published_only": {
+          "description": "Drop unpublished Types. Applied before `limit`, so asking for N published\nTypes returns N when N exist. Narrows a candidate set; it cannot be the\nonly predicate.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Restrict to Types whose name contains this substring (case-insensitive).\nNarrows a candidate set; it cannot be the only predicate — use\nsde_search_types for a bare name search.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type_ids": {
+          "description": "Evaluate only these Types — \"of the 60 I already hold, which carry an\nExplicitValue for X\", or \"which are published\". Unlike the other narrowing\npredicates this one can stand alone, because the set is yours and needs no\nscan to produce. IDs the SDE does not declare simply match nothing.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_blueprint",
+    "description": "Get a blueprint by its blueprint type ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "blueprint_type_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blueprint_type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_blueprint_for_product",
+    "description": "Get the blueprint that produces a given product type, tagged with the activity that makes it. Returns {\"blueprint\": {...}, \"activity\": \"manufacturing\"|\"reaction\"} — the activity tells you whether the product is manufactured or comes out of a reaction (the two are distinct production paths with different rules; reactions ignore material efficiency). {\"result\": null} means the product has no blueprint at all (a raw material you must buy/mine). For a full multi-tier bill of materials, prefer sde_build_type.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "product_type_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "product_type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_category",
+    "description": "Get a type category by its category ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "category_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "category_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_constellation",
+    "description": "Get a constellation by its constellation ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "constellation_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "constellation_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_dogma_attribute",
+    "description": "Get a dogma attribute by its attribute ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "attribute_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attribute_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_dogma_effect",
+    "description": "Get a dogma effect by its effect ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "effect_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "effect_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_faction",
+    "description": "Get a faction by its faction ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "faction_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "faction_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_group",
+    "description": "Get a type group by its group ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "group_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_market_group",
+    "description": "Get a market group by its market group ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "market_group_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "market_group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_market_group_tree",
+    "description": "Get the full ancestor chain for a market group, from root to the given group",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "market_group_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "market_group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_modifiers",
+    "description": "Resolve dogma modifiers with no prose parsing. Provide exactly one of: type_id (the attributes this skill/ship/module modifies), attribute_id (which skills/ships modify this attribute), or effect_id (the raw modifierInfo entries a dogma effect defines). Magnitudes come from the source type's dogmaAttributes. For attribute_id, each row gives source_type_id/source_type_name = the type that OWNS the effect (the actual bonus source, e.g. Astrogeology), one row per owning type; required_skill_id/required_skill_name is a separate required-skill FILTER on the boosted modules (e.g. Mining) — do NOT treat it as the source. operation_name decodes the operation int: 'postPercent' means magnitude is +x% PER stacking source (NOT a flat add), 'modAdd' is flat additive, 'postMul'/'preMul' multiply — read it before interpreting magnitude. To assess what affects a MODULE's effective output (yield/DPS/tank/etc.), call with type_id + levers:true FIRST: it lists every attribute on the module with a modifier_count and the distinct modifying sources (skills first), filtered to modifiers that actually apply to this module (by its required skills), so you enumerate ALL tunable levers (crit chance, duration, etc.) before deciding which matter — never infer the full picture from one 'obvious' attribute. Then drill into a specific attribute_id for full per-source rows. This tool answers which Types MODIFY an attribute; sde_find_types answers which Types HAVE one, as a stored ExplicitValue. They are disjoint questions over disjoint data, and the English is nearly identical — an empty modified_by here does NOT mean no Type carries the attribute, and when it is empty the response says how many do and points you at sde_find_types.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "attribute_id": {
+          "description": "Direction-b: a target attribute ID (e.g. 77 miningAmount) → the modifiers that hit it",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "effect_id": {
+          "description": "Direction-c: a dogma effect ID → the raw modifierInfo entries it defines",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "levers": {
+          "description": "Direction-d (with type_id): true → list EVERY attribute on the type and, per\nattribute, how many things modify it + the distinct modifying sources\n(skills first). Use this to enumerate all of a module's tunable levers before\njudging which matter — don't assume one \"obvious\" attribute is the whole story.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "resolve_names": {
+          "description": "Join attribute IDs to human names from dogmaAttributes (default true)",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type_id": {
+          "description": "Direction-a: a skill/ship/type ID → the attributes it modifies + magnitudes",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_npc_corporation",
+    "description": "Get an NPC corporation by its corporation ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "corporation_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "corporation_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_npc_station",
+    "description": "Get an NPC station by its station ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "station_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "station_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_production_chain",
+    "description": "Compute the resolved production chain for a build: given the player's buy-vs-build decisions, returns per-Type build jobs (runs, output-per-run, leftover from run-rounding) and one consolidated shopping list grouped by origin (minerals, moon materials, PI, etc.), plus the aggregate job skills. Material efficiency reduces manufacturing material cost (floored at one unit per run); reactions ignore ME. Shared intermediates are counted once across the whole tree before run-rounding. Decisions: build_origins toggles which decomposable origins to build (default: build everything), buy_type_ids force-buys specific Types (e.g. fuel blocks), me / me_overrides set material efficiency. Call sde_build_type first to discover the decision gates.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "build_origins": {
+          "description": "Which decomposable origins to build rather than buy: any of \"manufactured\",\n\"reaction-output\". Defaults to both (build the whole tree). Anything not built\nlands in the shopping list.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "buy_type_ids": {
+          "description": "Force these Type IDs to be bought even when their origin is being built\n(e.g. buy fuel blocks instead of decomposing them into ice + PI).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "me": {
+          "description": "Default material efficiency (%) applied to every manufacturing job. Default 0.\nReactions always ignore ME.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "me_overrides": {
+          "additionalProperties": false,
+          "description": "Per-Type material-efficiency overrides (%), keyed by Type ID; overrides `me`\nfor those types only.",
+          "patternProperties": {
+            "^\\d+$": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "product_type_id": {
+          "description": "The Type ID you want to build.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runs": {
+          "description": "Number of runs (units, when output-per-run is 1) of the target to build. Default 1.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "product_type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_region",
+    "description": "Get a region by ID or name",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_skill_plan",
+    "description": "Build a recursive skill-prerequisite training plan for one or more target type IDs (ships, modules, or skills). Returns each target's full prerequisite tree plus one merged, deduped (to the highest level demanded), topologically-sorted plan with per-skill rank, SP cost, running cumulative SP, the per-level SP curve (sp_by_level), and which targets require it.",
+    "inputSchema": {
+      "$defs": {
+        "SkillPlanTarget": {
+          "properties": {
+            "level_override": {
+              "description": "When the target is a skill, train it to this level (default 5). Ignored for\nnon-skill targets (their prerequisites keep the levels the item demands).",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type_id": {
+              "description": "Type ID to train prerequisites for (ship, module, or a skill itself)",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type_id"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "targets": {
+          "description": "Targets are treated as separate items (not a merged fit); no variant expansion",
+          "items": {
+            "$ref": "#/$defs/SkillPlanTarget"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "targets"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_skill_sp",
+    "description": "Get the SP cost curve (levels 1-5: cumulative sp_to_reach and per-level increment) for a skill. Provide rank directly, or type_id to look its rank up.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "rank": {
+          "description": "Skill rank directly (skillTimeConstant, attribute 275)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type_id": {
+          "description": "Or a skill's type ID — its rank is looked up from dogma",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_skin",
+    "description": "Get a SKIN (ship SKINs) by its skin ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "skin_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "skin_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_solar_system",
+    "description": "Get a solar system by ID or name",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "name": {
+          "description": "Solar system name (provide this or system_id)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "system_id": {
+          "description": "Solar system ID (provide this or name)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_type",
+    "description": "Get a type (item) by its type ID",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "type_id": {
+          "description": "EVE type ID",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_type_dogma",
+    "description": "Get the dogma attributes and effects of a type by its type ID (e.g. skill rank/skillTimeConstant attribute 275, module stats). Set resolve_names to annotate each attribute with its name and decode skill-prerequisite attributes into readable requiredSkill objects.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "resolve_names": {
+          "description": "Join attributeID→name and decode skill-prerequisite attrs (182/183/184 + levels)\ninto a `requiredSkill` object. Default false keeps the raw record.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type_id": {
+          "description": "EVE type ID",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_type_materials",
+    "description": "Get the materials required to reprocess a type",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "type_id": {
+          "description": "EVE type ID",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_types",
+    "description": "Batch-get multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false rather than failing the call.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "type_ids": {
+          "description": "EVE type IDs to fetch in one call",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type_ids"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_get_types_dogma",
+    "description": "Batch-get the dogma of multiple types by ID in one call. Returns one entry per input ID in order; missing IDs are reported with found:false. Pass attribute_ids to project each Type's dogma down to just those DogmaAttributes — ships carry over a hundred, so reading two fields across 60 of them costs kilobytes instead of hundreds. An attribute a Type records no ExplicitValue for is absent from its entry rather than an error, while an attribute ID the SDE declares nowhere is rejected as a typo; effects are returned either way. resolve_names annotates each returned attribute with its name and decodes skill prerequisites, exactly as sde_get_type_dogma does. Omitting both returns today's full record unchanged.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "attribute_ids": {
+          "description": "Return only these DogmaAttributes for each Type instead of all of them — a\nfield selector. A Type recording no ExplicitValue for one of them simply has\nno entry for it; that is absence, not a zero and not the DefaultValue. An\nattribute ID the SDE declares nowhere is a typo and is rejected. Effects are\nunaffected.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "resolve_names": {
+          "description": "Join attributeID→name and decode skill-prerequisite attrs (182/183/184 +\nlevels) into a `requiredSkill` object, exactly as sde_get_type_dogma does.\nDefault false keeps the raw records.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "type_ids": {
+          "description": "EVE type IDs to fetch in one call",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type_ids"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_resolve_types",
+    "description": "Bulk-resolve type IDs to names and/or exact (case-insensitive) names to type IDs in one call. Lightweight id↔name mapping — use sde_search_types for substring search and sde_get_types for full records. A name several Types share resolves to one of them: the lowest published ID, or the lowest of all when none is published.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "names": {
+          "description": "Exact type names to resolve to IDs (case-insensitive)",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "type_ids": {
+          "description": "Type IDs to resolve to names",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_search_dogma",
+    "description": "Find DogmaAttributes and DogmaEffects by name — the first step of any dogma question, since every other dogma tool wants an ID. One call searches both, returned as separate `attributes` and `effects` lists, so you do not have to know in advance which one a term names. The query is a case-insensitive substring matched against each record's name, display name and description, and each hit reports which of those matched: attribute names are camelCase identifiers, so \"jump fatigue\" finds jumpFatigueMultiplier only through its display name \"Jump Fatigue Multiplier\" — searching the name alone would find nothing. Each attribute hit also carries default_value, the DefaultValue every Type without an ExplicitValue for it holds, and explicit_type_count, how many Types record an ExplicitValue for it — feed the attribute ID to sde_find_types to list them, or skip that call when the count is 0. Both lists are capped independently; attributes_matched / effects_matched report the true totals.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "description": "Maximum hits per list (default: 25, capped at 200). Attributes and effects\nare limited separately, so a term matching many attributes still shows its\neffects — the point of searching both in one call.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Substring to look for, matched case-insensitively against the name, display\nname and description of every DogmaAttribute and DogmaEffect. Spaced\nphrases work: \"jump fatigue\" finds jumpFatigueMultiplier through its display\nname even though the camelCase identifier holds no space.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_search_solar_systems",
+    "description": "Search solar systems by name substring",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_search_types",
+    "description": "Search types by name substring, returning whole Type records. Optionally scope the search to group_ids and/or category_ids (a Category resolves down through its Groups) — searching 'raven' unscoped also returns its blueprint, its SKINs and every NPC variant sharing the word, and category_ids: [6] is how you keep the ship. published_only drops unpublished Types. Every filter applies to the whole match set before the limit, so a scoped search still returns a full page, and results come back in ascending type ID so the same question gets the same answer twice. Use sde_find_types instead when you want a set defined by an attribute or taxonomy rather than by a name, or minimal rows over whole records.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "category_ids": {
+          "description": "Restrict the search to these Categories, each resolving down through its\nGroups. ANDs with group_ids and with published_only.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "group_ids": {
+          "description": "Restrict the search to these Groups. Applied before the limit, so a scoped\nsearch still returns a full page.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Maximum results to return (default: 10)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "published_only": {
+          "description": "Only return published types",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Name substring to search for (case-insensitive)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "sde_status",
+    "description": "Get SDE metadata: build number, release date, data directory, files scanned",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    }
+  }
+]

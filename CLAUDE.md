@@ -42,13 +42,21 @@ RUST_LOG=debug cargo run             # run with debug logging
 **Key files**:
 - `src/store.rs` — `SdeStore` (all indexes) and `SdeIndex` (path + id_index + name_index)
 - `src/scan.rs` — JSONL scanning; `scan_blueprints`, `scan_stargates`, and `scan_dogma_effects` have custom parsers for their derived structures
-- `src/tools/server.rs` — all 32 MCP tool definitions using `#[tool]` / `#[tool_router]` macros; `fetch_filtered` and `search_filtered` helpers apply language filter. `sde_get_skill_plan` (recursive prereq traversal + topo sort + SP math) and `sde_get_modifiers` (dogma modifier resolution) live here as free functions below the impl. `sde_find_types` is the Type selector (predicates AND; `attribute` / `group_ids` / `category_ids` / `type_ids` produce a candidate set, `meta_group_ids` / `published_only` / `query` only narrow one), and `sde_search_dogma` finds DogmaAttributes and DogmaEffects by name
+- `src/tools/` — the 32 MCP tools, split one directory per domain, each `mod.rs` + `tests.rs` with its own `#[tool_router]`:
+  - `types/` — Type, Group, Category, reprocessing materials, SKINs, and `sde_find_types`, the Type selector (predicates AND; `attribute` / `group_ids` / `category_ids` / `type_ids` produce a candidate set, `meta_group_ids` / `published_only` / `query` only narrow one)
+  - `dogma/` — DogmaAttributes and DogmaEffects, `sde_search_dogma`, and `sde_get_modifiers` (modifier resolution). Owns the ExplicitValue-vs-DefaultValue rule; `types/` borrows its projection helpers
+  - `skills/` — `sde_get_skill_plan` (recursive prereq traversal + topo sort + SP math) and `sde_get_skill_sp`
+  - `manufacturing/` — the `build_type` router and `production_chain` engine, plus their two tools
+  - `map/`, `market/`, `politics/`, `blueprints/` — solar systems and routing, market groups, factions and NPC corps/stations, blueprint lookup
+  - `query.rs` — byte-offset fetch, name search, language filter, and the corpus substring search (`matching_records`)
+  - `guidance.rs` — the empty/truncated-result guidance strings; `testkit.rs` — shared test fixtures and the MCP `Seam` harness
+- `src/tools/server.rs` — `SdeMcpServer` itself, the `fetch_filtered` / `search_filtered` language-filter helpers every domain calls, `sde_status`, and the `tool_router()` that sums the per-domain routers
 - `src/download.rs` — SDE download; extracts build number from CCP redirect URL
 - `src/config.rs` — CLI args (clap) and `Meta` (persisted build state)
 
 **SDE data directory layout**: `~/.local/share/eve-sde-mcp/sde-{build}/` containing the extracted JSONL files. Old build dirs are deleted on successful download.
 
-**Adding a new tool**: add a field to `SdeStore` + `SdeIndex` in `store.rs`, scan it in `scan.rs`, add a `#[tool]` method to `SdeMcpServer` in `tools/server.rs`.
+**Adding a new tool**: add a field to `SdeStore` + `SdeIndex` in `store.rs`, scan it in `scan.rs`, then add a `#[tool]` method to the `#[tool_router]` impl of the domain module it belongs to. A new domain needs its own directory, a `mod` line in `tools/mod.rs`, and a `+ Self::<domain>_router()` in `server.rs`. The pinned `tools/list` contract test enumerates the router automatically, so there is no list to edit — instead regenerate its golden with `SDE_UPDATE_TOOLS_LIST=1 cargo test tools_list_matches_the_pinned_contract`, then read the diff to `tests/fixtures/tools-list.json` and commit it. That run deliberately fails; a green suite means the contract matched without a rewrite.
 
 ## Configuration
 
@@ -63,7 +71,7 @@ RUST_LOG=debug cargo run             # run with debug logging
 
 - **No stdout except MCP JSON-RPC frames** — all progress bars, logs, and status messages go to stderr. Breaking this breaks MCP clients.
 - `scan_index` uses `memchr::memmem` for fast byte-pattern matching to extract `_key` and `name.en` without full JSON parsing — the hot path for startup.
-- Tests use `tempfile` JSONL fixtures; the `scan_index_pub` re-export in `scan.rs` exists solely to expose the private function to tests in `tools/server.rs`.
+- Tests use `tempfile` JSONL fixtures; the `scan_index_pub` re-export in `scan.rs` exists solely to expose the private function to the tool tests. Shared fixture builders and the MCP `Seam` harness live in `tools/testkit.rs`.
 
 ## Agent conventions
 
