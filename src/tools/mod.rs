@@ -10,4 +10,5 @@ mod server;
 pub(crate) mod skills;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub(crate) mod types;
 pub use server::SdeMcpServer;
