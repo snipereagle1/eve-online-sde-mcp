@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-rmcp = { version = "1.7", features = [
+rmcp = { version = "3.0", features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
@@ -27,7 +27,7 @@ directories = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3"
-rmcp = { version = "1.7", features = [
+rmcp = { version = "3.0", features = [
     "client",
     "transport-streamable-http-client-reqwest",
     "macros",
