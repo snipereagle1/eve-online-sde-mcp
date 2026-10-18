@@ -56,7 +56,7 @@ fn router(path: &str, store: Arc<SdeStore>, language: Option<String>) -> Router 
     let factory = move || Ok(SdeMcpServer::new(store.clone(), language.clone()));
 
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         // Return `application/json` directly instead of SSE framing — the tools
         // are simple request/response, so there is nothing to stream.
         .with_json_response(true)
@@ -186,5 +186,27 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false);
+    }
+
+    // Clients probe `server/discover` (SEP-2575) before `initialize`; rmcp 1.x
+    // answered -32601 and logged a WARN for every probe.
+    #[tokio::test]
+    async fn server_discover_probe_succeeds() {
+        let base = spawn_server().await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "server/discover")
+            .body(r#"{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.get("error").is_none(), "discover failed: {body}");
+        assert!(body["result"].is_object(), "no discover result: {body}");
     }
 }

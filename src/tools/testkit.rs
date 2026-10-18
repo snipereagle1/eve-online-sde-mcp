@@ -15,7 +15,7 @@ use std::{
 
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt as _,
-    model::{CallToolRequestParams, CallToolResult, ClientInfo},
+    model::{CallToolRequestParams, CallToolResult, ClientConfig},
     service::RunningService,
 };
 
@@ -106,8 +106,8 @@ pub(crate) fn default_store() -> SdeStore {
 pub(crate) struct DummyClient;
 
 impl ClientHandler for DummyClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
@@ -170,7 +170,7 @@ impl Seam {
         let text = result
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(|c| c.as_text())
             .map(|t| t.text.as_str())
             .expect("expected text content");
         Ok(serde_json::from_str(text).expect("invalid JSON in tool response"))
