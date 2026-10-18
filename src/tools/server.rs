@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rmcp::{
     ErrorData, ServerHandler,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 
@@ -138,8 +138,8 @@ impl SdeMcpServer {
 
 #[tool_handler(name = "eve-sde-mcp", version = "0.1.0")]
 impl ServerHandler for SdeMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "eve-sde-mcp",
                 env!("CARGO_PKG_VERSION"),
